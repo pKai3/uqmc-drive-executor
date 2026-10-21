@@ -368,7 +368,7 @@ def _blocked(journal, projection, approval_ref, approval, batch_id, reason, revi
                 "authorization_scope": {"section_id": projection["section_id"], "method_profile": projection["method_profile"],
                     "projection_revision": projection["projection_revision"], "projection_sha256": digest(projection),
                     "owner_approval_ref": approval_ref, "owner_approval_id": approval["approval_id"], "review_context_ref": review_context_ref, "batch_binding_required": True},
-                "rows": [{"reference": op["reference"], "source_id": op["source_id"], "action": "MOVE", "state": "BLOCKED", "reason_code": reason} for op in projection["operations"]]}
+                "rows": [{"reference": op["reference"], "source_id": op["source_id"], "action": op.get("action", "MOVE"), "state": "BLOCKED", "reason_code": reason} for op in projection["operations"]]}
     ref = journal.evidence({"projection": projection, "owner_approval_ref": approval_ref, "manifest": manifest, "plan": None})
     journal.append("SECTION_IMPORT_BLOCKED", payload={"run_id": batch_id, "manifest_ref": ref, "reason_code": reason, "dry_run": True})
     return ImportResult(None, manifest, ref)
@@ -566,9 +566,11 @@ def import_section(journal, export, *, projection, owner_approval_ref, expected_
         for source_id in source["excluded_ids"]:
             if source_id not in excluded_sources:
                 journal.append("EXCLUDED", payload={"file_id": source_id, "reason_code": "WORKBOOK_WITHDRAWN_OR_EXCLUDED"})
+        quarantined_refs = {ref for row in source.get("quarantined_tombstones", []) for ref in row["refs"]}
         for ref in source["excluded_refs"]:
             if ref not in excluded_refs:
-                journal.append("PROPOSAL_EXCLUDED", payload={"proposal_ref": ref, "reason_code": "WORKBOOK_DECISION_NO"})
+                reason = "WORKBOOK_REDACTED_EXCLUSION" if ref in quarantined_refs else "WORKBOOK_DECISION_NO"
+                journal.append("PROPOSAL_EXCLUDED", payload={"proposal_ref": ref, "reason_code": reason})
         excluded_sources |= set(source["excluded_ids"])
         excluded_refs |= set(source["excluded_refs"])
         target_sections = {r.get("parent_section_id") for r in projection.get("destination_requirements", [])}

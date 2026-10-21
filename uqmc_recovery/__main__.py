@@ -194,7 +194,13 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init")
     sub.add_parser("status")
-    sub.add_parser("export")
+    p = sub.add_parser("export")
+    p.add_argument("--identity-basis", required=True, type=Path,
+                   help="Private verified identity basis, including exact source_ids")
+    p.add_argument("--allowed-source-ids", type=Path,
+                   help="Private JSON array of IDs already approved for the existing viewer")
+    p.add_argument("--verified-source-links", type=Path,
+                   help="Private map of source IDs to existing verified viewer links")
     p = sub.add_parser("evidence")
     p.add_argument("--input", required=True, type=Path)
     p = sub.add_parser("disable-agent-dispatch")
@@ -294,6 +300,8 @@ def main():
         result["report_path"] = save_new(output / "report.json", result)
         save_new(output / "projection-private.json", projections["workbook"])
         save_new(output / "projection-redacted.json", projections["html"])
+        save_new(output / "operation-log-private.json", projections["operation_log"])
+        save_new(output / "projection-diagnostics.json", projections["diagnostics"])
     elif args.command == "handoff-demo":
         output = args.output or private / ("handoff-demo-" + str(uuid4()))
         result = handoff_demo(output)
@@ -312,10 +320,15 @@ def main():
         result = {"manifest_file": save_new(private / "imports" / (str(uuid4()) + "-rollback.json"), result_plan.body()),
                   "execution_approved": False, "external_tool_calls": 0}
     elif args.command == "export":
-        projections = build_projections(journal)
+        projections = build_projections(
+            journal, identity_basis=read_json(args.identity_basis),
+            allowed_source_ids=read_json(args.allowed_source_ids) if args.allowed_source_ids else (),
+            verified_source_links=read_json(args.verified_source_links) if args.verified_source_links else None)
         identifier = str(uuid4())
         result = {"private": save_new(private / "exports" / (identifier + "-workbook.json"), projections["workbook"]),
                   "redacted": save_new(private / "exports" / (identifier + "-html.json"), projections["html"]),
+                  "operation_log": save_new(private / "exports" / (identifier + "-operation-log.json"), projections["operation_log"]),
+                  "diagnostics": save_new(private / "exports" / (identifier + "-diagnostics.json"), projections["diagnostics"]),
                   "published": False}
     elif args.command == "prepare":
         from .bridge import prepare_reads

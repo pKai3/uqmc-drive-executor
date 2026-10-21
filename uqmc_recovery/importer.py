@@ -21,6 +21,21 @@ HEADERS = {
     "Rename Coverage": ["Rename necessity", "Assessment", "Current name + type suffix", "Proposed name / retained name", "Necessity rationale (assistant)", "Rename proposal", "Source link", "Existing proposed target", "Evidence / rationale", "Remaining checks", "Item kind", "Assessment scope", "Move proposal", "Manifest item / root reference", "Source ID", "Verified MIME type", "Verified on", "Coverage basis"],
 }
 WITHDRAWN_VALUES = {"excluded", "withdrawn"}
+REDACTED_EXCLUSION_LABELS = {
+    "Proposed Moves": "Current item",
+    "Move Manifest": "Current item",
+    "Proposed Renames": "Current name + type suffix",
+}
+REDACTED_REFERENCE_FIELDS = {
+    "Proposed Moves": ("Proposal ID",),
+    "Move Manifest": ("Proposal ID", "Manifest item"),
+    "Proposed Renames": ("Rename ID", "Move proposal ID", "Manifest item"),
+}
+REDACTED_EMPTY_FIELDS = {
+    "Proposed Moves": {"Source path", "Proposed target path"},
+    "Move Manifest": {"Source ID", "Source path", "Exact target path"},
+    "Proposed Renames": {"Source ID", "Current source path", "Proposed destination folder", "Proposed name + type suffix"},
+}
 
 
 def _text(value):
@@ -34,7 +49,7 @@ def _rows(export, tab):
     headers = matrix[0]
     if len(headers) != len(set(headers)) or not set(HEADERS[tab]) <= set(headers):
         raise SafetyError("WORKBOOK_HEADER_MISMATCH:" + tab)
-    if any(not isinstance(h, str) for h in headers):
+    if any(not isinstance(h, str) for h in headers) or "_row" in headers:
         raise SafetyError("INVALID_WORKBOOK_HEADER")
     result = []
     for number, values in enumerate(matrix[1:], 2):
@@ -77,12 +92,53 @@ def _withdrawn(row, fields):
     return any(_text(row.get(key)).strip().lower() in WITHDRAWN_VALUES for key in fields)
 
 
+def _quarantined_refs(row, tab):
+    """Return only complete retained references, never an inferred identity."""
+    references = REDACTED_REFERENCE_FIELDS[tab]
+    if any(not isinstance(row.get(key), str) or not row[key] or row[key].strip() != row[key] for key in references):
+        raise SafetyError("AMBIGUOUS_REDACTED_EXCLUSION:" + tab)
+    allowed = set(HEADERS[tab]) - REDACTED_EMPTY_FIELDS[tab]
+    # This exact review placeholder names no destination. It is allowed only
+    # inside an already excluded rename row, never as an executable target.
+    if tab == "Proposed Renames" and row.get("Proposed destination folder") == "Pending restricted-destination review":
+        allowed.add("Proposed destination folder")
+    if any(value not in (None, "") for key, value in row.items() if key not in allowed | {"_row"}):
+        raise SafetyError("AMBIGUOUS_REDACTED_EXCLUSION:" + tab)
+    if tab == "Move Manifest":
+        return [row["Proposal ID"] + "/" + row["Manifest item"]]
+    return [row[references[0]]]
+
+
+def _catalog_rows(export, tab, tombstones, quarantined):
+    """Separate exact identity-redacted exclusions without recovering identities.
+
+    Raw rows remain in the full workbook fingerprint and evidence. Complete
+    retained proposal references are quarantined as durable exclusions; source
+    identities, destinations, incomplete references or unknown nonempty fields
+    remain ambiguous and fail closed. Historical review text is never executable.
+    """
+    active = []
+    label = REDACTED_EXCLUSION_LABELS.get(tab)
+    for row in _rows(export, tab):
+        if label is not None and row.get(label) == "Excluded by user":
+            if any(value not in (None, "") for key, value in row.items() if key not in {label, "_row"}):
+                quarantined.append({"tab": tab, "row": row["_row"], "refs": _quarantined_refs(row, tab)})
+            else:
+                tombstones.append({"tab": tab, "row": row["_row"]})
+        else:
+            active.append(row)
+    return active
+
+
 def catalog(export, *, expected_workbook_id=WORKBOOK_ID):
     """Find explicit source-ID proposal records without retrieving source metadata."""
     input_hash = workbook_fingerprint(export, expected_workbook_id=expected_workbook_id)
-    moves = _index(_rows(export, "Proposed Moves"), "Proposal ID")
-    result, excluded, excluded_refs = {}, {WITHDRAWN_ID}, set()
-    for row in _rows(export, "Move Manifest"):
+    tombstones, quarantined = [], []
+    rows_by_tab = {tab: _catalog_rows(export, tab, tombstones, quarantined) for tab in HEADERS}
+    moves = _index(rows_by_tab["Proposed Moves"], "Proposal ID")
+    quarantine_refs = {ref for item in quarantined for ref in item["refs"]}
+    result, excluded, excluded_refs = {}, {WITHDRAWN_ID}, set(quarantine_refs)
+    for row in rows_by_tab["Move Manifest"]:
         pid, item = _text(row["Proposal ID"]).strip(), _text(row["Manifest item"]).strip()
         ref = f"{pid}/{item}"
         if not pid or not item or ref in result:
@@ -98,7 +154,7 @@ def catalog(export, *, expected_workbook_id=WORKBOOK_ID):
         result[ref] = {"reference": ref, "proposal_refs": [pid, item], "action": "MOVE", "source_id": source_id,
                        "decision": decision, "withdrawn": bool(is_excluded), "row": row, "proposal": proposal,
                        "row_sha256": digest({"manifest": row, "proposal": proposal})}
-    for row in _rows(export, "Proposed Renames"):
+    for row in rows_by_tab["Proposed Renames"]:
         ref = _text(row["Rename ID"]).strip()
         if not ref or ref in result:
             raise SafetyError("DUPLICATE_OR_MISSING_RENAME_REFERENCE")
@@ -112,13 +168,14 @@ def catalog(export, *, expected_workbook_id=WORKBOOK_ID):
         result[ref] = {"reference": ref, "proposal_refs": [ref], "action": "RENAME", "source_id": source_id,
                        "decision": decision, "withdrawn": is_excluded, "row": row,
                        "row_sha256": digest(row)}
-    for row in _rows(export, "Rename Coverage"):
+    for row in rows_by_tab["Rename Coverage"]:
         if _withdrawn(row, ("Assessment", "Rename necessity", "Coverage basis")):
             source_id = _text(row["Source ID"]).strip()
             if source_id:
                 excluded.add(source_id)
     return {"input_sha256": input_hash, "records": result, "excluded_ids": sorted(excluded),
-            "excluded_refs": sorted(excluded_refs)}
+            "excluded_refs": sorted(excluded_refs), "redacted_tombstones": tombstones,
+            "quarantined_tombstones": quarantined}
 
 
 @dataclass(frozen=True)
@@ -167,9 +224,11 @@ def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
         for source_id in source["excluded_ids"]:
             if source_id not in recorded_exclusions:
                 journal.append("EXCLUDED", payload={"file_id": source_id, "reason_code": "WORKBOOK_WITHDRAWN_OR_EXCLUDED", "input_sha256": input_hash})
+        quarantine_refs = {value for item in source["quarantined_tombstones"] for value in item["refs"]}
         for ref in source["excluded_refs"]:
             if ref not in recorded_refs:
-                journal.append("PROPOSAL_EXCLUDED", payload={"proposal_ref": ref, "reason_code": "WORKBOOK_DECISION_NO", "input_sha256": input_hash})
+                reason = "WORKBOOK_REDACTED_EXCLUSION" if ref in quarantine_refs else "WORKBOOK_DECISION_NO"
+                journal.append("PROPOSAL_EXCLUDED", payload={"proposal_ref": ref, "reason_code": reason, "input_sha256": input_hash})
         excluded = set(source["excluded_ids"]) | recorded_exclusions
         excluded_refs = set(source["excluded_refs"]) | recorded_refs
         rows, candidates = [], {}
@@ -181,6 +240,9 @@ def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
             try:
                 if stale:
                     raise SafetyError("WORKBOOK_CHANGED_REVALIDATION_REQUIRED")
+                if ref in excluded_refs:
+                    entry["approval_state"] = "WITHDRAWN"
+                    raise SafetyError("PROPOSAL_EXCLUDED")
                 if not record:
                     raise SafetyError("SELECTED_REFERENCE_MISSING")
                 source_id = record["source_id"]
@@ -307,6 +369,8 @@ def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
             "input_sha256": input_hash, "proposal_revision": "workbook:" + input_hash,
             "batch_id": batch_id, "selected_refs": selected, "rows": rows,
             "excluded_ids": sorted(excluded), "excluded_refs": sorted(excluded_refs), "execution_approved": False,
+            "redacted_tombstones": source["redacted_tombstones"],
+            "quarantined_tombstones": source["quarantined_tombstones"],
             "proposal_hash": plan.proposal_hash if plan else None,
             "plan_ready_for_explicit_review": plan is not None,
         }

@@ -1,0 +1,444 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:uqmc:execution:snapshot:v1",
+  "title": "UQMC execution snapshot v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "snapshot_id",
+    "generated_at_utc",
+    "journal_sequence",
+    "journal_tip_sha256",
+    "coverage",
+    "operations",
+    "items"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "uqmc.execution.snapshot.v1"
+    },
+    "snapshot_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "generated_at_utc": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "journal_sequence": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "journal_tip_sha256": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "basis",
+        "last_reconciled_at_utc",
+        "complete",
+        "identity_basis_version",
+        "identity_count",
+        "source_identity_sha256"
+      ],
+      "properties": {
+        "basis": {
+          "const": "tracked_operations_only"
+        },
+        "last_reconciled_at_utc": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "Z$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "identity_basis_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "identity_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_identity_sha256": {
+          "type": "string"
+        }
+      }
+    },
+    "operations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operation_id",
+          "run_id",
+          "source_id",
+          "action",
+          "direction",
+          "state",
+          "operation_order",
+          "depends_on_operation_ids",
+          "approval_state",
+          "approved_plan_sha256",
+          "related_forward_operation_id",
+          "verified_at_utc",
+          "reason_code"
+        ],
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "run_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "source_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "action": {
+            "enum": [
+              "MOVE",
+              "RENAME",
+              "MOVE_AND_RENAME",
+              "CREATE_FOLDER"
+            ]
+          },
+          "direction": {
+            "enum": [
+              "FORWARD",
+              "ROLLBACK"
+            ]
+          },
+          "state": {
+            "enum": [
+              "PREPARED",
+              "ATTEMPTED",
+              "VERIFIED_APPLIED",
+              "FAILED_NOT_APPLIED",
+              "UNCERTAIN",
+              "BLOCKED_CONFLICT",
+              "SKIPPED"
+            ]
+          },
+          "operation_order": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "depends_on_operation_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "uniqueItems": true
+          },
+          "approval_state": {
+            "enum": [
+              "NOT_APPROVED",
+              "APPROVED",
+              "STALE",
+              "WITHDRAWN"
+            ]
+          },
+          "approved_plan_sha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "related_forward_operation_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verified_at_utc": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "Z$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "uniqueItems": true
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source_id",
+          "source_link",
+          "move",
+          "rename",
+          "location",
+          "observed",
+          "reason_codes"
+        ],
+        "properties": {
+          "source_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "source_link": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "move": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "effect",
+              "last_event_state",
+              "operation_ids",
+              "verified_at_utc"
+            ],
+            "properties": {
+              "effect": {
+                "enum": [
+                  "NOT_TRACKED",
+                  "UNCHANGED",
+                  "APPLIED",
+                  "REVERTED",
+                  "UNKNOWN",
+                  "CONFLICT"
+                ]
+              },
+              "last_event_state": {
+                "enum": [
+                  null,
+                  "PREPARED",
+                  "ATTEMPTED",
+                  "VERIFIED_APPLIED",
+                  "FAILED_NOT_APPLIED",
+                  "UNCERTAIN",
+                  "BLOCKED_CONFLICT",
+                  "SKIPPED"
+                ]
+              },
+              "operation_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "uniqueItems": true
+              },
+              "verified_at_utc": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "Z$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          },
+          "rename": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "effect",
+              "last_event_state",
+              "operation_ids",
+              "verified_at_utc"
+            ],
+            "properties": {
+              "effect": {
+                "enum": [
+                  "NOT_TRACKED",
+                  "UNCHANGED",
+                  "APPLIED",
+                  "REVERTED",
+                  "UNKNOWN",
+                  "CONFLICT"
+                ]
+              },
+              "last_event_state": {
+                "enum": [
+                  null,
+                  "PREPARED",
+                  "ATTEMPTED",
+                  "VERIFIED_APPLIED",
+                  "FAILED_NOT_APPLIED",
+                  "UNCERTAIN",
+                  "BLOCKED_CONFLICT",
+                  "SKIPPED"
+                ]
+              },
+              "operation_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "uniqueItems": true
+              },
+              "verified_at_utc": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "Z$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          },
+          "location": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "effect",
+              "ancestor_move_operation_ids",
+              "verified_path",
+              "path_verified_at_utc"
+            ],
+            "properties": {
+              "effect": {
+                "enum": [
+                  "NONE",
+                  "DIRECT",
+                  "INHERITED",
+                  "DIRECT_AND_INHERITED",
+                  "UNKNOWN"
+                ]
+              },
+              "ancestor_move_operation_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "uniqueItems": true
+              },
+              "verified_path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "path_verified_at_utc": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "Z$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          },
+          "observed": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "exact_name",
+              "parent_ids",
+              "mime_type",
+              "metadata_verified_at_utc",
+              "read_state"
+            ],
+            "properties": {
+              "exact_name": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "parent_ids": {
+                "anyOf": [
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "uniqueItems": true
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "mime_type": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "metadata_verified_at_utc": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "Z$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "read_state": {
+                "enum": [
+                  "NEVER_VERIFIED",
+                  "VERIFIED",
+                  "UNAVAILABLE",
+                  "CONFLICT"
+                ]
+              }
+            }
+          },
+          "reason_codes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "uniqueItems": true
+          }
+        }
+      },
+      "uniqueItems": true
+    }
+  }
+}

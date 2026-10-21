@@ -1,5 +1,6 @@
 """Real CLI process boundaries, with synthetic evidence and no external tools."""
 import copy
+import hashlib
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -11,6 +12,7 @@ import unittest
 from uqmc_recovery.adapters import MockAdapter, fixture_state
 from uqmc_recovery.journal import Journal
 from uqmc_recovery.model import Approval, FOLDER, Operation, Plan, digest
+from uqmc_recovery.projection import HEADERS, validate_snapshot
 
 
 class ActionCLITests(unittest.TestCase):
@@ -58,6 +60,36 @@ class ActionCLITests(unittest.TestCase):
     def test_default_disabled_does_not_freeze_real_plan(self):
         result = self.cli("prepare-action", self.prepare, success=False)
         self.assertIn("LIVE_EXECUTION_DISABLED", result.stderr)
+        self.assertEqual(Journal(self.private / "state").records(), [])
+
+    def test_export_requires_identity_basis_and_writes_separate_private_transports(self):
+        rejected = self.cli("export", success=False)
+        self.assertIn("--identity-basis", rejected.stderr)
+        basis = self.root / "identity.json"
+        basis.write_text(json.dumps({"identity_basis_version": 3, "source_ids": ["fixture-file"],
+                                    "identity_count": 1,
+                                    "source_identity_sha256": hashlib.sha256(b"fixture-file").hexdigest()}))
+        selected = self.root / "selected.json"
+        selected.write_text(json.dumps(["fixture-file"]))
+        args = [sys.executable, "-m", "uqmc_recovery", "--private-dir", str(self.private), "export",
+                "--identity-basis", str(basis), "--allowed-source-ids", str(selected)]
+        result = subprocess.run(args, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        paths = json.loads(result.stdout)
+        self.assertFalse(paths["published"])
+        snapshots = [json.loads(Path(paths[key]).read_text()) for key in ("private", "redacted")]
+        for snapshot in snapshots:
+            validate_snapshot(snapshot)
+            self.assertNotIn("rows", snapshot)
+            self.assertEqual(snapshot["items"][0]["move"]["effect"], "NOT_TRACKED")
+        log = json.loads(Path(paths["operation_log"]).read_text())
+        self.assertEqual(log["headers"], HEADERS)
+        self.assertEqual(log["rows"], [])
+        self.assertEqual(log["snapshot_id"], snapshots[0]["snapshot_id"])
+        self.assertEqual(log["snapshot_id"], snapshots[1]["snapshot_id"])
+        self.assertEqual(json.loads(Path(paths["diagnostics"]).read_text())["identity_basis_origin"], "EXPLICIT")
+        for key in ("private", "redacted", "operation_log", "diagnostics"):
+            self.assertEqual(Path(paths[key]).stat().st_mode & 0o777, 0o600)
         self.assertEqual(Journal(self.private / "state").records(), [])
 
     def test_agent_enable_and_pause_gates_run_before_plan_or_approval_writes(self):

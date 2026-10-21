@@ -3,9 +3,14 @@ import hashlib
 import json
 import unittest
 from contextlib import nullcontext
+from pathlib import Path
+from types import SimpleNamespace
+
+from uqmc_recovery.model import Plan
 
 from uqmc_recovery.projection import (
     HEADERS, WORKBOOK_STATES, build_projections, deliver_projection, delivery_key, source_head,
+    validate_snapshot,
 )
 
 
@@ -43,6 +48,11 @@ class MemoryJournal:
 class ProjectionTests(unittest.TestCase):
     def setUp(self):
         self.journal = MemoryJournal()
+        # Explicit frozen plan order, independent of journal event sequence.
+        order = ["rename-1", "other-op", "move-1", "rename-later", "undo-rename",
+                 "folder-move", "undo-folder"]
+        plan_ref = self.journal.evidence({"operations": [{"operation_id": op} for op in order]})
+        self.journal.append("DRAFTED", payload={"batch_id": "batch-1", "plan_ref": plan_ref})
         self.before = self.journal.evidence({
             "id": "source-private", "name": "=SECRET_FORMULA()", "mime_type": "text/plain",
             "parents": ["private-parent"], "permissions": [{"email": "private@example.test"}],
@@ -68,7 +78,7 @@ class ProjectionTests(unittest.TestCase):
         output = build_projections(self.journal)
         self.assertEqual(output["html"]["items"], [])
         self.assertEqual(output["html"]["operations"], [])
-        self.assertEqual(len(output["workbook"]["rows"]), 1)
+        self.assertEqual(len(output["operation_log"]["rows"]), 1)
 
     def test_public_allowlist_redacts_nested_sensitive_data(self):
         self.add("VERIFIED_APPLIED", reason_code="private@example.test")
@@ -90,13 +100,14 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(output["html"]["snapshot_id"], output["workbook"]["snapshot_id"])
         self.assertEqual(output["html"]["schema_version"], "uqmc.execution.snapshot.v1")
         self.assertEqual(len(HEADERS), 26)
-        self.assertEqual(output["workbook"]["headers"], HEADERS)
-        self.assertTrue(all(len(r) == 26 for r in output["workbook"]["rows"]))
-        self.assertEqual(output["workbook"]["rows"][0][2], "batch-1")
+        self.assertEqual(output["operation_log"]["headers"], HEADERS)
+        self.assertTrue(all(len(r) == 26 for r in output["operation_log"]["rows"]))
+        self.assertEqual(output["operation_log"]["rows"][0][2], "batch-1")
+        self.assertEqual(output["operation_log"]["snapshot_id"], output["workbook"]["snapshot_id"])
 
     def test_formula_name_remains_literal_for_raw_sheet_insert(self):
         self.add("PREPARED")
-        private = build_projections(self.journal)["workbook"]
+        private = build_projections(self.journal)["operation_log"]
         self.assertEqual(private["valueInputOption"], "RAW")
         self.assertEqual(private["rows"][0][12], "=SECRET_FORMULA()")
         self.assertEqual(private["rows"][0][13], '["private-parent"]')
@@ -104,11 +115,11 @@ class ProjectionTests(unittest.TestCase):
     def test_policy_events_do_not_become_log_rows(self):
         for kind in ("DRAFTED", "APPROVED", "REVOKED", "EXCLUDED"):
             self.add(kind)
-        self.assertEqual(build_projections(self.journal)["workbook"]["rows"], [])
+        self.assertEqual(build_projections(self.journal)["operation_log"]["rows"], [])
 
     def test_reconciled_mapping_preserves_attribution_uncertainty(self):
         self.add("RECONCILED_AT_TARGET")
-        row = build_projections(self.journal)["workbook"]["rows"][0]
+        row = build_projections(self.journal)["operation_log"]["rows"][0]
         self.assertIn(row[16], WORKBOOK_STATES)
         self.assertEqual(row[16], "VERIFIED_APPLIED")
         self.assertEqual(row[24], "OBSERVED_TARGET_ATTRIBUTION_UNCERTAIN")
@@ -178,12 +189,12 @@ class ProjectionTests(unittest.TestCase):
     def test_sink_requires_readback_and_freshness_is_explicit(self):
         self.add("VERIFIED_APPLIED")
         projection = build_projections(self.journal)["html"]
-        self.assertIsNone(projection["stale"])
+        self.assertIsNone(build_projections(self.journal)["diagnostics"]["stale"])
         result = deliver_projection(self.journal, "html", projection, lambda key, payload: {})
         self.assertEqual(result["state"], "PUBLICATION_FAILED")
-        latest = build_projections(self.journal, current_source_head=source_head(self.journal.records()))["html"]
+        latest = build_projections(self.journal, current_source_head=source_head(self.journal.records()))["diagnostics"]
         self.assertFalse(latest["stale"])
-        stale = build_projections(self.journal, current_source_head={"seq": 999, "hash": "x"})["html"]
+        stale = build_projections(self.journal, current_source_head={"seq": 999, "hash": "x"})["diagnostics"]
         self.assertTrue(stale["stale"])
 
     def test_frozen_unattempted_plan_is_visible_without_fabricated_observation(self):
@@ -194,10 +205,203 @@ class ProjectionTests(unittest.TestCase):
         self.journal.append("DRAFTED", payload={"run_id": "batch-1", "batch_id": "batch-1",
                                                "proposal_hash": "a" * 64, "plan_ref": ref})
         output = build_projections(self.journal, allowed_source_ids=["source-private"])
-        self.assertEqual(output["html"]["operations"][0]["state"], "NOT_ATTEMPTED")
-        self.assertIsNone(output["html"]["operations"][0]["approved_plan_sha256"])
+        self.assertEqual(output["html"]["operations"], [])
+        self.assertEqual(output["workbook"]["operations"], [])
+        for surface in ("workbook", "html"):
+            item = output[surface]["items"][0]
+            for field in ("move", "rename"):
+                self.assertEqual(item[field], {"effect": "NOT_TRACKED", "last_event_state": None,
+                                               "operation_ids": [], "verified_at_utc": None})
+            self.assertEqual(item["location"]["effect"], "UNKNOWN")
+            self.assertIsNone(item["observed"]["metadata_verified_at_utc"])
         self.assertEqual(output["html"]["items"][0]["observed"]["read_state"], "NEVER_VERIFIED")
-        self.assertEqual(output["workbook"]["rows"], [])
+        self.assertEqual(output["operation_log"]["rows"], [])
+
+    def test_export_has_exact_schema_keys_at_every_level(self):
+        self.add("PREPARED")
+        output = build_projections(self.journal, allowed_source_ids=["source-private"])
+        schema = json.loads((Path(__file__).parents[1] / "schemas" /
+                             "uqmc.execution.snapshot.v1.schema.json").read_text())
+
+        def check_schema(value, spec):
+            if "anyOf" in spec:
+                failures = []
+                for branch in spec["anyOf"]:
+                    try:
+                        check_schema(value, branch)
+                        return
+                    except AssertionError as exc:
+                        failures.append(exc)
+                self.fail(str(failures))
+            kind = spec.get("type")
+            types = {"string": str, "object": dict, "array": list,
+                     "integer": int, "boolean": bool, "null": type(None)}
+            if kind:
+                choices = kind if isinstance(kind, list) else [kind]
+                self.assertIn(type(value), [types[t] for t in choices])
+            if "const" in spec:
+                self.assertEqual(value, spec["const"])
+            if "enum" in spec:
+                self.assertIn(value, spec["enum"])
+            if "minimum" in spec:
+                self.assertGreaterEqual(value, spec["minimum"])
+            if "minLength" in spec:
+                self.assertGreaterEqual(len(value), spec["minLength"])
+            if spec.get("uniqueItems"):
+                self.assertEqual(len(value), len({json.dumps(item, sort_keys=True) for item in value}))
+            if isinstance(value, dict):
+                self.assertFalse(spec["additionalProperties"])
+                self.assertEqual(set(value), set(spec["required"]))
+                for key, item in value.items():
+                    check_schema(item, spec["properties"][key])
+            elif isinstance(value, list):
+                for item in value:
+                    check_schema(item, spec["items"])
+
+        for surface in ("workbook", "html"):
+            validate_snapshot(output[surface])
+            check_schema(output[surface], schema)
+        self.assertNotIn("stale", output["html"])
+        self.assertNotIn("rows", output["workbook"])
+        self.assertIsNone(output["html"]["items"][0]["source_link"])
+
+    def test_strict_validator_rejects_additional_nested_fields(self):
+        self.add("PREPARED")
+        snapshot = build_projections(self.journal)["workbook"]
+        paths = [(), ("coverage",), ("operations", 0), ("items", 0),
+                 ("items", 0, "move"), ("items", 0, "rename"),
+                 ("items", 0, "location"), ("items", 0, "observed")]
+        for path in paths:
+            with self.subTest(path=path):
+                changed = copy.deepcopy(snapshot)
+                target = changed
+                for part in path:
+                    target = target[part]
+                target["private_evidence"] = self.before
+                with self.assertRaises(ValueError):
+                    validate_snapshot(changed)
+
+    def test_strict_validator_rejects_null_order_draft_state_and_invalid_types(self):
+        self.add("PREPARED")
+        snapshot = build_projections(self.journal)["workbook"]
+        changes = [("operations", 0, "operation_order", None),
+                   ("operations", 0, "operation_order", 0),
+                   ("operations", 0, "operation_order", True),
+                   ("operations", 0, "state", "NOT_ATTEMPTED"),
+                   ("coverage", "identity_basis_version", 0),
+                   ("coverage", "identity_count", -1),
+                   ("items", 0, "source_link", 7),
+                   ("generated_at_utc", "2026-10-21Z")]
+        for *path, key, value in changes:
+            with self.subTest(key=key, value=value):
+                changed = copy.deepcopy(snapshot)
+                target = changed
+                for part in path:
+                    target = target[part]
+                target[key] = value
+                with self.assertRaises(ValueError):
+                    validate_snapshot(changed)
+
+    def test_operation_order_uses_frozen_plan_not_dispatch_sequence(self):
+        self.add("PREPARED", op="move-1", action="MOVE", operation_order=999)
+        self.add("ATTEMPTED", op="move-1", action="MOVE", operation_order=888)
+        self.add("PREPARED")
+        output = build_projections(self.journal)
+        self.assertEqual([op["operation_order"] for op in output["workbook"]["operations"]], [3, 1])
+        self.assertEqual([row[5] for row in output["operation_log"]["rows"]], [3, 3, 1])
+
+    def test_sealed_dependency_order_matches_plan_execution_order(self):
+        raw = [{"operation_id": "child", "depends_on": ["base"]},
+               {"operation_id": "independent", "depends_on": []},
+               {"operation_id": "base", "depends_on": []}]
+        plan = Plan("dependency-batch", "dependency-batch", "fixture", tuple(SimpleNamespace(**op) for op in raw))
+        expected = {op.operation_id: index for index, op in enumerate(plan.ordered(), 1)}
+        ref = self.journal.evidence({"run_id": plan.run_id, "batch_id": plan.batch_id, "operations": raw})
+        self.journal.append("DRAFTED", payload={"batch_id": plan.batch_id, "run_id": plan.run_id, "plan_ref": ref})
+        for op in raw:
+            self.add("PREPARED", op=op["operation_id"], batch_id=plan.batch_id, run_id=plan.run_id)
+        output = build_projections(self.journal)
+        self.assertEqual(expected, {op["operation_id"]: op["operation_order"] for op in output["workbook"]["operations"]})
+        self.assertEqual(expected, {row[3]: row[5] for row in output["operation_log"]["rows"]})
+        self.assertEqual(expected, {"independent": 1, "base": 2, "child": 3})
+
+    def test_sealed_invalid_dependencies_or_run_binding_block_export(self):
+        plans = [
+            {"operations": [{"operation_id": "new", "depends_on": ["missing"]}]},
+            {"operations": [{"operation_id": "new", "depends_on": ["new"]}]},
+            {"operations": [{"operation_id": "new"}, {"operation_id": "new"}]},
+            {"operations": [{"operation_id": "new"}], "run_id": "mismatched"},
+            {"operations": [{"operation_id": "new"}], "batch_id": "mismatched"},
+        ]
+        for plan in plans:
+            with self.subTest(plan=plan):
+                journal = MemoryJournal()
+                ref = journal.evidence(plan)
+                journal.append("DRAFTED", payload={"run_id": "batch", "batch_id": "batch", "plan_ref": ref})
+                with self.assertRaises(ValueError):
+                    build_projections(journal)
+
+    def test_validator_accepts_nullable_operation_source_and_reason(self):
+        self.add("PREPARED")
+        snapshot = build_projections(self.journal)["workbook"]
+        snapshot["operations"][0].update(source_id=None, reason_code=None)
+        self.assertIs(validate_snapshot(snapshot), snapshot)
+
+    def test_validator_rejects_empty_required_identifiers(self):
+        self.add("PREPARED")
+        snapshot = build_projections(self.journal)["workbook"]
+        for path in (("operations", 0, "operation_id"), ("operations", 0, "run_id"),
+                     ("items", 0, "source_id")):
+            with self.subTest(path=path):
+                changed = copy.deepcopy(snapshot)
+                changed[path[0]][path[1]][path[2]] = ""
+                with self.assertRaises(ValueError):
+                    validate_snapshot(changed)
+
+    def test_validator_rejects_duplicate_array_values_at_every_level(self):
+        self.add("PREPARED")
+        snapshot = build_projections(self.journal)["workbook"]
+        paths = [("operations",), ("items",), ("operations", 0, "depends_on_operation_ids"),
+                 ("items", 0, "reason_codes"), ("items", 0, "move", "operation_ids"),
+                 ("items", 0, "rename", "operation_ids"),
+                 ("items", 0, "location", "ancestor_move_operation_ids"),
+                 ("items", 0, "observed", "parent_ids")]
+        for path in paths:
+            with self.subTest(path=path):
+                changed = copy.deepcopy(snapshot)
+                target = changed
+                for part in path[:-1]:
+                    target = target[part]
+                array = target[path[-1]]
+                repeated = array[0] if array else "duplicate"
+                target[path[-1]] = [repeated, copy.deepcopy(repeated)]
+                with self.assertRaises(ValueError):
+                    validate_snapshot(changed)
+
+    def test_action_without_sealed_order_blocks_export(self):
+        self.add("PREPARED", op="not-in-frozen-plan")
+        with self.assertRaisesRegex(ValueError, "no sealed plan"):
+            build_projections(self.journal)
+
+    def test_identity_basis_binds_exact_ids_and_public_selection(self):
+        ids = ["source-private", "untracked"]
+        fingerprint = hashlib.sha256("\n".join(sorted(ids)).encode("utf-8")).hexdigest()
+        basis = {"identity_basis_version": 7, "source_ids": ids,
+                 "identity_count": 2, "source_identity_sha256": fingerprint}
+        output = build_projections(self.journal, allowed_source_ids=["source-private"],
+                                   identity_basis=basis,
+                                   verified_source_links={"source-private": "https://example.test/verified"})
+        for surface in ("workbook", "html"):
+            self.assertEqual(output[surface]["coverage"]["identity_basis_version"], 7)
+            self.assertEqual(output[surface]["coverage"]["identity_count"], 2)
+            self.assertEqual(output[surface]["coverage"]["source_identity_sha256"], fingerprint)
+        self.assertEqual(output["html"]["items"][0]["source_link"], "https://example.test/verified")
+        for broken in ({**basis, "identity_count": 3}, {**basis, "source_identity_sha256": "0" * 64},
+                       {**basis, "source_ids": ids + [ids[0]]}):
+            with self.assertRaises(ValueError):
+                build_projections(self.journal, identity_basis=broken)
+        with self.assertRaisesRegex(ValueError, "outside identity basis"):
+            build_projections(self.journal, allowed_source_ids=["unknown"], identity_basis=basis)
 
     def test_revocation_resolves_approval_id_without_run_id(self):
         self.journal.append("APPROVED", payload={"batch_id": "batch-1", "approval_id": "a1",

@@ -502,6 +502,9 @@ class ReuseRenameSectionTests(ReuseSectionImporterTests):
         self.projection["rename_bindings"][0]["exact_target_name"] = "Unauthorized"
         result = self.run_import()
         self.assertEqual(result.manifest["section_reason_code"], "INDEPENDENT_RENAME_BINDING_MISMATCH")
+        actions = {row["reference"]: row["action"] for row in result.manifest["rows"]}
+        self.assertEqual(actions["RENAME-ROOT"], "RENAME")
+        self.assertEqual(actions["ROOT/ROOT-ITEM"], "MOVE")
 
     def test_consistent_wrong_binding_and_resolution_cannot_override_workbook(self):
         binding = next(item for item in self.projection["rename_bindings"] if item["source_id"] == "source")
