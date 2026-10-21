@@ -1,7 +1,7 @@
 """Default-disabled handoff protocol; this module never calls a connector.
 
 AGENT_ASSISTED mode requires separately recorded authorization and dispatch review.
-It emits one bounded ticket for an external authorized agent, with a documented
+It emits one bounded ticket for an external authorized controller, with a documented
 read/write race window. Local evidence is not cryptographically authenticated:
 the controller must import provenance from trusted user/tool history honestly.
 Strict complete metadata and atomic CAS below describe the fixture contract only;
@@ -23,6 +23,7 @@ from .model import Approval, FOLDER, Operation, Plan, SafetyError, WITHDRAWN_ID,
 _BRIDGE = "TEST_ONLY_HANDOFF"
 _AGENT_BRIDGE = "AGENT_ASSISTED_HANDOFF"
 AGENT_TOOL = "mcp__codex_apps__google_drive_update_file"
+DIRECT_API_TOOL = "google.drive.v3.files.update"
 AGENT_LIMITATIONS = {"NO_ATOMIC_PRECONDITION", "READ_WRITE_RACE", "NO_EXACTLY_ONCE",
                      "UNKNOWN_PROVIDER_FIELDS", "UNCERTAIN_DISPATCH_NEVER_RETRIED"}
 _TERMINAL = {"RECONCILED_AT_TARGET", "FAILED_NOT_APPLIED"}
@@ -51,21 +52,39 @@ class _FixtureEvidenceAdapter:
 
 
 class ActionBridge:
-    """Persist an exact simulation request before a separately invoked fake tool.
+    """Persist a bounded request before a separately invoked transport.
 
     ``mark_attempt`` needs a fresh snapshot and complete repeated preflight. The
-    fixture's concurrency proof binds their exact contents; a real connector
-    implementation would need a separately reviewed limitations/unlock policy.
+    fixture mode binds an atomic test precondition. AGENT_ASSISTED is the existing
+    partial-evidence profile; its explicit execution_transport records whether
+    an agent connector or a local direct API driver actually makes the request.
+    This class never makes either request, and neither real transport claims CAS.
     """
 
-    def __init__(self, journal, mode="DISABLED", fault=None, controller_id=None):
+    def __init__(self, journal, mode="DISABLED", fault=None, controller_id=None,
+                 execution_transport="AGENT_CONNECTOR"):
         if mode not in {"DISABLED", "TEST_ONLY", "AGENT_ASSISTED"}:
             raise SafetyError("LIVE_EXECUTION_DISABLED")
         self.journal, self.mode = journal, mode
         self.controller_id = controller_id
+        if execution_transport not in {"AGENT_CONNECTOR", "DIRECT_GOOGLE_API"}:
+            raise SafetyError("UNKNOWN_EXECUTION_TRANSPORT")
+        if execution_transport == "DIRECT_GOOGLE_API" and mode != "AGENT_ASSISTED":
+            raise SafetyError("DIRECT_API_EVIDENCE_PROFILE_REQUIRED")
+        self.execution_transport = execution_transport
         if mode == "AGENT_ASSISTED" and (not isinstance(controller_id, str) or not controller_id):
             raise SafetyError("AGENT_CONTROLLER_REQUIRED")
         self.fault = fault or (lambda point: None)
+
+    def _transport_review(self, enable):
+        # Absence means the historical connector boundary, never a new API grant.
+        if enable.get("execution_transport", "AGENT_CONNECTOR") != self.execution_transport:
+            raise SafetyError("EXECUTION_TRANSPORT_REVIEW_REQUIRED")
+
+    def _envelope_transport(self, envelope):
+        if (self.mode == "AGENT_ASSISTED"
+                and envelope.get("execution_transport", "AGENT_CONNECTOR") != self.execution_transport):
+            raise SafetyError("HANDOFF_EXECUTION_TRANSPORT_MISMATCH")
 
     def _mode(self, dispatch=False):
         if self.mode not in {"DISABLED", "TEST_ONLY", "AGENT_ASSISTED"} or (dispatch and self.mode == "DISABLED"):
@@ -207,6 +226,7 @@ class ActionBridge:
             section_authority = self._agent_approval(plan, approval)
             authorization = copy.deepcopy(authorization_evidence)
             enable = copy.deepcopy(enable_evidence)
+            self._transport_review(enable)
             if authorization.get("section_authority") != section_authority:
                 raise SafetyError("AGENT_SECTION_AUTHORITY_BINDING_REQUIRED")
             if (authorization.get("kind") != "EXPLICIT_BATCH_AUTHORIZATION"
@@ -251,7 +271,8 @@ class ActionBridge:
             common = {"mode": "AGENT_ASSISTED", "run_id": plan.run_id, "batch_id": plan.batch_id,
                       "proposal_revision": plan.proposal_revision, "proposal_hash": plan.proposal_hash,
                       "approval_id": approval.approval_id, "approval_ref": approval_ref,
-                      "controller_id": self.controller_id, "actor": approval.actor}
+                      "controller_id": self.controller_id, "actor": approval.actor,
+                      "execution_transport": self.execution_transport}
             if not prior:
                 self._emit("APPROVED", None, common, 0)
             auth_payload = common | {"authorization_ref": authorization_ref}
@@ -285,6 +306,7 @@ class ActionBridge:
                     or digest(self.journal.read_evidence(p["approval_ref"])) != digest(approval.body())):
                 raise SafetyError("AGENT_ENABLE_SCOPE_MISMATCH")
         enable = self.journal.read_evidence(p["enable_ref"])
+        self._transport_review(enable)
         authorization = self.journal.read_evidence(p["authorization_ref"])
         if authorization.get("section_authority") != section_authority:
             raise SafetyError("AGENT_SECTION_AUTHORITY_CHANGED")
@@ -586,6 +608,7 @@ class ActionBridge:
                 if previous[-1]["kind"] != "PREPARED" or previous[-1]["payload"].get("bridge") != bridge_kind:
                     raise SafetyError("HANDOFF_ALREADY_ATTEMPTED_OR_FINISHED")
                 envelope, event = self._load(previous[-1]["payload"]["envelope_hash"])
+                self._envelope_transport(envelope)
                 same_before = (self._agent_exact(self.journal.read_evidence(envelope["before_ref"])) == self._agent_exact(before)
                                if self.mode == "AGENT_ASSISTED" else self.journal.read_evidence(envelope["before_ref"]) == before)
                 saved_check = self.journal.read_evidence(envelope["preflight_ref"])
@@ -623,11 +646,13 @@ class ActionBridge:
                         "intended_ref": self.journal.evidence(expected),
                         "preflight_ref": self.journal.evidence(check), "scope_ids": scope,
                         "prepared_at": prepared_at.isoformat(), "expires_at": expires.isoformat(),
-                        "tool": AGENT_TOOL if agent else "fixture.drive.update_file", "args": args,
+                        "tool": (DIRECT_API_TOOL if self.execution_transport == "DIRECT_GOOGLE_API" else AGENT_TOOL)
+                                if agent else "fixture.drive.update_file", "args": args,
                         "dispatch_authorized": False, "live_execution_enabled": False}
             if agent:
                 authority = self._agent_authority(plan, approval)
                 envelope.update(controller_id=self.controller_id, authorization_ref=authority["authorization_ref"],
+                                execution_transport=self.execution_transport,
                                 enable_ref=authority["enable_ref"], atomic_precondition=False,
                                 limitations=sorted(AGENT_LIMITATIONS),
                                 metadata_unavailable=before.get("metadata_unavailable", []),
@@ -645,6 +670,7 @@ class ActionBridge:
         with self.journal.locked():
             self._mode(dispatch=True)
             envelope, prepared = self._load(envelope_hash)
+            self._envelope_transport(envelope)
             if envelope["mode"] != self.mode or (self.mode == "AGENT_ASSISTED" and envelope["controller_id"] != self.controller_id):
                 raise SafetyError("HANDOFF_MODE_OR_CONTROLLER_MISMATCH")
             if any(r["kind"] == "ATTEMPTED" for r in self._events(envelope_hash)):
@@ -687,11 +713,14 @@ class ActionBridge:
             self.fault("before_ticket_return")
             # This value is returned only once. A crash after the journal append
             # but before this return consumes it without proving any dispatch.
-            return {"mode": self.mode, "envelope_hash": envelope_hash,
+            ticket = {"mode": self.mode, "envelope_hash": envelope_hash,
                     "attempt_key": envelope["attempt_key"], "tool": envelope["tool"],
                     "args": copy.deepcopy(envelope["args"]), "dispatch_ticket": str(uuid.uuid4()),
                     "live_execution_enabled": False, "agent_dispatch_authorized": self.mode == "AGENT_ASSISTED",
                     "atomic_precondition": self.mode == "TEST_ONLY"}
+            if self.mode == "AGENT_ASSISTED":
+                ticket["execution_transport"] = envelope.get("execution_transport", "AGENT_CONNECTOR")
+            return ticket
 
     def ingest_result(self, envelope_hash, attempt_key, raw, receipt_id=None):
         with self.journal.locked():
@@ -809,7 +838,9 @@ class ActionBridge:
                          "TRUSTED_TOOL_NONDISPATCH" if not_dispatched else "TRUSTED_TOOL_COMPLETION")
             raw = receipt["raw"]
             returned = raw.get("structuredContent", {})
-            if (not completion.get("tool_call_id") or completion.get("tool") != AGENT_TOOL
+            # The local driver attests its synchronous API invocation using the
+            # sealed API transport name; it must not claim an assistant tool ran.
+            if (not completion.get("tool_call_id") or completion.get("tool") != envelope["tool"]
                     or completion.get("args_hash") != digest(envelope["args"])
                     or completion.get("raw_response_hash") != digest(raw)
                     or not parsed(attempted["at"]) <= parsed(completion["completed_at"]) <= datetime.now(timezone.utc)):

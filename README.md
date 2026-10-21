@@ -38,7 +38,7 @@ python3 -m uqmc_recovery reconcile --request-id REQUEST
 
 The [action handoff protocol](docs/action-handoff.md) adds `prepare-action`, `mark-attempt`, `ingest-result` and `reconcile-action`. The default is disabled. Its agent mode requires a frozen approval, independently reviewed dispatch enablement and fresh evidence; actual connector integration remains subject to review and a bounded pilot. `handoff-demo` bootstraps a fake-tool example and proves the local ticket cannot be issued twice. A local ticket cannot prevent a person from manually repeating an external tool call, and it is not an atomic Drive precondition or server idempotency key.
 
-Observed connector limits and the pilot gates are in [operations and recovery](docs/operations.md). The standalone adapter deliberately raises an error rather than pretending it can access authenticated tools.
+Observed connector limits and the pilot gates are in [operations and recovery](docs/operations.md). The connector adapter cannot access assistant tools from standalone code. The optional [direct Google Drive transport](docs/DIRECT_API.md) runs the existing plan and journal in a normal Python loop after separate Google authorization. It is prepared and fixture-tested, not live-tested; no OAuth grant or automatic resume is performed. An unresolved prior request blocks apply.
 
 ## Evidence and recovery
 
