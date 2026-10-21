@@ -23,6 +23,7 @@ import stat
 
 from .model import SafetyError
 
+FULL_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 METADATA_SCOPE = "https://www.googleapis.com/auth/drive.metadata"
 READONLY_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
 DEFAULT_REQUEST_TIMEOUT = 15
@@ -444,9 +445,11 @@ class GoogleDriveTransport:
         except Exception:
             raise TransportError("INVALID_AUTHORIZED_TOKEN_FILE") from None
         declared = set(credentials.granted_scopes or credentials.scopes or ())
-        permitted = {METADATA_SCOPE} if apply else {METADATA_SCOPE, READONLY_SCOPE}
-        if not declared or not declared <= permitted or (apply and METADATA_SCOPE not in declared):
-            raise TransportError("EXACT_METADATA_SCOPE_REQUIRED")
+        permitted_profiles = ({METADATA_SCOPE}, {FULL_DRIVE_SCOPE})
+        if not apply:
+            permitted_profiles += ({READONLY_SCOPE},)
+        if declared not in permitted_profiles:
+            raise TransportError("EXACT_SUPPORTED_DRIVE_SCOPE_REQUIRED")
         # httplib2 otherwise has its own socket retry loop below HttpRequest.
         # This dedicated single-writer process uses one attempt at that layer.
         httplib2.RETRIES = 1
@@ -463,8 +466,8 @@ class GoogleDriveTransport:
                 if not credentials.valid:
                     raise TransportError("AUTH_REFRESH_FAILED")
             scopes = set(credentials.granted_scopes or credentials.scopes or ())
-            if not scopes or not scopes <= permitted or (apply and METADATA_SCOPE not in scopes):
-                raise TransportError("EXACT_METADATA_SCOPE_REQUIRED")
+            if scopes not in permitted_profiles:
+                raise TransportError("EXACT_SUPPORTED_DRIVE_SCOPE_REQUIRED")
         try:
             service = build("drive", "v3", http=auth_http,
                             cache_discovery=False, static_discovery=True)

@@ -93,9 +93,25 @@ python3 -m uqmc_recovery.google_login \
   --token secrets/token.json
 ```
 
-This command is the only entry point that initiates OAuth. It uses Google's installed-app browser flow on a temporary localhost port with account selection, and requests only `https://www.googleapis.com/auth/drive.metadata`. Add `--readonly` for a preview-only `drive.metadata.readonly` token. It saves the token with mode `0600` in a private directory and refuses to overwrite an existing token. Inside a checkout, the output path must be Git-ignored and untracked. It does not run the migration. A Sheets integration would need a separately disclosed Sheets scope; this login command does not request one.
+This command is the only entry point that initiates OAuth. It uses Google's installed-app browser flow on a temporary localhost port with account selection, and by default requests only `https://www.googleapis.com/auth/drive.metadata`. Add `--readonly` for a preview-only `drive.metadata.readonly` token. It saves the token with mode `0600` in a private directory and refuses to overwrite an existing token. Inside a checkout, the output path must be Git-ignored and untracked. It does not run the migration. A Sheets integration would need a separately disclosed Sheets scope; this login command does not request one.
 
-These are restricted account-wide metadata scopes. `drive.file` does not automatically cover arbitrary existing files merely because their IDs are known. No full file-content scope is proposed. See Google's [scope guide](https://developers.google.com/workspace/drive/api/guides/api-specific-auth), [metadata update API](https://developers.google.com/workspace/drive/api/reference/rest/v3/files/update), and [Python authorization quickstart](https://developers.google.com/workspace/drive/api/quickstart/python).
+These are restricted account-wide metadata scopes. `drive.file` does not automatically cover arbitrary existing files merely because their IDs are known. Full Drive access is available only through the explicit option below. See Google's [scope guide](https://developers.google.com/workspace/drive/api/guides/api-specific-auth), [metadata update API](https://developers.google.com/workspace/drive/api/reference/rest/v3/files/update), and [Python authorization quickstart](https://developers.google.com/workspace/drive/api/quickstart/python).
+
+## Explicit full-Drive option
+
+The user may separately authorize `https://www.googleapis.com/auth/drive`, which includes access to file contents and management. In the existing Google Cloud project, add this scope under the OAuth consent screen / Google Auth Platform **Data Access** settings if needed. Keep the intended signing-in account listed as a test user while the app is in testing. Reuse the existing Desktop client; no new credentials are required by this code change.
+
+Run this login manually from the checkout, then complete Google consent yourself:
+
+```sh
+.venv/bin/python -m uqmc_recovery.google_login \
+  --client-json secrets/API_KEY.json \
+  --token secrets/token-drive.json --full-drive
+```
+
+The existing `secrets/token.json` is preserved. Login refuses to overwrite any token path and saves the new token as mode `0600` under the ignored `secrets/` directory. `--full-drive` and `--readonly` are mutually exclusive; omitting both keeps metadata-only login. Only the exact requested scope is accepted. The transport accepts the explicitly supplied full-Drive token while retaining its exact source-ID, mutation-ID and action guards; it still exposes only metadata operations. It does not start a run or expand the frozen plan. No Sheets scope is requested.
+
+After successful consent, a separate authorized command must explicitly select `--token secrets/token-drive.json`. The currently authorized execution remains the receiving-folder move and the already saved 30-certificate set. Do not run an unrestricted full-plan command merely because a broader token exists. Full scope has not yet been live-tested as a fix for the refused move.
 
 ## Offline validation
 

@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from uqmc_recovery.direct_transport import (
-    GoogleDriveTransport, TransportError, METADATA_SCOPE, READONLY_SCOPE, FILE_FIELDS,
+    GoogleDriveTransport, TransportError, METADATA_SCOPE, READONLY_SCOPE, FULL_DRIVE_SCOPE, FILE_FIELDS,
     _single_send_http_class, _ReplayBlocked,
 )
 
@@ -191,6 +191,79 @@ class DirectTransportTests(unittest.TestCase):
             http.request(connection)
         self.assertEqual(connection.actual_sends, 1)
 
+    def test_full_drive_transport_retains_exact_id_and_apply_guards(self):
+        try:
+            from google.oauth2.credentials import Credentials
+        except ImportError:
+            self.skipTest("Optional direct dependencies are not installed")
+        credentials = Credentials(token="fixture-token", scopes=[FULL_DRIVE_SCOPE])
+        service = Service({"id": "file-a"})
+        with tempfile.TemporaryDirectory() as folder:
+            token = Path(folder) / "token-drive.json"
+            token.write_text("synthetic fixture only")
+            token.chmod(0o600)
+            with patch.object(Credentials, "from_authorized_user_file", return_value=credentials), patch("googleapiclient.discovery.build", return_value=service):
+                transport = GoogleDriveTransport.from_authorized_user_file(token, apply=True,
+                    allowed_ids={"file-a", "parent-a"}, mutation_ids={"file-a"})
+                self.assertEqual(service.calls, [])
+                for identity, error in (("unapproved", "OUTSIDE_FROZEN_SCOPE"), ("parent-a", "OUTSIDE_APPROVED_MUTATION_IDS")):
+                    with self.assertRaisesRegex(TransportError, error):
+                        transport.update_metadata({"fileId": identity, "name": "forbidden"})
+                self.assertEqual(service.calls, [])
+                transport.update_metadata({"fileId": "file-a", "name": "approved.pdf"})
+                self.assertEqual(len([x for x in service.calls if x[0] == "files.update"]), 1)
+                preview = GoogleDriveTransport.from_authorized_user_file(token, allowed_ids={"file-a"})
+                with self.assertRaisesRegex(TransportError, "READ_ONLY_TRANSPORT"):
+                    preview.update_metadata({"fileId": "file-a", "name": "blocked"})
+                self.assertEqual(token.read_text(), "synthetic fixture only")
+
+    def test_full_drive_refresh_revalidates_actual_grant_before_dispatch(self):
+        try:
+            from google.oauth2.credentials import Credentials
+        except ImportError:
+            self.skipTest("Optional direct dependencies are not installed")
+        from datetime import datetime, timedelta, timezone
+        for grants, allowed in (([FULL_DRIVE_SCOPE], True), ([READONLY_SCOPE], False),
+                                ([FULL_DRIVE_SCOPE, "https://www.googleapis.com/auth/spreadsheets"], False)):
+            with self.subTest(grants=grants), tempfile.TemporaryDirectory() as folder:
+                credentials = Credentials(token="expired-fixture", refresh_token="fixture-refresh", scopes=[FULL_DRIVE_SCOPE],
+                    expiry=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1))
+                def refresh(request):
+                    credentials._granted_scopes = grants
+                    credentials.expiry = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=1)
+                token = Path(folder) / "token-drive.json"
+                token.write_text("fixture only")
+                token.chmod(0o600)
+                service = Service({"id": "file-a"})
+                with patch.object(Credentials, "from_authorized_user_file", return_value=credentials), patch.object(credentials, "refresh", side_effect=refresh) as refresh_call, patch("googleapiclient.discovery.build", return_value=service):
+                    transport = GoogleDriveTransport.from_authorized_user_file(token, apply=True, allowed_ids={"file-a"})
+                    if allowed:
+                        transport.update_metadata({"fileId": "file-a", "name": "approved.pdf"})
+                    else:
+                        with self.assertRaisesRegex(TransportError, "EXACT_SUPPORTED_DRIVE_SCOPE_REQUIRED"):
+                            transport.update_metadata({"fileId": "file-a", "name": "approved.pdf"})
+                        self.assertEqual(service.calls, [])
+                    refresh_call.assert_called_once()
+                    self.assertEqual(token.read_text(), "fixture only")
+
+    def test_transport_rejects_mixed_or_unrelated_scope_profiles(self):
+        try:
+            from google.oauth2.credentials import Credentials
+        except ImportError:
+            self.skipTest("Optional direct dependencies are not installed")
+        with tempfile.TemporaryDirectory() as folder:
+            token = Path(folder) / "fixture.json"
+            token.write_text("fixture only")
+            token.chmod(0o600)
+            for scopes in ([FULL_DRIVE_SCOPE, METADATA_SCOPE], [READONLY_SCOPE, METADATA_SCOPE],
+                           [FULL_DRIVE_SCOPE, "https://www.googleapis.com/auth/spreadsheets"], []):
+                with self.subTest(scopes=scopes):
+                    credentials = Credentials(token="fixture", scopes=scopes)
+                    with patch.object(Credentials, "from_authorized_user_file", return_value=credentials), patch("googleapiclient.discovery.build") as build:
+                        with self.assertRaisesRegex(TransportError, "EXACT_SUPPORTED_DRIVE_SCOPE_REQUIRED"):
+                            GoogleDriveTransport.from_authorized_user_file(token, allowed_ids={"file-a"})
+                        build.assert_not_called()
+
     def test_explicit_token_loader_uses_supported_auth_without_grant_or_persistence(self):
         calls = []
         credentials = types.SimpleNamespace(scopes=[METADATA_SCOPE], granted_scopes=None,
@@ -248,11 +321,11 @@ class DirectTransportTests(unittest.TestCase):
             refresh_request = next(call[1] for call in calls if call[0] == "refresh")
             self.assertIs(refresh_request[1], auth["http"])
             self.assertEqual(refresh_request[1].timeout, 15)
-            credentials.scopes = ["https://www.googleapis.com/auth/drive"]
-            with self.assertRaisesRegex(TransportError, "EXACT_METADATA_SCOPE_REQUIRED"):
+            credentials.scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+            with self.assertRaisesRegex(TransportError, "EXACT_SUPPORTED_DRIVE_SCOPE_REQUIRED"):
                 GoogleDriveTransport.from_authorized_user_file(token, allowed_ids={"file-a"})
             credentials.scopes = [READONLY_SCOPE]
-            with self.assertRaisesRegex(TransportError, "EXACT_METADATA_SCOPE_REQUIRED"):
+            with self.assertRaisesRegex(TransportError, "EXACT_SUPPORTED_DRIVE_SCOPE_REQUIRED"):
                 GoogleDriveTransport.from_authorized_user_file(token, apply=True, allowed_ids={"file-a"})
             preview = GoogleDriveTransport.from_authorized_user_file(token, allowed_ids={"file-a"})
             self.assertFalse(preview.apply_enabled)

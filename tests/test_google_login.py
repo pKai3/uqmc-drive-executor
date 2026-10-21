@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from uqmc_recovery.direct_transport import METADATA_SCOPE, READONLY_SCOPE
+from uqmc_recovery.direct_transport import METADATA_SCOPE, READONLY_SCOPE, FULL_DRIVE_SCOPE
 from uqmc_recovery.google_login import login, main, _save_exclusive
 from uqmc_recovery.model import SafetyError
 
@@ -60,6 +60,58 @@ class GoogleLoginTests(unittest.TestCase):
     def test_readonly_scope_is_only_requested_scope(self):
         login(self.client, self.token, readonly=True, flow_factory=self.factory)
         self.assertEqual(self.calls[0]["scopes"], [READONLY_SCOPE])
+
+    def test_explicit_full_drive_login_uses_separate_private_token(self):
+        self.token.parent.mkdir(mode=0o700)
+        self.token.write_text("existing metadata fixture")
+        full_token = self.token.with_name("token-drive.json")
+        result = login(self.client, full_token, full_drive=True, flow_factory=self.factory)
+        self.assertEqual(self.calls[0]["scopes"], [FULL_DRIVE_SCOPE])
+        self.assertEqual(result["scope"], FULL_DRIVE_SCOPE)
+        self.assertFalse(result["migration_started"])
+        self.assertEqual(json.loads(full_token.read_text())["scopes"], [FULL_DRIVE_SCOPE])
+        self.assertEqual(stat.S_IMODE(full_token.stat().st_mode), 0o600)
+        self.assertEqual(self.token.read_text(), "existing metadata fixture")
+        count = len(self.calls)
+        with self.assertRaisesRegex(SafetyError, "TOKEN_ALREADY_EXISTS"):
+            login(self.client, full_token, full_drive=True, flow_factory=self.factory)
+        self.assertEqual(len(self.calls), count)
+        self.assertEqual(self.token.read_text(), "existing metadata fixture")
+
+    def test_conflicting_full_drive_and_readonly_never_start_consent(self):
+        with self.assertRaises(SafetyError):
+            login(self.client, self.token, readonly=True, full_drive=True, flow_factory=self.factory)
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.token.exists())
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as result:
+            main(["--client-json", "unused", "--token", "unused", "--full-drive", "--readonly"])
+        self.assertEqual(result.exception.code, 2)
+
+    def test_full_drive_login_rejects_different_or_extra_grants(self):
+        for grants in ([METADATA_SCOPE], [FULL_DRIVE_SCOPE, METADATA_SCOPE],
+                       [FULL_DRIVE_SCOPE, "https://www.googleapis.com/auth/spreadsheets"]):
+            with self.subTest(grants=grants):
+                def factory(*args, **kwargs):
+                    class Credentials:
+                        granted_scopes = grants
+                        refresh_token = "fixture-refresh"
+                    class Flow:
+                        def run_local_server(self, **options):
+                            return Credentials()
+                    return Flow()
+                with self.assertRaisesRegex(SafetyError, "EXACT_REQUESTED_SCOPE"):
+                    login(self.client, self.token, full_drive=True, flow_factory=factory)
+                self.assertFalse(self.token.exists())
+
+    def test_full_drive_cli_discloses_content_access_and_does_not_migrate(self):
+        output = io.StringIO()
+        with patch("uqmc_recovery.google_login.login", return_value={"migration_started": False}) as call:
+            with contextlib.redirect_stdout(output):
+                result = main(["--client-json", "client.json", "--token", "secrets/token-drive.json", "--full-drive"])
+        self.assertEqual(result, 0)
+        call.assert_called_once_with("client.json", "secrets/token-drive.json", readonly=False, full_drive=True)
+        self.assertIn("content", output.getvalue().lower())
+        self.assertIn("does not run", output.getvalue())
 
     def test_existing_output_is_never_replaced_or_new_consent_started(self):
         self.token.parent.mkdir(mode=0o700)
@@ -124,7 +176,7 @@ class GoogleLoginTests(unittest.TestCase):
                         def run_local_server(self, **options):
                             return Credentials()
                     return Flow()
-                with self.assertRaisesRegex(SafetyError, "EXACT_METADATA_SCOPE"):
+                with self.assertRaisesRegex(SafetyError, "EXACT_REQUESTED_SCOPE"):
                     login(self.client, self.token, flow_factory=factory)
                 self.assertFalse(self.token.exists())
 
@@ -142,7 +194,7 @@ class GoogleLoginTests(unittest.TestCase):
             with contextlib.redirect_stdout(output):
                 result = main(["--client-json", "client.json", "--token", "protected/token.json", "--readonly"])
         self.assertEqual(result, 0)
-        call.assert_called_once_with("client.json", "protected/token.json", readonly=True)
+        call.assert_called_once_with("client.json", "protected/token.json", readonly=True, full_drive=False)
         self.assertIn("does not run", output.getvalue())
 
 

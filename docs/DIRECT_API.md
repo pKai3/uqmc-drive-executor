@@ -13,11 +13,11 @@ The prepared code does not create credentials or start browser authorization. It
 
 `drive.metadata` is accepted by both [files.update](https://developers.google.com/workspace/drive/api/reference/rest/v3/files/update) and [permissions.list](https://developers.google.com/workspace/drive/api/reference/rest/v3/permissions/list). The executor uses only metadata updates: an exact name or exact parent-ID additions/removals. It does not upload/download file bodies, edit sharing, transfer ownership, delete files, or create folders.
 
-The narrower `drive.file` scope covers files opened with or explicitly shared with this particular app. Supplying existing Drive IDs does not itself authorize those files for the app, so this scope is not a drop-in grant for an existing inventory. Google lists both metadata scopes as restricted; applicable consent, testing and verification requirements must be followed. No full `drive` or content-download scope is proposed. See Google's [scope guide](https://developers.google.com/workspace/drive/api/guides/api-specific-auth).
+The narrower `drive.file` scope covers files opened with or explicitly shared with this particular app. Supplying existing Drive IDs does not itself authorize those files for the app, so this scope is not a drop-in grant for an existing inventory. Google lists both metadata scopes as restricted; applicable consent, testing and verification requirements must be followed. An explicit full `drive` login option is now available with separate user consent; see [the desired-state login instructions](DESIRED_STATE.md#explicit-full-drive-option). It grants content access even though the executor still only sends metadata updates. See Google's [scope guide](https://developers.google.com/workspace/drive/api/guides/api-specific-auth).
 
 ## Setup still requiring authorization
 
-No Google setup has been performed. Before a direct API run, the user must explicitly approve the Google account, OAuth application/project and requested scope:
+Existing metadata credentials stay intact. Any new scope requires separate user consent for the intended Google account and OAuth application/project:
 
 1. Select a Google Cloud project and enable the Drive API. Configure its consent settings and create or supply an appropriate **Desktop app** OAuth client.
 2. In a separate, user-authorized setup step, complete Google sign-in and consent for the chosen scope. Google's [Python quickstart](https://developers.google.com/workspace/drive/api/quickstart/python) uses the supported `google-auth-oauthlib` desktop flow and a local loopback callback. Do not run that flow implicitly from preview or apply.

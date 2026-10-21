@@ -11,7 +11,7 @@ import subprocess
 from pathlib import Path
 import tempfile
 
-from .direct_transport import METADATA_SCOPE, READONLY_SCOPE
+from .direct_transport import FULL_DRIVE_SCOPE, METADATA_SCOPE, READONLY_SCOPE
 from .model import SafetyError
 
 
@@ -77,11 +77,13 @@ def _save_exclusive(path, content):
         os.unlink(temporary)
 
 
-def login(client_json, token, *, readonly=False, flow_factory=None):
+def login(client_json, token, *, readonly=False, full_drive=False, flow_factory=None):
     """Called only by an explicit operator command; tests inject a fake flow."""
+    if readonly and full_drive:
+        raise SafetyError("CONFLICTING_LOGIN_SCOPE_OPTIONS")
     config = _client_config(client_json)
     path = _token_path(token)
-    scope = READONLY_SCOPE if readonly else METADATA_SCOPE
+    scope = FULL_DRIVE_SCOPE if full_drive else READONLY_SCOPE if readonly else METADATA_SCOPE
     if flow_factory is None:
         try:
             from google_auth_oauthlib.flow import InstalledAppFlow
@@ -97,11 +99,11 @@ def login(client_json, token, *, readonly=False, flow_factory=None):
             prompt="consent select_account", access_type="offline", include_granted_scopes="false")
         granted = set(credentials.granted_scopes or credentials.scopes or ())
         if granted != {scope} or not credentials.refresh_token:
-            raise SafetyError("EXACT_METADATA_SCOPE_AND_REFRESH_TOKEN_REQUIRED")
+            raise SafetyError("EXACT_REQUESTED_SCOPE_AND_REFRESH_TOKEN_REQUIRED")
         serialized = credentials.to_json()
         parsed = json.loads(serialized)
         if set(parsed.get("scopes", [])) != {scope}:
-            raise SafetyError("EXACT_METADATA_SCOPE_AND_REFRESH_TOKEN_REQUIRED")
+            raise SafetyError("EXACT_REQUESTED_SCOPE_AND_REFRESH_TOKEN_REQUIRED")
     except SafetyError:
         raise
     except Exception:
@@ -115,11 +117,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--client-json", required=True, help="Downloaded OAuth Desktop app client JSON")
     parser.add_argument("--token", required=True, help="New private token file; inside a Git checkout it must be ignored and untracked")
-    parser.add_argument("--readonly", action="store_true", help="Request Drive metadata read-only access")
+    scope_options = parser.add_mutually_exclusive_group()
+    scope_options.add_argument("--readonly", action="store_true", help="Request Drive metadata read-only access")
+    scope_options.add_argument("--full-drive", action="store_true", help="Explicitly request full Drive access, including file contents and management")
     args = parser.parse_args(argv)
     print("This opens Google consent for the account you select. It does not run the migration.")
+    if args.full_drive:
+        print("Full Drive access includes file contents and management. Save to a separate token path; migration remains paused.")
     try:
-        print(json.dumps(login(args.client_json, args.token, readonly=args.readonly)))
+        print(json.dumps(login(args.client_json, args.token, readonly=args.readonly, full_drive=args.full_drive)))
         return 0
     except SafetyError as error:
         print(json.dumps({"error": str(error)}))
