@@ -76,6 +76,17 @@ class TransportError(SafetyError):
     def as_dict(self):
         return {"code": self.code, "status": self.status, "outcome": self.outcome}
 
+    @property
+    def conflict(self):
+        return self.status == 412
+
+    @property
+    def transient(self):
+        # Classification is advice for a fresh-read recovery loop, never a
+        # transport-level instruction to replay a mutation.
+        return self.status in {408, 429, 500, 502, 503, 504} or (
+            self.status is None and self.code == "DRIVE_TRANSPORT_ERROR")
+
 
 def _failure(error, *, dispatched):
     status = getattr(getattr(error, "resp", None), "status", None)
@@ -92,16 +103,19 @@ def _failure(error, *, dispatched):
 class GoogleDriveTransport:
     """Only exact-ID reads and metadata-only rename/reparent calls are exposed."""
 
-    def __init__(self, service, *, apply=False, allowed_ids, excluded_ids=(),
+    def __init__(self, service, *, apply=False, allowed_ids, excluded_ids=(), mutation_ids=None,
                  refresh_credentials=None):
         if type(apply) is not bool:
             raise TransportError("EXPLICIT_APPLY_BOOLEAN_REQUIRED")
         self.service = service
         self.apply_enabled = apply
         self.allowed_ids = frozenset(allowed_ids)
+        self.mutation_ids = self.allowed_ids if mutation_ids is None else frozenset(mutation_ids)
         self.excluded_ids = frozenset(excluded_ids)
         if not self.allowed_ids or any(not self._valid_id(x) for x in self.allowed_ids | self.excluded_ids):
             raise TransportError("VALID_EXACT_ID_ALLOWLIST_REQUIRED")
+        if not self.mutation_ids <= self.allowed_ids:
+            raise TransportError("MUTATION_IDS_MUST_BE_IN_READ_SCOPE")
         self._refresh_credentials = refresh_credentials or (lambda: None)
 
     @staticmethod
@@ -137,11 +151,32 @@ class GoogleDriveTransport:
 
     def get_file(self, file_id):
         file_id = self._guard(file_id)
-        result = self._read(lambda: self.service.files().get(
-            fileId=file_id, fields=FILE_FIELDS, supportsAllDrives=True))
+        response_headers = {}
+        def request():
+            value = self.service.files().get(
+                fileId=file_id, fields=FILE_FIELDS, supportsAllDrives=True)
+            if hasattr(value, "add_response_callback"):
+                value.add_response_callback(lambda headers: response_headers.update(headers))
+            return value
+        result = self._read(request)
         if result.get("id") != file_id:
             raise TransportError("DRIVE_RESPONSE_ID_MISMATCH", outcome="READ_FAILED")
+        # This is an HTTP response header, not a synthetic File resource field.
+        # The Python client exposes response callbacks; Drive returning and
+        # enforcing an ETag for this account still needs a live integration test.
+        etag = next((value for key, value in response_headers.items()
+                     if key.lower() == "etag"), None)
+        if etag is not None:
+            result["_http_etag"] = etag
         return copy.deepcopy(result)
+
+    def get_account(self):
+        result = self._read(lambda: self.service.about().get(
+            fields="user(displayName,emailAddress,permissionId,me)"))
+        user = result.get("user", {})
+        if user.get("me") is not True or not user.get("emailAddress"):
+            raise TransportError("AUTHENTICATED_ACCOUNT_UNVERIFIED", outcome="READ_FAILED")
+        return {key: user.get(key) for key in ("displayName", "emailAddress", "permissionId")}
 
     def _pages(self, factory, key):
         token = None
@@ -185,21 +220,41 @@ class GoogleDriveTransport:
             fields="nextPageToken,permissions", supportsAllDrives=True), "permissions")
 
     def update_file(self, args):
+        """Legacy bridge entry point: one effect per call, kept compatible."""
+        return self._update(args, combined=False)
+
+    def update_metadata(self, args, *, etag=None):
+        """Rename and/or reparent in one metadata PATCH, without hidden retry.
+
+        When supplied, pass the exact observed ETag through If-Match. Absence
+        of an ETag must remain visible to the caller; this method does not
+        claim an atomic concurrency guarantee or manufacture one from version.
+        """
+        return self._update(args, combined=True, etag=etag)
+
+    def _update(self, args, *, combined, etag=None):
         if not self.apply_enabled:
             raise TransportError("READ_ONLY_TRANSPORT")
         if not isinstance(args, dict) or set(args) - {"fileId", "name", "addParents", "removeParents"}:
             raise TransportError("METADATA_ONLY_ARGUMENTS_REQUIRED")
         file_id = self._guard(args.get("fileId"))
+        if file_id not in self.mutation_ids:
+            raise TransportError("OUTSIDE_APPROVED_MUTATION_IDS")
         rename = "name" in args
         moving = bool({"addParents", "removeParents"} & set(args))
-        if rename == moving:
+        if not rename and not moving:
             raise TransportError("SEPARATE_MOVE_OR_RENAME_REQUIRED")
-        parameters = {"fileId": file_id, "fields": FILE_FIELDS, "supportsAllDrives": True}
+        if not combined and rename and moving:
+            raise TransportError("SEPARATE_MOVE_OR_RENAME_REQUIRED")
+        if etag is not None and (not isinstance(etag, str) or len(etag) > 2048
+                or not re.fullmatch(r'(?:W/)?"[\x21\x23-\x7e\x80-\xff]*"', etag)):
+            raise TransportError("EXACT_HTTP_ETAG_REQUIRED")
+        parameters = {"fileId": file_id, "fields": FILE_FIELDS, "supportsAllDrives": True, "body": {}}
         if rename:
             if not isinstance(args["name"], str) or not args["name"] or "\x00" in args["name"]:
                 raise TransportError("EXACT_NONEMPTY_NAME_REQUIRED")
             parameters["body"] = {"name": args["name"]}
-        else:
+        if moving:
             parents = {}
             for field in ("addParents", "removeParents"):
                 if field not in args:
@@ -218,12 +273,14 @@ class GoogleDriveTransport:
                 parameters[field] = value
             if parents.get("addParents", set()) & parents.get("removeParents", set()):
                 raise TransportError("PARENT_ADD_REMOVE_OVERLAP")
-            parameters["body"] = {}
         # Pre-request refresh is separate; never retry the request following a
         # 401 or a socket/server error. The caller journals ATTEMPTED first.
         self._ready()
         try:
-            result = self.service.files().update(**parameters).execute(num_retries=0)
+            request = self.service.files().update(**parameters)
+            if etag is not None:
+                request.headers["If-Match"] = etag
+            result = request.execute(num_retries=0)
         except Exception as error:
             raise _failure(error, dispatched=True) from None
         if not isinstance(result, dict) or result.get("id") != file_id:
@@ -232,7 +289,7 @@ class GoogleDriveTransport:
 
     @classmethod
     def from_authorized_user_file(cls, token_path, *, apply=False, allowed_ids,
-                                  excluded_ids=(), timeout=30):
+                                  excluded_ids=(), mutation_ids=None, timeout=30):
         """Load one explicit pre-existing grant; never run OAuth or persist tokens.
 
         This function is used only by an operator's later command. No token path
@@ -286,4 +343,4 @@ class GoogleDriveTransport:
         except Exception:
             raise TransportError("DRIVE_CLIENT_INITIALIZATION_FAILED") from None
         return cls(service, apply=apply, allowed_ids=allowed_ids,
-                   excluded_ids=excluded_ids, refresh_credentials=refresh)
+                   excluded_ids=excluded_ids, mutation_ids=mutation_ids, refresh_credentials=refresh)
