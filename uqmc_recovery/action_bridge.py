@@ -498,12 +498,12 @@ class ActionBridge:
             known = agent_snapshot(self.journal.read_evidence(max(same, key=lambda r: r["seq"])["payload"]["observed_ref"]))
             known = adjust_descendant_renames(known, dependency_states, self.journal)
             baseline = adjust_descendant_renames(baseline, dependency_states, self.journal)
-            if agent_semantic(known) != agent_semantic(baseline):
+            if agent_semantic(known) != agent_semantic(self._with_observed_unknown_size(baseline, known)):
                 raise SafetyError("DEPENDENCY_BASELINE_MISMATCH")
             baseline = known
         baseline = adjust_descendant_renames(baseline, dependency_states, self.journal)
         before = agent_snapshot(before)
-        if self._agent_exact(before) != self._agent_exact(baseline):
+        if self._agent_exact(before) != self._agent_exact(self._with_observed_unknown_size(baseline, before)):
             raise SafetyError("HANDOFF_BASELINE_DRIFT")
         expected = self._agent_checks(op, before, preflight, plan, approval)
         self._agent_approved_access(plan, authority, before, preflight, dependency_states)
@@ -520,6 +520,24 @@ class ActionBridge:
         if agent_semantic(before) == agent_semantic(expected):
             raise SafetyError("HANDOFF_NO_CHANGE_REQUIRED")
         return op, before, expected, copy.deepcopy(preflight), sorted(scope), plan_ref, authority["approval_ref"]
+
+    @staticmethod
+    def _with_observed_unknown_size(baseline, observed):
+        """Compare a newly available size without inventing a historical value.
+
+        This comparison-only copy leaves the sealed plan and its approval hash
+        intact. The actual fresh size is retained in PREPARED before_ref, then
+        compared exactly at mark_attempt and readback. A verified dependency's
+        known size becomes the subsequent baseline; known values never relax.
+        No other optional or identity/access fields receive this treatment.
+        """
+        result = copy.deepcopy(baseline)
+        if result.get("size") is None:
+            if "size" in observed:
+                result["size"] = copy.deepcopy(observed["size"])
+            else:
+                result.pop("size", None)
+        return result
 
     def _reservation(self, scope, own_hash=None):
         latest = {}

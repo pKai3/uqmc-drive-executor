@@ -447,7 +447,7 @@ class AgentAssistedBridgeTests(unittest.TestCase):
         self.temp.cleanup()
 
     def read_proof(self, value):
-        raw = {key: copy.deepcopy(value[key]) for key in ("id", "name", "mime_type", "parents", "version", "modified_time", "trashed", "permissions", "owners", "drive_id", "capabilities", "access") if key in value}
+        raw = {key: copy.deepcopy(value[key]) for key in ("id", "name", "mime_type", "parents", "version", "modified_time", "trashed", "permissions", "owners", "drive_id", "capabilities", "access", "size") if key in value}
         return {"kind": "AGENT_CONNECTOR_READ", "observed_at": datetime.now(timezone.utc).isoformat(),
                 "snapshot_ref": self.journal.evidence(value), "receipt_ref": self.journal.evidence({"structuredContent": raw})}
 
@@ -708,6 +708,66 @@ class AgentAssistedBridgeTests(unittest.TestCase):
         envelope = self.bridge.prepare_action(self.plan, move.operation_id, self.approval, renamed, self.check(before=renamed, op=move))
         ticket = self.bridge.mark_attempt(envelope["envelope_hash"], renamed, self.check(before=renamed, op=move))
         self.assertEqual(set(ticket["args"]), {"fileId", "addParents", "removeParents"})
+
+    def test_unknown_size_is_recorded_then_enforced_through_rename_and_move(self):
+        rename = Operation("agent-size:rename", self.before["id"], "RENAME", self.before, {"name": "Approved.pdf"})
+        move = Operation("agent-size:move", self.before["id"], "MOVE", self.snapshot(rename.intended(self.before)),
+                         {"parents": ["agent-fixture-target"]}, (rename.operation_id,))
+        self.configure([rename, move])
+        frozen_hash = self.plan.proposal_hash
+        self.authorize()
+        fresh = self.snapshot(self.before | {"size": "318168"})
+        envelope = self.bridge.prepare_action(self.plan, rename.operation_id, self.approval, fresh,
+                                              self.check(before=fresh, op=rename))
+        self.assertEqual(self.journal.read_evidence(envelope["before_ref"])["size"], "318168")
+        self.assertNotIn("size", self.plan.operations[0].before)
+        self.assertEqual(self.plan.proposal_hash, frozen_hash)
+        for field, value in (("size", "318169"), ("size", None), ("name", "Manual.pdf"),
+                             ("parents", ["agent-fixture-target"]), ("permissions", [])):
+            with self.subTest(field=field, value=value):
+                changed = self.snapshot(fresh | {field: value})
+                with self.assertRaisesRegex(SafetyError, "DRIFT"):
+                    self.bridge.mark_attempt(envelope["envelope_hash"], changed,
+                                             self.check(before=changed, op=rename))
+        self.bridge.mark_attempt(envelope["envelope_hash"], fresh, self.check(before=fresh, op=rename))
+        terminal = self.completed(envelope)
+        renamed = self.snapshot(rename.intended(fresh))
+        result = self.bridge.reconcile_action(envelope["envelope_hash"], renamed,
+                                              self.check(renamed, before=fresh, op=rename), terminal)
+        self.assertEqual(result["kind"], "RECONCILED_AT_TARGET")
+        # The frozen dependent operation still has no historical size, but the
+        # verified rename does. Losing or changing that known value must fail.
+        for value in (None, "318169"):
+            with self.subTest(dependency_size=value):
+                changed = self.snapshot(renamed | {"size": value})
+                with self.assertRaisesRegex(SafetyError, "HANDOFF_BASELINE_DRIFT"):
+                    self.bridge.prepare_action(self.plan, move.operation_id, self.approval, changed,
+                                               self.check(before=changed, op=move))
+        move_envelope = self.bridge.prepare_action(self.plan, move.operation_id, self.approval, renamed,
+                                                   self.check(before=renamed, op=move))
+        self.bridge.mark_attempt(move_envelope["envelope_hash"], renamed, self.check(before=renamed, op=move))
+        terminal = self.completed(move_envelope)
+        observed = self.snapshot(move.intended(renamed))
+        parents = copy.deepcopy(self.parents)
+        parents["agent-fixture-origin"]["subtree"]["members"] = []
+        parents["agent-fixture-target"]["subtree"]["members"] = [{"id": observed["id"]}]
+        observed["size"] = "318169"
+        result = self.bridge.reconcile_action(move_envelope["envelope_hash"], observed,
+            self.check(observed, parents=parents, before=renamed, op=move), terminal)
+        self.assertEqual(result["kind"], "BLOCKED_CONFLICT")
+        self.assertEqual(result["payload"]["reason_code"], "AGENT_READBACK_OR_MEMBERSHIP_CONFLICT")
+
+    def test_known_historical_size_remains_an_exact_precondition(self):
+        known = self.snapshot(self.before | {"size": "318168"})
+        move = Operation("agent-size:known", known["id"], "MOVE", known, {"parents": ["agent-fixture-target"]})
+        self.configure([move])
+        self.authorize()
+        for value in (None, "318169"):
+            with self.subTest(size=value):
+                changed = self.snapshot(known | {"size": value})
+                with self.assertRaisesRegex(SafetyError, "HANDOFF_BASELINE_DRIFT"):
+                    self.bridge.prepare_action(self.plan, move.operation_id, self.approval, changed,
+                                               self.check(before=changed, op=move))
 
     def test_folder_move_uses_explicit_direct_parent_membership(self):
         folder = self.snapshot(self.before | {"mime_type": FOLDER, "name": "Folder",
