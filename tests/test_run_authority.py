@@ -54,6 +54,13 @@ class RunAuthorityTests(unittest.TestCase):
                 self.assertEqual(list(pool.map(worker, range(12))), [self.plan_hash] * 12)
             self.assertEqual(validate.call_count, 1)
 
+    def test_reported_workbook_edit_blocks_dispatch_after_cached_validation(self):
+        with self.journal.locked():
+            cache = self.cache()
+            self.journal.append("BATCH_REFRESH_REQUIRED", payload={"proposal_hash": self.plan_hash})
+            with self.assertRaisesRegex(SafetyError, "PLAN_EDITS_REQUIRE_NEW_REFRESHED_BATCH"):
+                cache.check()
+
     def test_section_revocation_after_cache_blocks_and_poisons_instance(self):
         with self.journal.locked():
             cache = self.cache()

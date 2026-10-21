@@ -162,3 +162,7 @@ PYTHONPATH=.:tests .venv/bin/python benchmarks/desired_cache.py
 `DesiredRunner.rebaseline_version_only(item, authorization_ref=...)` supports an explicitly reviewed, exact-ID move remaining after a recorded rename. It requires a fresh read with the same known identity, exact name, parents, MIME, content metadata, owners, modified time, ETag and relevant capabilities; only an increased version counter is accepted. The private instruction evidence binds the plan hash and source IDs. It does not confer authority by hashing.
 
 A `DESIRED_REBASELINED` event links the original applied event, unchanged historical before/applied evidence, fresh observed evidence and explicit instruction. No old event is replaced. Restart uses the accepted baseline only for that original event; subsequent version changes and pre-write drift still block. Pending uncertain attempts cannot be rebaselined. This establishes agreement with available evidence, not the cause of a historical version increment. Permission-list omissions are tolerated only in the separately authorized no-audit mode.
+
+### New batches use a fresh spreadsheet snapshot
+
+New CLI `apply` runs require the capture/reconcile/bind workflow in [BATCH_REFRESH.md](BATCH_REFRESH.md). `resume` continues only an already started immutable plan or a fresh bound plan. Reported edits require a pause and explicit refresh, not silent target replacement. Existing exact approval and source pre-write checks remain required.

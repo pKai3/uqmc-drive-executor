@@ -210,6 +210,10 @@ def validate_section_authority(journal, plan):
     origins = [event for event in journal.records() if event["kind"] == "SECTION_IMPORTED"
                and event["payload"].get("proposal_hash") == plan.proposal_hash]
     if not origins:
+        if any(event["kind"] == "BATCH_SOURCE_BOUND" and event["payload"].get("proposal_hash") == plan.proposal_hash
+               for event in journal.records()):
+            from .batch_source import refreshed_section_authority
+            return refreshed_section_authority(journal, plan)
         if plan.proposal_revision.startswith("section:"):
             raise SafetyError("SECTION_PLAN_ORIGIN_REQUIRED")
         return None

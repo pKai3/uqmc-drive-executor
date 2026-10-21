@@ -171,6 +171,8 @@ class RunAuthority:
             if self.section_authority and payload.get("approval_id") == self.section_authority["owner_approval_id"]:
                 raise SafetyError("SECTION_APPROVAL_REVOKED_OR_SUPERSEDED")
             raise SafetyError("APPROVAL_REVOKED")
+        if kind == "BATCH_REFRESH_REQUIRED" and payload.get("proposal_hash") == self.plan_sha256:
+            raise SafetyError("PLAN_EDITS_REQUIRE_NEW_REFRESHED_BATCH")
         if kind == "EXCLUDED" and payload.get("file_id") in self._source_ids:
             raise SafetyError("EXCLUDED")
         if kind == "PROPOSAL_EXCLUDED" and payload.get("proposal_ref") in self._proposal_refs:

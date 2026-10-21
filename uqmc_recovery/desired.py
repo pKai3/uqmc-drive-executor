@@ -787,6 +787,9 @@ def main(argv=None):
             raise SafetyError("EXPLICIT_APPLY_AND_EXACT_PLAN_HASH_REQUIRED")
         if not mutating and args.apply:
             raise SafetyError("PREVIEW_CANNOT_APPLY")
+        if args.command in {"apply", "resume"}:
+            from .batch_source import require_batch_source
+            require_batch_source(journal, plan, resume=args.command == "resume")
         items = runner.items
         allowed = {i["source_id"] for i in items}
         for i in items:
