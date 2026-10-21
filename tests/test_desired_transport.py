@@ -52,11 +52,11 @@ class Service:
         return Request(self, self.values.pop(0))
 
 
-def transport(*values, apply=True, headers=None):
+def transport(*values, apply=True, headers=None, secret_values=None):
     service = Service(*values, headers=headers)
     return GoogleDriveTransport(service, apply=apply,
         allowed_ids={"file-a", "parent-a", "parent-b", "excluded"},
-        excluded_ids={"excluded"}), service
+        excluded_ids={"excluded"}, secret_values=secret_values), service
 
 
 class DesiredTransportTests(unittest.TestCase):
@@ -251,7 +251,7 @@ class DesiredTransportTests(unittest.TestCase):
                     body = {"error": {"code": 403, "message": "provider secret",
                         "errors": [{"reason": reason, "message": "provider secret"} for reason in reasons]}}
                     error = HttpError(httplib2.Response({"status": "403"}), json.dumps(body).encode(), uri="https://secret.invalid")
-                    t, service = transport(error)
+                    t, service = transport(error, secret_values=lambda: ("provider secret",))
                     with self.assertRaises(TransportError) as caught:
                         if write:
                             t.update_metadata({"fileId": "file-a", "name": "approved.pdf"})

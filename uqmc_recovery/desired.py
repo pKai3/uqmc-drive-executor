@@ -415,7 +415,8 @@ class DesiredRunner:
                     request_error=exc.as_dict() if isinstance(exc, TransportError) else {"code": type(exc).__name__},
                     next_step="READ_CURRENT_STATE_BEFORE_ANY_RETRY")
                 self.record("RECEIPT", item, direction=direction, attempt=attempt,
-                    request_outcome="UNKNOWN", error_type=type(exc).__name__, http_status=getattr(exc, "status", None), **payload)
+                    request_outcome="UNKNOWN", error_type=type(exc).__name__, http_status=getattr(exc, "status", None),
+                    request_error=exc.as_dict() if isinstance(exc, TransportError) else {"code": type(exc).__name__}, **payload)
             observed = self.read(item["source_id"])
             self.fault("after_readback", item)
             self.unchanged(before, observed, moving=core(before)["parents"] != target["parents"])

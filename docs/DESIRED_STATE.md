@@ -29,6 +29,8 @@ Transient write failures have a bounded attempt budget (default three). Backoff 
 
 For a blocked item, inspect the reported observation and reason, resolve the external conflict, then run preview and resume. If the desired change itself has changed, obtain a revised approved plan; do not edit the journal to erase the conflict. The program does not promise exactly-once execution or prove that every timed-out remote request was never processed.
 
+Future structured Google errors retain a bounded `provider_error` with reason codes and a redacted message in private progress logs and journal receipts. Raw request URLs, headers, response bodies and exception representations are never saved. Known in-memory credentials, URL and common token forms are redacted; malformed or oversized error bodies are omitted. This does not reconstruct previously discarded diagnostics or change retry authorization.
+
 Where an HTTP ETag is available, the update can carry `If-Match`. Provider behavior still needs a live test. Fresh reads without an enforced conditional write leave a race between the final read and update; they are not an atomic concurrency guarantee.
 
 ## Commands

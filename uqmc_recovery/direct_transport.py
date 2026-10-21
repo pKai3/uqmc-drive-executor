@@ -17,6 +17,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+from urllib.parse import quote, quote_plus
 import re
 import stat
 
@@ -81,11 +82,12 @@ def _single_send_http_class(base):
 
 
 class TransportError(SafetyError):
-    """Safe diagnostic only: no provider message, URL, headers or credentials."""
+    """Safe code plus bounded, redacted structured provider diagnostics."""
 
-    def __init__(self, code, *, status=None, outcome="NOT_DISPATCHED", request=None, item_id=None):
+    def __init__(self, code, *, status=None, outcome="NOT_DISPATCHED", request=None, item_id=None, provider_error=None):
         self.code, self.status, self.outcome = code, status, outcome
         self.request, self.item_id = request, item_id
+        self.provider_error = copy.deepcopy(provider_error)
         context = (":" + request if request else "") + (":" + item_id if item_id else "")
         super().__init__(code + (f":HTTP_{status}" if status is not None else "") + context)
 
@@ -95,6 +97,8 @@ class TransportError(SafetyError):
             result["request"] = self.request
         if self.item_id is not None:
             result["item_id"] = self.item_id
+        if self.provider_error:
+            result["provider_error"] = copy.deepcopy(self.provider_error)
         return result
 
     @property
@@ -146,7 +150,55 @@ def _is_rate_limit_403(error, status):
     )
 
 
-def _failure(error, *, dispatched, request=None, item_id=None):
+def _provider_error(error, secret_values):
+    """Retain only structured reasons/message, never headers, URI or repr.
+
+    Known in-memory credentials and common credential/URL forms are redacted
+    before truncation. Diagnostics stay in private local logs/journal.
+    """
+    content = getattr(error, "content", None)
+    if not isinstance(content, (str, bytes)) or len(content) > 65536:
+        return None
+    try:
+        body = json.loads(content)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None
+    details = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(details, dict):
+        return None
+    try:
+        values = secret_values() if callable(secret_values) else secret_values
+        secrets = {variant for value in values if isinstance(value, str) and value
+                   for variant in (value, quote(value, safe=""), quote_plus(value))}
+    except Exception:
+        return None  # Never emit message text if credential redaction failed.
+    def redact(value):
+        for secret in sorted(secrets, key=len, reverse=True):
+            value = value.replace(secret, "[REDACTED]")
+        value = re.sub(r"https?://[^\s<>\"']+", "[URL REDACTED]", value, flags=re.I)
+        value = re.sub(r"\b(?:Bearer|Basic)\s+[^\s,;\"']+", "[AUTH REDACTED]", value, flags=re.I)
+        value = re.sub(r"(?i)(?:access_token|refresh_token|id_token|client_secret|client_id|api[_ -]?key|password|authorization)[\"']?\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)", "[CREDENTIAL REDACTED]", value)
+        value = re.sub(r"\b(?:ya29\.|GOCSPX-|1//)[A-Za-z0-9_./+=-]+", "[TOKEN REDACTED]", value)
+        value = re.sub(r"[A-Za-z0-9_./+=-]{32,}", "[OPAQUE VALUE REDACTED]", value)
+        return " ".join(value.split())[:1024]
+    errors = details.get("errors", [])
+    errors = errors[:20] if isinstance(errors, list) else []
+    reasons = []
+    for entry in errors:
+        reason = entry.get("reason") if isinstance(entry, dict) else None
+        if isinstance(reason, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,127}", reason) and not any(v in reason for v in secrets):
+            if reason not in reasons:
+                reasons.append(reason)
+    message = details.get("message")
+    if not isinstance(message, str):
+        message = next((x.get("message") for x in errors if isinstance(x, dict) and isinstance(x.get("message"), str)), None)
+    result = {"reasons": reasons} if reasons else {}
+    if message:
+        result["message"] = redact(message)
+    return result or None
+
+
+def _failure(error, *, dispatched, request=None, item_id=None, secret_values=()):
     status = getattr(getattr(error, "resp", None), "status", None)
     if not isinstance(status, int) or isinstance(status, bool) or not 100 <= status <= 599:
         status = None
@@ -157,7 +209,7 @@ def _failure(error, *, dispatched, request=None, item_id=None):
         else "DRIVE_RATE_LIMIT" if _is_rate_limit_403(error, status)
         else "DRIVE_HTTP_ERROR" if status else "DRIVE_TRANSPORT_ERROR",
         status=status, outcome="UNKNOWN" if dispatched else "READ_FAILED",
-        request=request, item_id=item_id
+        request=request, item_id=item_id, provider_error=_provider_error(error, secret_values)
     )
 
 
@@ -165,7 +217,7 @@ class GoogleDriveTransport:
     """Only exact-ID reads and metadata-only rename/reparent calls are exposed."""
 
     def __init__(self, service, *, apply=False, allowed_ids, excluded_ids=(), mutation_ids=None,
-                 refresh_credentials=None, audit_permissions=True):
+                 refresh_credentials=None, audit_permissions=True, secret_values=None):
         if type(apply) is not bool:
             raise TransportError("EXPLICIT_APPLY_BOOLEAN_REQUIRED")
         if type(audit_permissions) is not bool:
@@ -182,6 +234,7 @@ class GoogleDriveTransport:
         if not self.mutation_ids <= self.allowed_ids:
             raise TransportError("MUTATION_IDS_MUST_BE_IN_READ_SCOPE")
         self._refresh_credentials = refresh_credentials or (lambda: None)
+        self._secret_values = secret_values or (lambda: ())
 
     @staticmethod
     def _valid_id(value):
@@ -213,7 +266,7 @@ class GoogleDriveTransport:
             # or backoff; a caller can make an explicitly bounded fresh read.
             result = factory().execute(num_retries=0)
         except Exception as error:
-            raise _failure(error, dispatched=False, request=request, item_id=item_id) from None
+            raise _failure(error, dispatched=False, request=request, item_id=item_id, secret_values=self._secret_values) from None
         if not isinstance(result, dict):
             raise TransportError("INVALID_DRIVE_RESPONSE", outcome="READ_FAILED")
         return result
@@ -353,7 +406,7 @@ class GoogleDriveTransport:
                 request.headers["If-Match"] = etag
             result = request.execute(num_retries=0)
         except Exception as error:
-            raise _failure(error, dispatched=True, request="files.update", item_id=file_id) from None
+            raise _failure(error, dispatched=True, request="files.update", item_id=file_id, secret_values=self._secret_values) from None
         if not isinstance(result, dict) or result.get("id") != file_id:
             raise TransportError("DRIVE_WRITE_RESPONSE_UNPROVEN", outcome="UNKNOWN")
         return copy.deepcopy(result)
@@ -419,4 +472,5 @@ class GoogleDriveTransport:
             raise TransportError("DRIVE_CLIENT_INITIALIZATION_FAILED") from None
         return cls(service, apply=apply, allowed_ids=allowed_ids,
                    excluded_ids=excluded_ids, mutation_ids=mutation_ids, refresh_credentials=refresh,
-                   audit_permissions=audit_permissions)
+                   audit_permissions=audit_permissions,
+                   secret_values=lambda: (credentials.token, credentials.refresh_token, credentials.client_secret, credentials.client_id))
