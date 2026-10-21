@@ -82,7 +82,12 @@ class ConsoleReporter:
                 print(json.dumps(value, ensure_ascii=False), file=self.stream, flush=True)
                 return
             stage = value.get("stage", value.get("event"))
-            if stage == "account_verified":
+            if stage == "stage_started":
+                self.line(concise(value.get('stage_name', 'Stage')) + '…')
+            elif stage == "stage_finished":
+                status = 'complete' if value.get('outcome') == 'COMPLETE' else 'failed'
+                self.line(f"{concise(value.get('stage_name', 'Stage'))}: {status} in {value.get('duration_seconds', 0):.3f}s.")
+            elif stage == "account_verified":
                 self.line("Google account verified: " + concise(value.get("account", "")))
             elif stage == "fresh_sheet":
                 self.line(f"Fresh plan: {concise(value.get('section', ''))}; {value.get('selected_identities', '?')} identities.")

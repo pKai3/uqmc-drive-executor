@@ -50,6 +50,19 @@ def command_lock(directory):
     finally:os.close(fd)
 
 
+@contextmanager
+def timed_stage(report, name):
+    started = time.monotonic()
+    report({'stage': 'stage_started', 'stage_name': name})
+    outcome = 'FAILED'
+    try:
+        yield
+        outcome = 'COMPLETE'
+    finally:
+        report({'stage': 'stage_finished', 'stage_name': name,
+                'duration_seconds': round(time.monotonic() - started, 3), 'outcome': outcome})
+
+
 def section_key(path):return 'destination-'+digest({'canonical_path':_path(path)})[:20]
 
 
@@ -435,9 +448,14 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
                 drive=GooglePublicationDrive(factory({config['viewer_file_id']},{config['viewer_file_id']},set(),True),config['viewer_file_id'],apply=True)
                 return publish_registered_sections(config,registry,journal=ReadOnlyJournal(config['store']),fresh_workbook=fresh,
                     sheet_capture=capture_client,drive=drive,apply=True)
-            except Exception as exc:return {'state':'PENDING','error':str(exc) if isinstance(exc,SafetyError) else type(exc).__name__}
+            except Exception as exc:
+                from .destination_publication import _error
+                detail = _error(exc)
+                return {'state':'PENDING','error':str(exc) if isinstance(exc,SafetyError) else detail.get('reason',type(exc).__name__),
+                        'error_class':type(exc).__name__}
         if not prepared:
-            with journal.locked():state=read_and_plan(config,section,journal,capture,factory,registry,report,preview=not apply)
+            with timed_stage(report,'Source and destination checks'), journal.locked():
+                state=read_and_plan(config,section,journal,capture,factory,registry,report,preview=not apply)
             blocked=[x for x in state['checks'] if x['disposition']=='BLOCKED']
             pending=[x for x in state['checks'] if x['disposition']!='COMPLETE']
             summary={'section':section,'preview_only':not apply,'counts':dict(Counter(x['disposition'] for x in state['checks'])),
@@ -454,9 +472,11 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
             Path(config['backup_directory']).mkdir(parents=True,exist_ok=True,mode=0o700)
             run_dir=Path(config['run_directory'])/(section_key(section)+'-'+uuid.uuid4().hex[:12]);run_dir.mkdir(parents=True,mode=0o700)
             with journal.locked():
-                journal.backup(Path(config['backup_directory'])/('before-destination-'+uuid.uuid4().hex))
+                with timed_stage(report,'Backup before plan preparation'):
+                    journal.backup(Path(config['backup_directory'])/('before-destination-'+uuid.uuid4().hex))
                 if capture_client._revision()!=capture['source_revision']:raise SafetyError('WORKBOOK_CHANGED_BEFORE_FREEZE_REFRESH_REQUIRED')
-                prepared=freeze(config,section,journal,state,factory,run_dir,report)
+                with timed_stage(report,'Freeze plan and validate authority'):
+                    prepared=freeze(config,section,journal,state,factory,run_dir,report)
             registry.setdefault('runs',[]).append(prepared);atomic_json(registry_path,registry)
         else:run_dir=Path(prepared['plan_path']).parent
         if not apply:return {'section':section,'preview_only':True,'saved_run_id':prepared['run_id'],'selected_identities':len(prepared['selected_source_ids'])}
@@ -478,12 +498,17 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
             limit=len(prepared['selected_source_ids']),workers=config.get('workers',10),transport_factory=client,rollback=bool(rollback))
         finally:
             for sig,handler in previous.items():signal.signal(sig,handler)
-        with journal.locked():
+        with timed_stage(report,'Save result and status exports'), journal.locked():
             result_path=save_new(run_dir/('result-'+uuid.uuid4().hex+'.json'),result)
             exports=export_status(journal,result,run_dir/'exports')
-            backup=Path(config['backup_directory'])/('destination-checkpoint-'+uuid.uuid4().hex);journal.backup(backup)
-            if (backup/'events.jsonl').read_bytes()!=journal.path.read_bytes():raise SafetyError('BACKUP_VERIFICATION_FAILED')
+            # DesiredRunner already made and fully verified its final snapshot.
+            # Reuse it only if no event has changed since that backup.
+            if runner.last_backup_path is None:raise SafetyError('FINAL_BACKUP_REQUIRED')
+            backup=runner.last_backup_path
             tip=journal.records()[-1]
+            if (runner.last_backup_manifest['head_hash']!=tip['hash']
+                    or (backup/'events.jsonl').read_bytes()!=journal.path.read_bytes()):
+                raise SafetyError('BACKUP_VERIFICATION_FAILED')
         finished={'section':section,'run_id':plan.run_id,'counts':result['counts'],'journal_sequence':tip['seq'],
             'backup':str(backup),'result_path':result_path,'exports':exports,'elapsed_seconds':round(time.monotonic()-started,3),
             'revision_stop_reason':guard.reason}

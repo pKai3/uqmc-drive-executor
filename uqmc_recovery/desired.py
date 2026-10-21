@@ -16,6 +16,7 @@ from pathlib import Path
 import signal
 import random
 import threading
+import time
 import uuid
 
 from .__main__ import plan_from_json, save_new
@@ -145,6 +146,8 @@ class DesiredRunner:
         self._progress_gate = threading.RLock()
         self.progress = progress or (lambda event: None)
         self.progress_output_failed = False
+        self.last_backup_path = None
+        self.last_backup_manifest = None
         self.items = compile_items(self.plan, journal, validate_authority=False)
         self.by_id = {i["source_id"]: i for i in self.items}
 
@@ -163,6 +166,18 @@ class DesiredRunner:
             except Exception:
                 # An output failure must not turn a verified action into a retry.
                 self.progress_output_failed = True
+
+    def snapshot_backup(self, path, label):
+        started = time.monotonic()
+        self.report_progress('stage_started', stage_name=label)
+        outcome = 'FAILED'
+        try:
+            manifest = self.journal.backup(path)
+            outcome = 'COMPLETE'
+            return manifest
+        finally:
+            self.report_progress('stage_finished', stage_name=label,
+                duration_seconds=round(time.monotonic() - started, 3), outcome=outcome)
 
     @staticmethod
     def transient(error):
@@ -744,7 +759,9 @@ class DesiredRunner:
             self.authority()
             backup = self.journal.root.parent / "backups"
             backup.mkdir(mode=0o700, parents=True, exist_ok=True)
-            self.journal.backup(backup / ("desired-before-" + str(uuid.uuid4())))
+            self.last_backup_path = None
+            self.last_backup_manifest = None
+            self.snapshot_backup(backup / ("desired-before-" + str(uuid.uuid4())), "Backup of approved batch")
             self.journal.append("DESIRED_POLICY_BOUND", payload={"plan_sha256": self.plan_sha256,
                 "run_id": self.plan.run_id, "policy": "exact-desired-state-v1", "direction": "ROLLBACK" if rollback else "FORWARD",
                 "dependencies": {i["source_id"]: i["dependencies"] for i in selected}, "global_phases_removed": True,
@@ -865,7 +882,10 @@ class DesiredRunner:
                 return self.summary(output, rollback=rollback, workers=workers,
                     selected_items=len(selected), new_changes=changed)
             finally:
-                self.journal.backup(backup / ("desired-after-" + str(uuid.uuid4())))
+                final_backup = backup / ("desired-after-" + str(uuid.uuid4()))
+                manifest = self.snapshot_backup(final_backup, "Final recovery backup")
+                self.last_backup_manifest = manifest
+                self.last_backup_path = final_backup
 
     def summary(self, items, **extra):
         return {"schema_version": "uqmc.desired.status.v1", "plan_sha256": self.plan_sha256,

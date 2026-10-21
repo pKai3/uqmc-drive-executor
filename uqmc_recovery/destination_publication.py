@@ -135,11 +135,8 @@ def display_section_specs(registry, data, allowed_source_ids):
         paths[node['i']] = (paths[node['p']] if node['p'] >= 0 else ()) + (node['n'].strip(),)
     specs = section_specs(registry)
     for spec in specs:
-        path = viewer.path_parts(spec['proposal_path'])
-        roots = [n for n in data['nodes'] if n['s'] == 'destination' and n['f']
-                 and paths[n['i']] == path]
-        if len(roots) != 1:
-            raise ValueError('SECTION_PATH_NOT_UNIQUE:' + spec['proposal_path'])
+        root = viewer.resolve_folder_path(data, spec['proposal_path'])
+        path = paths[root['i']]
         ids = [n.get('id') for n in data['nodes'] if n['s'] == 'destination' and not n['f']
                and paths[n['i']][:len(path)] == path]
         if (any(not x for x in ids) or len(ids) != len(set(ids))
@@ -149,6 +146,17 @@ def display_section_specs(registry, data, allowed_source_ids):
         if len(registered) != len(set(registered)) or not set(registered) <= set(ids):
             raise ValueError('SECTION_REGISTERED_MEMBER_MISSING:' + spec['section_id'])
         spec['source_ids'] = sorted(ids)
+    # A later child-section run can finish previously untracked parent members.
+    # Aggregate only sealed plans from registered descendant destinations; the
+    # projection still requires exact verified state matching those plan targets.
+    for parent in specs:
+        parent_path = paths[viewer.resolve_folder_path(data, parent['proposal_path'])['i']]
+        hashes = list(parent.get('plan_sha256s', [parent.get('plan_sha256')]))
+        for child in specs:
+            child_path = paths[viewer.resolve_folder_path(data, child['proposal_path'])['i']]
+            if len(child_path) > len(parent_path) and child_path[:len(parent_path)] == parent_path:
+                hashes.extend(child.get('plan_sha256s', [child.get('plan_sha256')]))
+        parent['plan_sha256s'] = list(dict.fromkeys(hashes))
     return specs
 
 

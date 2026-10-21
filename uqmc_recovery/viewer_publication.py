@@ -38,6 +38,22 @@ def path_parts(value):
     return tuple(x.strip() for x in value.split('/') if x.strip())
 
 
+def resolve_folder_path(data, value):
+    """Resolve canonical collection aliases without renaming/reparenting nodes."""
+    parent = -1
+    node = None
+    for segment in path_parts(value):
+        matches = [n for n in data['nodes'] if n['p'] == parent and n['s'] == 'destination'
+                   and n['f'] and segment in {n['n'].strip(), (n.get('o') or '').strip()}]
+        if len(matches) != 1:
+            raise ValueError('SECTION_PATH_NOT_UNIQUE:' + value)
+        node = matches[0]
+        parent = node['i']
+    if node is None:
+        raise ValueError('SECTION_PATH_NOT_UNIQUE:' + value)
+    return node
+
+
 def refresh_proposal(data, workbook):
     """Reconcile explicit rename rows, recognizing already-renamed folder aliases.
 
@@ -189,11 +205,8 @@ def integrate(data, bundle):
     completed_files = set()
     retained = set()
     for section in sections['sections']:
-        path = path_parts(section['path'])
-        matches = path_nodes.get(path, [])
-        if len(matches) != 1:
-            raise ValueError('SECTION_PATH_NOT_UNIQUE:' + section['path'])
-        root = matches[0]
+        root = resolve_folder_path(data, section['path'])
+        path = paths[root['i']]
         root_url = folder_link(section['destination_url'])
         members = [n for n in nodes if n['s'] == 'destination' and not n['f'] and paths[n['i']][:len(path)] == path]
         if len(members) != section['expected_file_count']:

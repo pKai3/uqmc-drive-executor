@@ -96,6 +96,19 @@ def _read(path: Path) -> bytes:
         os.close(fd)
 
 
+def _decode_evidence(raw: bytes, content_hash: str) -> Any:
+    """Validate exactly the bytes that will be returned or copied."""
+    if digest(raw) != content_hash:
+        raise JournalCorrupt("Evidence content hash mismatch")
+    try:
+        result = json.loads(raw)
+        if canonical(result) != raw:
+            raise JournalCorrupt("Evidence is not canonical JSON")
+        return result
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise JournalCorrupt("Missing or invalid evidence") from exc
+
+
 def _write_all(fd: int, data: bytes) -> None:
     view = memoryview(data)
     while view:
@@ -404,13 +417,7 @@ class Journal:
                 raise JournalCorrupt("Invalid evidence digest")
             path = self.evidence_dir / f"{content_hash}.json"
             try:
-                raw = _read(path)
-                if digest(raw) != content_hash:
-                    raise JournalCorrupt("Evidence content hash mismatch")
-                result = json.loads(raw)
-                if canonical(result) != raw:
-                    raise JournalCorrupt("Evidence is not canonical JSON")
-                return result
+                return _decode_evidence(_read(path), content_hash)
             except (FileNotFoundError, ValueError, UnicodeDecodeError) as exc:
                 raise JournalCorrupt("Missing or invalid evidence") from exc
 
@@ -419,8 +426,9 @@ class Journal:
         for path in sorted(self.evidence_dir.iterdir()):
             if path.suffix != ".json" or not _DIGEST.fullmatch(path.stem):
                 raise JournalCorrupt("Unexpected file in content-addressed evidence store")
-            self.read_evidence(f"sha256:{path.stem}")
-            result[path.name] = _read(path)
+            raw = _read(path)
+            _decode_evidence(raw, path.stem)
+            result[path.name] = raw
         return result
 
     def _snapshot(self, destination: str | Path, *, recover: bool) -> dict[str, Any]:
@@ -441,7 +449,11 @@ class Journal:
             # A missing referenced evidence file blocks every backup/recovery.
             def verify_refs(value: Any) -> None:
                 if isinstance(value, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", value):
-                    self.read_evidence(value)
+                    # _all_evidence already validated these exact captured
+                    # bytes once. Repeated references need presence checks,
+                    # not another read/JSON parse of large workbook evidence.
+                    if value[7:] + ".json" not in evidence:
+                        raise JournalCorrupt("Missing or invalid evidence")
                 elif isinstance(value, dict):
                     for child in value.values():
                         verify_refs(child)

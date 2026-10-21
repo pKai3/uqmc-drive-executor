@@ -15,7 +15,14 @@ verified filenames, errors, and a separate publication result. Metadata progress
 is summarized every ten items; execution prints one completion line per item.
 The complete JSON progress and final result are also saved to a private, flushed
 and synced JSONL transcript under the configured run directory's `console-logs/`.
-The execution journal remains the authority for recovery. Use `--json` for JSON
+The execution journal remains the authority for recovery. Source/destination
+checks, pre-plan backup, plan/authority preparation, approved-batch backup, final
+recovery backup and result exports each report start/completion and duration.
+The final runner backup is reused as the saved checkpoint after its journal head
+and bytes are checked; the command does not immediately copy that store again.
+Each backup still validates and independently copies all evidence with fsync and
+readback, but repeated references do not cause repeated parsing of the same blob.
+Use `--json` for JSON
 records on stdout, for example:
 
 ```sh
@@ -219,3 +226,9 @@ This samples 1–30 files and makes no whole-section completeness claim. The cur
 acceptance check sampled two files from each completed section (six files total),
 plus one destination-anchor metadata read. All six matched current approved
 name/parent state; checkpoint 2658 was unchanged. No new live migration was run.
+
+Publication resolves canonical folder paths through the viewer's recorded original
+and proposed names, rejecting ambiguous aliases. Completion of a registered
+subsection contributes its verified sealed plan history to parent status. This
+changes display aggregation only and never authorizes a migration. Publication
+failures retain safe reason codes instead of only an exception class.
