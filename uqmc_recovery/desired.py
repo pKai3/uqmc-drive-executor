@@ -97,6 +97,25 @@ def compile_items(plan, journal, *, validate_authority=True):
             if event and event["kind"] in {"ATTEMPTED", "UNCERTAIN"}:
                 item["historical_uncertain_operation_ids"].append(op.operation_id)
         item["dependencies"] = [p for p in item["target"]["parents"] if p in groups and groups[p]["target"]["mime_type"] == FOLDER]
+    # A folder must not mutate concurrently with an original descendant that
+    # leaves it. Target-parent edges alone miss those outgoing children. Honor
+    # a required inversion (child leaves first, old parent moves into child)
+    # instead of introducing a cycle or inventing a global phase.
+    def depends(source, ancestor, seen=None):
+        seen = set() if seen is None else seen
+        if source in seen:
+            return False
+        seen.add(source)
+        return any(d == ancestor or depends(d, ancestor, seen)
+                   for d in groups[source]["dependencies"])
+    for folder in groups.values():
+        if folder["original"]["mime_type"] != FOLDER:
+            continue
+        descendants = {m["id"] for m in (folder["baseline"].get("subtree") or {}).get("members", [])}
+        descendants |= {s for s, child in groups.items() if folder["source_id"] in child["original"]["parents"]}
+        for source in sorted(descendants & groups.keys()):
+            if not depends(folder["source_id"], source) and folder["source_id"] not in groups[source]["dependencies"]:
+                groups[source]["dependencies"].append(folder["source_id"])
     ordered, pending = [], list(groups.values())
     while pending:
         ready = [i for i in pending if set(i["dependencies"]) <= {x["source_id"] for x in ordered}]
@@ -239,6 +258,17 @@ class DesiredRunner:
 
     def _applied_baseline(self, item, active):
         historical = self.journal.read_evidence(active["payload"]["applied_ref"])
+        if item["original"]["mime_type"] == FOLDER:
+            reconciled = [r for r in self.events(item["source_id"])
+                if r["kind"] == "DESIRED_FOLDER_RECONCILED" and r["seq"] > active["seq"]
+                and r["payload"].get("forward_event_id") == active["event_id"]]
+            if reconciled:
+                payload = reconciled[-1]["payload"]
+                if payload.get("historical_applied_ref") != active["payload"]["applied_ref"]:
+                    raise SafetyError("FOLDER_RECONCILIATION_HISTORY_MISMATCH")
+                accepted = self.journal.read_evidence(payload["observed_ref"])
+                self._same_folder_fields(historical, accepted)
+                return accepted
         accepted = [r for r in self.events(item["source_id"])
                     if r["kind"] == "DESIRED_REBASELINED" and
                     r["seq"] > active["seq"] and
@@ -251,6 +281,120 @@ class DesiredRunner:
         observed = self.journal.read_evidence(event["observed_ref"])
         self._version_only_match(item, historical, observed)
         return observed
+
+    def _folder_graph(self):
+        """Frozen membership plus verified changes; no editable proposal reads."""
+        states = {}
+        for known in self.items:
+            for member in (known["baseline"].get("subtree") or {}).get("members", []):
+                states.setdefault(member["id"], copy.deepcopy(member))
+        for known in self.items:
+            states[known["source_id"]] = copy.deepcopy(known["original"])
+        effects = []
+        for event in self.events():
+            if event["kind"] in {"DESIRED_APPLIED", "DESIRED_ROLLED_BACK"} or (
+                    event["kind"] == "DESIRED_OBSERVED" and event["payload"].get("state") in {"TARGET", "PARTIAL", "NOT_APPLIED"}):
+                payload = event["payload"]
+                ref = payload.get("applied_ref") or payload.get("observed_ref")
+                if ref and payload.get("source_id") in self.by_id:
+                    state = core(self.journal.read_evidence(ref))
+                    if state["id"] != payload["source_id"]:
+                        raise SafetyError("FOLDER_HISTORY_IDENTITY_MISMATCH")
+                    states[state["id"]] = state
+                    effects.append(event)
+        return states, effects
+
+    @staticmethod
+    def _inside(source, folder, states, trail=None):
+        if source == folder:
+            return False
+        trail = set() if trail is None else trail
+        if source in trail:
+            raise SafetyError("FOLDER_CYCLE")
+        trail = trail | {source}
+        return any(p == folder or (p in states and DesiredRunner._inside(p, folder, states, trail))
+                   for p in states.get(source, {}).get("parents", []))
+
+    def _check_folder_members(self, item, target=None, preview_cache=None):
+        subtree = item["baseline"].get("subtree") or {}
+        if subtree.get("complete") is not True:
+            raise SafetyError("COMPLETE_FOLDER_MEMBERSHIP_REQUIRED")
+        states, effects = self._folder_graph()
+        root = item["source_id"]
+        # Older snapshots containing only IDs cannot prove parent transitions.
+        # Keep those fixed members required until richer evidence is available.
+        fixed = {m["id"] for m in subtree.get("members", []) if "parents" not in m and m["id"] not in self.by_id}
+        expected = {s for s in states if self._inside(s, root, states)} | fixed
+        pending, seen, members = [root], set(), []
+        while pending:
+            pid = pending.pop()
+            if pid in seen:
+                raise SafetyError("FOLDER_CYCLE")
+            seen.add(pid)
+            children = self.preview_read(preview_cache, "children", pid, self.children)
+            members.extend(children)
+            pending.extend(c["id"] for c in children if c["mimeType"] == FOLDER)
+        actual_ids = [m["id"] for m in members]
+        if len(actual_ids) != len(set(actual_ids)) or set(actual_ids) != expected:
+            raise SafetyError("FOLDER_MEMBERSHIP_DRIFT")
+        if target and set(target["parents"]) & ({root} | expected):
+            raise SafetyError("FOLDER_CYCLE")
+        for member in members:
+            known = states.get(member["id"], {})
+            for field, api in (("name", "name"), ("mime_type", "mimeType"), ("parents", "parents")):
+                value = known.get(field, known.get(api))
+                actual = member.get(api)
+                if field == "parents" and value is not None:
+                    value, actual = sorted(value), sorted(actual or [])
+                if value is not None and value != actual:
+                    raise SafetyError("FOLDER_MEMBER_METADATA_DRIFT")
+        return members, states, effects
+
+    def _same_folder_fields(self, before, observed):
+        if core(before) != core(observed):
+            raise SafetyError("RECORDED_APPLIED_STATE_WAS_CHANGED")
+        self.unchanged(before, observed)
+        if before.get("capabilities") != observed.get("capabilities"):
+            raise SafetyError("FOLDER_CAPABILITY_DRIFT")
+
+    def _check_applied(self, item, active, applied, observed, *, read_only=False):
+        try:
+            self.unchanged(applied, observed, strict=True)
+            return
+        except SafetyError as error:
+            if str(error) != "CONCURRENT_CHANGE" or item["original"]["mime_type"] != FOLDER:
+                raise
+        self._same_folder_fields(applied, observed)
+        old, new = applied.get("version"), observed.get("version")
+        if not (isinstance(old, str) and old.isdecimal() and isinstance(new, str)
+                and new.isdecimal() and int(new) > int(old)):
+            raise SafetyError("CONCURRENT_CHANGE")
+        members, states, effects = self._check_folder_members(item)
+        prior = [e for e in self.events(item["source_id"]) if e["kind"] == "DESIRED_FOLDER_RECONCILED"
+                 and e["payload"].get("forward_event_id") == active["event_id"]]
+        since = prior[-1]["seq"] if prior else active["seq"]
+        root = item["source_id"]
+        original = {m["id"] for m in (item["baseline"].get("subtree") or {}).get("members", [])}
+        related = []
+        for event in effects:
+            source = event["payload"]["source_id"]
+            if event["seq"] <= since or source == root or event["kind"] == "DESIRED_OBSERVED":
+                continue
+            before = core(self.journal.read_evidence(event["payload"]["before_ref"]))
+            after = states[source]
+            if (source in original or self._inside(source, root, states) or self._inside(root, source, states)
+                    or root in before["parents"] or root in after["parents"]):
+                related.append(event["event_id"])
+        if not related:
+            raise SafetyError("CONCURRENT_CHANGE")
+        if read_only:
+            return
+        self.record("FOLDER_RECONCILED", item, forward_event_id=active["event_id"],
+            historical_applied_ref=active["payload"]["applied_ref"],
+            prior_ref=self.journal.evidence(applied), observed_ref=self.journal.evidence(observed),
+            membership_ref=self.journal.evidence(members), related_event_ids=related,
+            reason="FOLDER_COUNTER_ADVANCE_AFTER_RELATED_VERIFIED_OPERATIONS",
+            limitation="Matching relevant fields and membership verified; version causation not provable.")
 
     def rebaseline_version_only(self, item, *, authorization_ref):
         """Explicit operator reconciliation, not an automatic exception to CAS.
@@ -286,7 +430,7 @@ class DesiredRunner:
                 reason="EXPLICIT_HISTORICAL_VERSION_ONLY_RECONCILIATION",
                 comparison="Known identity/name/parents/content/owners/capabilities unchanged; version causation unknown")
 
-    def approved(self, item, raw, *, dependency=False):
+    def approved(self, item, raw, *, dependency=False, read_only=False):
         current = core(raw)
         if current["id"] != item["source_id"] or current["mime_type"] != item["original"]["mime_type"]:
             raise SafetyError("IDENTITY_OR_MIME_DRIFT")
@@ -311,7 +455,10 @@ class DesiredRunner:
                 # Parent observations authorize use of the current location;
                 # siblings/provider propagation may advance its version without
                 # changing that location. Actual mutation targets stay strict.
-                self.unchanged(applied, raw, strict=not dependency)
+                if dependency:
+                    self.unchanged(applied, raw)
+                else:
+                    self._check_applied(item, active, applied, raw, read_only=read_only)
             if dependency:
                 known = applied.get("capabilities", {}).get("canAddChildren")
                 if known is not None and raw.get("capabilities", {}).get("canAddChildren") != known:
@@ -400,33 +547,12 @@ class DesiredRunner:
             if not rollback and self.authority().get("access_policy") != "SCOPED_EXPOSURE_ACCEPTED":
                 raise SafetyError("MOVE_ACCESS_REVIEW_REQUIRED")
             if before.get("mimeType") == FOLDER:
-                subtree = item["baseline"].get("subtree") or {}
-                if not subtree.get("complete"):
-                    raise SafetyError("COMPLETE_FOLDER_MEMBERSHIP_REQUIRED")
-                pending, seen, members = [item["source_id"]], set(), []
-                while pending:
-                    pid = pending.pop()
-                    if pid in seen:
-                        raise SafetyError("FOLDER_CYCLE")
-                    seen.add(pid)
-                    children = self.preview_read(preview_cache, "children", pid, self.children)
-                    members.extend(children)
-                    pending.extend(c["id"] for c in children if c["mimeType"] == FOLDER)
-                if set(target["parents"]) & ({item["source_id"]} | {m["id"] for m in members}):
-                    raise SafetyError("FOLDER_CYCLE")
-                original = {m["id"]: m for m in (item["baseline"].get("subtree") or {}).get("members", [])}
-                permitted = set(original) | {i["source_id"] for i in self.items if item["source_id"] in i["target"]["parents"]}
-                if any(m["id"] not in permitted for m in members) or not set(original) <= {m["id"] for m in members}:
-                    raise SafetyError("FOLDER_MEMBERSHIP_DRIFT")
-                for member in members:
-                    known = self.by_id.get(member["id"])
-                    if known and (member["name"] not in (known["original"]["name"], known["target"]["name"]) or member["mimeType"] != known["original"]["mime_type"]):
-                        raise SafetyError("FOLDER_MEMBER_METADATA_DRIFT")
+                self._check_folder_members(item, target, preview_cache)
         return parents
 
-    def observe(self, item, *, dependency=False):
+    def observe(self, item, *, dependency=False, read_only=False):
         raw = self.read(item["source_id"])
-        current = self.approved(item, raw, dependency=dependency)
+        current = self.approved(item, raw, dependency=dependency, read_only=read_only)
         partial = any(current[f] == item["target"][f] != item["original"][f] for f in ("name", "parents"))
         return raw, current, "TARGET" if current == item["target"] else "PARTIAL" if partial else "NOT_APPLIED"
 
@@ -443,7 +569,7 @@ class DesiredRunner:
                 self.report_progress("item_started", source_id=item["source_id"], mode="PREVIEW",
                     completed_items=len(output), total_items=len(self.items))
                 try:
-                    raw, current, state = self.observe(item)
+                    raw, current, state = self.observe(item, read_only=True)
                     if raw.get("mimeType") == FOLDER:
                         preview_cache[("parent", item["source_id"])] = copy.deepcopy(raw)
                     parents = self.preflight(item, raw, item["target"], preview_cache=preview_cache)
@@ -570,19 +696,21 @@ class DesiredRunner:
                 if not event:
                     return {"source_id": item["source_id"], "state": "NOTHING_TO_ROLL_BACK"}
                 raw = self.read(item["source_id"])
-                applied = self.journal.read_evidence(event["payload"]["applied_ref"])
+                applied = self._applied_baseline(item, event)
                 target = core(self.journal.read_evidence(event["payload"]["before_ref"]))
                 pending = self.pending(item, "ROLLBACK")
                 if pending and core(raw) == target:
                     return self.transition(item, raw, target, rollback_event=event)
                 if core(raw) != core(applied):
                     raise SafetyError("ROLLBACK_CURRENT_STATE_CONFLICT")
-                self.unchanged(applied, raw, strict=True)
+                self._check_applied(item, event, applied, raw)
                 return self.transition(item, raw, target, rollback_event=event)
             raw, current, state = self.observe(item)
             if state == "TARGET" and self.pending(item, "FORWARD"):
                 return self.transition(item, raw, item["target"])
             if state == "TARGET":
+                if item["original"]["mime_type"] == FOLDER:
+                    self._check_folder_members(item)
                 self.record("OBSERVED", item, observed_ref=self.journal.evidence(raw), state="TARGET")
                 return {"source_id": item["source_id"], "state": "TARGET", "observed": current,
                         "effects": self.effects(item, current)}
@@ -650,6 +778,26 @@ class DesiredRunner:
                     changed += 1
                 self.report_progress("item_finished", completed_items=len(output), total_items=len(selected), **result)
             try:
+                # Recover remote success before walking parent dependencies.
+                # This records a fresh observation only; it never sends a write
+                # or retries an unresolved child behind an unsatisfied parent.
+                if not rollback:
+                    for item in selected:
+                        attempt = self.pending(item, "FORWARD")
+                        if not attempt:
+                            continue
+                        related_folders = [folder for folder in self.items
+                            if folder["original"]["mime_type"] == FOLDER and folder["source_id"] != item["source_id"]
+                            and (folder["source_id"] in item["original"]["parents"] + item["target"]["parents"]
+                                 or item["source_id"] in {m["id"] for m in (folder["baseline"].get("subtree") or {}).get("members", [])})]
+                        if not related_folders:
+                            continue
+                        target = self.journal.read_evidence(attempt["payload"]["target_ref"])
+                        observed = self.read(item["source_id"])
+                        if core(observed) == target:
+                            before = self.journal.read_evidence(attempt["payload"]["before_ref"])
+                            self.unchanged(before, observed, moving=core(before)["parents"] != target["parents"])
+                            self.applied(item, before, observed, attempt["payload"], None, recovered=True)
                 # Subset runs observe outside dependencies; never add them to mutation scope.
                 external = set().union(*dependencies.values()) - selected_ids if dependencies else set()
                 if not rollback:

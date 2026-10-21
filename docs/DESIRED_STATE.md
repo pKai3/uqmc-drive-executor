@@ -166,3 +166,7 @@ A `DESIRED_REBASELINED` event links the original applied event, unchanged histor
 ### New batches use a fresh spreadsheet snapshot
 
 New CLI `apply` runs require the capture/reconcile/bind workflow in [BATCH_REFRESH.md](BATCH_REFRESH.md). `resume` continues only an already started immutable plan or a fresh bound plan. Reported edits require a pause and explicit refresh, not silent target replacement. Existing exact approval and source pre-write checks remain required.
+
+Folder moves retain their stable IDs at every depth. The runner orders both target-folder dependencies and original containment, including the case where a former child must move out before its old parent can move into it. Independent siblings can still run concurrently. Rollback reverses these dependencies.
+
+Folder membership checks reconcile the frozen descendant graph with verified journal outcomes, including incoming and outgoing subtrees. After related successful operations, a folder counter advance may be accepted only after matching relevant metadata and current membership; a separate `DESIRED_FOLDER_RECONCILED` event preserves the old evidence and links the observations. This does not prove what caused a provider version increment. Unexplained advances, substantive drift and changes after the final pre-write read still block. Pending child successes are read back before parent resume checks, without replaying the write. Preview records no reconciliation events.
