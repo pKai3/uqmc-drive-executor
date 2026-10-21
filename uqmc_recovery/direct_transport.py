@@ -51,12 +51,12 @@ class _ReplayBlocked(RuntimeError):
 
 
 def _single_send_http_class(base):
-    """Fence httplib2's unconditional BadStatusLine replay below its retry flag.
+    """Fence write replay; allow one identical GET/HEAD stale-socket retry.
 
-    The official library retries that case even with RETRIES=1. A connection
-    proxy permits one request() call per outer HTTP request; any attempted
-    replay fails before another request is sent. Used by this single-writer
-    process only, not a shared concurrent HTTP client.
+    httplib2 retries BadStatusLine/ResponseNotReady even with RETRIES=1.
+    Mutations still permit exactly one send per outer request. Safe reads may
+    send twice, with the existing socket timeout on each attempt. This is not
+    a wall-clock deadline. Each worker owns its HTTP client.
     """
     class Connection:
         def __init__(self, wrapped, owner):
@@ -66,14 +66,22 @@ def _single_send_http_class(base):
             return getattr(self.wrapped, name)
 
         def request(self, *args, **kwargs):
+            method = args[0] if args else kwargs.get("method")
+            uri = args[1] if len(args) > 1 else kwargs.get("url")
+            signature = (method, uri)
             if self.owner._send_count:
-                raise _ReplayBlocked("AUTOMATIC_HTTP_REPLAY_BLOCKED")
+                if (method not in {"GET", "HEAD"} or self.owner._send_count >= 2
+                        or signature != self.owner._first_request):
+                    raise _ReplayBlocked("AUTOMATIC_HTTP_REPLAY_BLOCKED")
+            else:
+                self.owner._first_request = signature
             self.owner._send_count += 1
             return self.wrapped.request(*args, **kwargs)
 
     class SingleSendHttp(base):
         def request(self, *args, **kwargs):
             self._send_count = 0
+            self._first_request = None
             return super().request(*args, **kwargs)
 
         def _conn_request(self, conn, *args, **kwargs):
@@ -268,8 +276,8 @@ class GoogleDriveTransport:
     def _read(self, factory, *, request, item_id=None):
         self._ready(item_id=item_id)
         try:
-            # Surface the first timeout/refusal promptly. No hidden read retry
-            # or backoff; a caller can make an explicitly bounded fresh read.
+            # Surface timeouts/refusals promptly. Only the HTTP stale-socket
+            # GET/HEAD retry is allowed below this layer; no request backoff.
             result = factory().execute(num_retries=0)
         except Exception as error:
             raise _failure(error, dispatched=False, request=request, item_id=item_id, secret_values=self._secret_values) from None

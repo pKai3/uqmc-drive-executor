@@ -369,6 +369,7 @@ def register_agent_plan(journal, plan):
                 latest[record["operation_id"]] = record
         if taken & {op.operation_id for op in plan.operations}:
             raise SafetyError("OPERATION_ID_REUSED")
+        reconciled_history = None
         for record in latest.values():
             if record["kind"] not in {"ATTEMPTED", "UNCERTAIN"} and not (record["kind"] == "PREPARED" and record["payload"].get("bridge")):
                 continue
@@ -377,6 +378,23 @@ def register_agent_plan(journal, plan):
                 old = journal.read_evidence(record["payload"]["before_ref"])
                 previous_scope |= set(old.get("parents", [])) | {m["id"] for m in _members(old)}
             if previous_scope & scope:
+                source_id = record["payload"]["file_id"]
+                if record["kind"] in {"ATTEMPTED", "UNCERTAIN"} and any(
+                        later["seq"] > record["seq"] and later["kind"] == "DESIRED_APPLIED"
+                        and later["payload"].get("source_id") == source_id for later in records):
+                    # Desired-state recovery may have verified an old adapter's
+                    # effect without rewriting its historical uncertain event.
+                    # Reuse the evidence-validated cross-adapter history; a bare
+                    # receipt, unrelated success or conflicting target cannot
+                    # release this fence. PREPARED handoffs remain fenced.
+                    if reconciled_history is None:
+                        from .destination_history import build_history_index
+                        reconciled_history = build_history_index(journal)
+                    history = reconciled_history.get(source_id, {})
+                    if (record["event_id"] in history.get("event_ids", [])
+                            and record["operation_id"] in history.get("historical_uncertain_operation_ids", [])
+                            and not history.get("pending_requests", [None])):
+                        continue
                 raise SafetyError("UNRESOLVED_PRIOR_REQUEST")
         ref = journal.evidence(plan.body())
         return journal.append("DRAFTED", payload={"run_id": plan.run_id, "batch_id": plan.batch_id,

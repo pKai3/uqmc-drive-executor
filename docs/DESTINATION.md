@@ -10,6 +10,18 @@ cd /Users/bcsinger/Documents/GitHub/uqmc-drive-executor
 .venv/bin/python -m uqmc_recovery.destination '06 Trip Leaders'
 ```
 
+Console output is readable by default: stage, elapsed time, progress counts,
+verified filenames, errors, and a separate publication result. Metadata progress
+is summarized every ten items; execution prints one completion line per item.
+The complete JSON progress and final result are also saved to a private, flushed
+and synced JSONL transcript under the configured run directory's `console-logs/`.
+The execution journal remains the authority for recovery. Use `--json` for JSON
+records on stdout, for example:
+
+```sh
+.venv/bin/python -m uqmc_recovery.destination '06 Trip Leaders' --json
+```
+
 The default is a read-only preview. It reads the fresh spreadsheet and relevant
 Drive metadata, checks the authenticated account and reports pending, complete
 and blocked items. It does not migrate files or publish status.
@@ -165,7 +177,8 @@ No server deployment is performed.
 The runner uses ten workers by default, independent HTTP transports, serialized
 durable journal writes and one process writer lock. Folder dependencies and
 same-name collision guards constrain parallel work. Each HTTP request has the
-existing 15-second socket timeout; this is not a strict wall-clock deadline for
+existing 15-second socket timeout per attempt. A stale-socket GET/HEAD may
+retry once; writes still allow only one transport send. This is not a strict wall-clock deadline for
 a complete multi-request item or batch. Transient retries are bounded and follow
 fresh reads. Cancellation stops new dispatch while retaining in-flight outcomes.
 

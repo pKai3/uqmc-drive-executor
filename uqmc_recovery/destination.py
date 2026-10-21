@@ -536,17 +536,23 @@ def main(argv=None):
     parser.add_argument('--config',default='private/destination-config.json');parser.add_argument('--apply',action='store_true')
     parser.add_argument('--resume',action='store_true');parser.add_argument('--rollback',metavar='RUN_ID');parser.add_argument('--publish-only',metavar='DIRECTORY')
     parser.add_argument('--verify-completed',type=int,metavar='N',help='Read-only sample of 1–30 already completed files; never a whole-section completion claim')
+    parser.add_argument('--json',action='store_true',help='Emit complete JSON records instead of readable console progress')
     args=parser.parse_args(argv);os.umask(0o077)
+    from .destination_console import ConsoleReporter
+    console=ConsoleReporter(json_output=args.json)
     try:
         config_path=Path(args.config).resolve();config=json.loads(config_path.read_text())
+        console.open_log(config['run_directory'])
         result=run_destination(config,args.destination,apply=args.apply,resume=args.resume,rollback=args.rollback,publish_only=args.publish_only,verify_completed=args.verify_completed,
-            report=lambda x:print(json.dumps(x),flush=True))
-        print(json.dumps(result,indent=2),flush=True)
+            report=console.progress)
+        console.finish(result)
         return 2 if result.get('blockers') or result.get('revision_stop_reason') or any(k not in {'APPLIED','TARGET','COMPLETE','ROLLED_BACK','UNCHANGED'} and v for k,v in result.get('counts',{}).items()) and args.apply else 0
     except Exception as exc:
         from .direct_transport import TransportError
-        print(json.dumps({'error':str(exc) if isinstance(exc,SafetyError) else type(exc).__name__,
-            **({'request_error':exc.as_dict()} if isinstance(exc,TransportError) else {})}),flush=True);return 2
+        console.error({'error':str(exc) if isinstance(exc,SafetyError) else type(exc).__name__,
+            **({'request_error':exc.as_dict()} if isinstance(exc,TransportError) else {})});return 2
+    finally:
+        console.close()
 
 
 if __name__=='__main__':raise SystemExit(main())

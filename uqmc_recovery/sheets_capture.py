@@ -183,7 +183,7 @@ class GoogleSheetsCapture:
         drive = GoogleDriveTransport.from_authorized_user_file(token_path, apply=False,
             allowed_ids={workbook_id}, mutation_ids=set(), audit_permissions=False, timeout=timeout)
         # The Drive factory already enforces private token permissions, scope
-        # validation, zero hidden retries, static discovery and redacted errors.
+        # validation, bounded safe-read retry, static discovery and redacted errors.
         http = drive.service._http
         credentials = http.credentials
         if set(credentials.granted_scopes or credentials.scopes or ()) != {FULL_DRIVE_SCOPE}:

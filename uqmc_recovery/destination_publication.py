@@ -121,13 +121,51 @@ def _read_viewer(drive, file_id):
     return identity, content
 
 
+def display_section_specs(registry, data, allowed_source_ids):
+    """Count all current viewer members without expanding execution authority.
+
+    The registry remains unchanged. Extra public proposal identities have no
+    matching sealed execution plan, so build_publication leaves them unverified.
+    A missing registered identity or ambiguous/unknown viewer identity is a
+    conflict, not a reason to reduce the expected completion count.
+    """
+    allowed = set(allowed_source_ids)
+    paths = {}
+    for node in data['nodes']:
+        paths[node['i']] = (paths[node['p']] if node['p'] >= 0 else ()) + (node['n'].strip(),)
+    specs = section_specs(registry)
+    for spec in specs:
+        path = viewer.path_parts(spec['proposal_path'])
+        roots = [n for n in data['nodes'] if n['s'] == 'destination' and n['f']
+                 and paths[n['i']] == path]
+        if len(roots) != 1:
+            raise ValueError('SECTION_PATH_NOT_UNIQUE:' + spec['proposal_path'])
+        ids = [n.get('id') for n in data['nodes'] if n['s'] == 'destination' and not n['f']
+               and paths[n['i']][:len(path)] == path]
+        if (any(not x for x in ids) or len(ids) != len(set(ids))
+                or not set(ids) <= allowed):
+            raise ValueError('SECTION_DISPLAY_IDENTITIES_INVALID:' + spec['section_id'])
+        registered = spec['source_ids']
+        if len(registered) != len(set(registered)) or not set(registered) <= set(ids):
+            raise ValueError('SECTION_REGISTERED_MEMBER_MISSING:' + spec['section_id'])
+        spec['source_ids'] = sorted(ids)
+    return specs
+
+
 def freeze_publication(config, registry, *, journal, fresh_workbook, drive):
     """Read remote HTML; freeze private artifacts without any remote writes."""
     basis = config['identity_basis']
     if isinstance(basis, (str, Path)):
         basis = _load(basis)
+    metadata, source = _read_viewer(drive, config['viewer_file_id'])
+    data = viewer.unpack(source.decode('utf-8'))
+    identities = {n['id'] for n in data['nodes'] if n.get('id')}
+    workbook = copy.deepcopy(fresh_workbook)
+    workbook.setdefault('exported_at_utc', workbook.get('captured_at_utc', _now()))
+    report = viewer.refresh_proposal(data, workbook)
+    specs = display_section_specs(registry, data, basis['source_ids'])
     bundle = build_publication(journal, allowed_source_ids=basis['source_ids'],
-        identity_basis=basis, sections=section_specs(registry))
+        identity_basis=basis, sections=specs)
     snapshot = bundle['html']['snapshot_id']
     # Proposal edits may change HTML without changing journal snapshot. Include
     # proposal content in the delivery key; snapshot IDs still match sheet/HTML.
@@ -144,12 +182,6 @@ def freeze_publication(config, registry, *, journal, fresh_workbook, drive):
             if existing['workbook_id'] != config['workbook_id'] or existing['viewer_file_id'] != config['viewer_file_id']:
                 raise ValueError('PUBLICATION_TARGET_CHANGED')
             return directory
-        metadata, source = _read_viewer(drive, config['viewer_file_id'])
-        data = viewer.unpack(source.decode('utf-8'))
-        identities = {n['id'] for n in data['nodes'] if n.get('id')}
-        workbook = copy.deepcopy(fresh_workbook)
-        workbook.setdefault('exported_at_utc', workbook.get('captured_at_utc', _now()))
-        report = viewer.refresh_proposal(data, workbook)
         validate_snapshot(bundle['html'])
         viewer.integrate(data, bundle)
         if {n['id'] for n in data['nodes'] if n.get('id')} != identities:

@@ -198,22 +198,28 @@ def integrate(data, bundle):
         members = [n for n in nodes if n['s'] == 'destination' and not n['f'] and paths[n['i']][:len(path)] == path]
         if len(members) != section['expected_file_count']:
             raise ValueError('SECTION_MEMBERSHIP_COUNT_MISMATCH:' + section['section_id'])
-        if section['status'] == 'COMPLETED':
-            if section['completed_file_count'] != len(members):
-                raise ValueError('SECTION_COMPLETION_COUNT_MISMATCH')
-            destination_ids = {section['destination_id']} | {d['id'] for d in section.get('created_destinations', []) + section.get('verified_destinations', [])}
-            for member in members:
-                observed_item = verified_items.get(member['id'], {})
-                observed = observed_item.get('observed', {})
-                parents = observed.get('parent_ids')
-                location = observed_item.get('location', {}).get('effect')
-                proof = (member['id'] in section['verified_file_ids'] if 'verified_file_ids' in section else
-                    observed_item.get('rename', {}).get('effect') == 'APPLIED' and
-                    (observed_item.get('move', {}).get('effect') == 'APPLIED' or location in {'INHERITED', 'DIRECT_AND_INHERITED'}))
-                if (observed.get('read_state') != 'VERIFIED' or not parents or
+        if section['status'] == 'COMPLETED' and section['completed_file_count'] != len(members):
+            raise ValueError('SECTION_COMPLETION_COUNT_MISMATCH')
+        verified = section.get('verified_file_ids',
+            [n['id'] for n in members] if section['status'] == 'COMPLETED' else [])
+        if (len(verified) != len(set(verified)) or not set(verified) <= {n['id'] for n in members}
+                or len(verified) != section['completed_file_count']):
+            raise ValueError('SECTION_VERIFIED_MEMBERSHIP_MISMATCH')
+        destination_ids = {section['destination_id']} | {d['id'] for d in section.get('created_destinations', []) + section.get('verified_destinations', [])}
+        for member in members:
+            if member['id'] not in verified:
+                continue
+            observed_item = verified_items.get(member['id'], {})
+            observed = observed_item.get('observed', {})
+            parents = observed.get('parent_ids')
+            location = observed_item.get('location', {}).get('effect')
+            proof = (member['id'] in section['verified_file_ids'] if 'verified_file_ids' in section else
+                observed_item.get('rename', {}).get('effect') == 'APPLIED' and
+                (observed_item.get('move', {}).get('effect') == 'APPLIED' or location in {'INHERITED', 'DIRECT_AND_INHERITED'}))
+            if (observed.get('read_state') != 'VERIFIED' or not parents or
                     not set(parents) <= destination_ids or not proof):
-                    raise ValueError('SECTION_MEMBER_NOT_VERIFIED_AT_DESTINATION')
-            completed_files.update(n['id'] for n in members)
+                raise ValueError('SECTION_MEMBER_NOT_VERIFIED_AT_DESTINATION')
+        completed_files.update(verified)
         retained.update(section.get('retained_source_folder_ids', []))
         destinations = {x['id']: x for x in section.get('created_destinations', [])}
         destinations.update({x['id']: x for x in section.get('verified_destinations', [])})
