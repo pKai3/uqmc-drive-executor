@@ -16,6 +16,7 @@
 *.log
 
 # Credentials and local configuration.
+/secrets/
 .env
 .env.*
 credentials*

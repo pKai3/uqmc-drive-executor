@@ -71,11 +71,11 @@ No credentials or OAuth grant have been created. The assistant's connector sessi
 
 1. Choose the Google account and Cloud project, enable Drive API, and configure a Desktop app OAuth client and consent settings.
 2. Run the explicit login command below and select your intended Google account in the browser. The project owner and the account granting Drive access can differ; your selected account needs access to the sources and destinations. If the OAuth app is in testing, include that selected account as a test user.
-3. Keep the client JSON and resulting authorized-user token private, outside Git, exports and chat. Pass the token path explicitly. Consent does not authorize automatic execution.
+3. Place the downloaded OAuth Desktop client JSON in the ignored local `secrets/API_KEY.json` file. Despite its user-chosen filename, its contents must be OAuth Desktop client configuration, not an API key. Keep it and the resulting token out of Git commits, exports and chat. Pass the token path explicitly. Consent does not authorize automatic execution.
 
 ```sh
 python3 -m uqmc_recovery.google_login \
-  --client-json /absolute/private/desktop-client.json \
+  --client-json secrets/API_KEY.json \
   --token /absolute/private/uqmc-auth/authorized-user-token.json
 ```
 
