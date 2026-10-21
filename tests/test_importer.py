@@ -105,6 +105,19 @@ class ImporterTests(unittest.TestCase):
         result = self.run_import(("RENAME-001",), resolutions=resolved)
         self.assertEqual(result.manifest["rows"][0]["reason_code"], "UPLOADED_EXTENSION_CHANGED")
 
+    def test_verified_mime_extension_correction_is_frozen_with_proof(self):
+        self.states["source"] = metadata("source", "Fixture_FA.CPR", "application/pdf")
+        provenance = self.journal.evidence({"source_id": "source", "mime_type": "application/pdf", "kind": "fixture_verified_metadata"})
+        proof = self.journal.evidence({"kind": "VERIFIED_EXTENSION_CORRECTION", "source_id": "source",
+            "source_exact_name": "Fixture_FA.CPR", "target_exact_name": "Fixture certificate.pdf", "mime_type": "application/pdf", "provenance_ref": provenance})
+        correction = {"source_suffix": ".CPR", "target_suffix": ".pdf", "mime_type": "application/pdf", "evidence_ref": proof}
+        resolved = resolutions(self.export, self.states)
+        resolved["RENAME-001"].update(exact_target_name="Fixture certificate.pdf", extension_correction=correction)
+        result = self.run_import(("RENAME-001",), resolutions=resolved)
+        self.assertIsNotNone(result.plan)
+        self.assertEqual(result.plan.operations[0].extension_correction, correction)
+        self.assertEqual(result.plan.operations[0].before["mime_type"], "application/pdf")
+
     def test_path_without_destination_id_blocks(self):
         result = self.run_import(resolutions={})
         self.assertIsNone(result.plan)

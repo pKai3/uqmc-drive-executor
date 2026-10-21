@@ -10,7 +10,7 @@ import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from .model import FOLDER, Operation, Plan, SafetyError, WITHDRAWN_ID, digest, snapshot
+from .model import FOLDER, Operation, Plan, SafetyError, WITHDRAWN_ID, digest, snapshot, validate_extension_evidence
 
 # Live identity is supplied from ignored private configuration, never from a repo.
 WORKBOOK_ID = "fixture-workbook"
@@ -129,7 +129,8 @@ class ImportResult:
 
 
 def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
-                    resolutions=None, expected_input_sha256=None, expected_workbook_id=WORKBOOK_ID):
+                    resolutions=None, expected_input_sha256=None, expected_workbook_id=WORKBOOK_ID,
+                    _section_eligibility=None, metadata_profile="STRICT"):
     """Freeze only an explicitly selected, wholly resolved batch.
 
     resolutions[reference] binds input_sha256, row_sha256, source_id and supplies
@@ -144,9 +145,23 @@ def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
     if len(set(selected)) != len(selected) or not selected:
         raise SafetyError("EXPLICIT_SELECTION_REQUIRED")
     resolutions = resolutions or {}
+    normalize = snapshot
+    validate_operation = lambda operation: operation.validate()
+    validate_plan = lambda plan: plan.validate()
+    if metadata_profile == "AGENT_ASSISTED":
+        from .agent_profile import agent_snapshot, validate_agent_operation, validate_agent_plan
+        normalize, validate_operation, validate_plan = agent_snapshot, validate_agent_operation, validate_agent_plan
+    elif metadata_profile != "STRICT":
+        raise SafetyError("UNKNOWN_METADATA_PROFILE")
     with journal.locked():
         source = catalog(export, expected_workbook_id=expected_workbook_id)
         input_hash = source["input_sha256"]
+        section_eligible_refs = frozenset()
+        if _section_eligibility is not None:
+            # Internal extension point: only the validated section wrapper can mint
+            # this token. It is not a public per-row approval switch.
+            from .section_importer import _eligibility_refs
+            section_eligible_refs = _eligibility_refs(_section_eligibility, input_hash, selected, journal)
         recorded_exclusions = {r["payload"]["file_id"] for r in journal.records() if r["kind"] == "EXCLUDED"}
         recorded_refs = {r["payload"]["proposal_ref"] for r in journal.records() if r["kind"] == "PROPOSAL_EXCLUDED"}
         for source_id in source["excluded_ids"]:
@@ -178,7 +193,7 @@ def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
                 if ref in excluded_refs or set(record["proposal_refs"]) & excluded_refs:
                     entry["approval_state"] = "WITHDRAWN"
                     raise SafetyError("PROPOSAL_EXCLUDED")
-                if record["decision"] != "Yes":
+                if record["decision"] != "Yes" and not (record["decision"] == "" and ref in section_eligible_refs):
                     raise SafetyError("PROPOSAL_DECISION_NOT_YES")
                 resolution = resolutions.get(ref)
                 if not isinstance(resolution, dict):
@@ -192,14 +207,19 @@ def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
                     raise SafetyError("EXPLICIT_DEPENDENCY_REVIEW_REQUIRED")
                 if resolution.get("reviewed_checks") is not True:
                     raise SafetyError("PROPOSAL_CHECKS_NOT_REVIEWED")
+                collisions = resolution.get("allowed_collision_ids", [])
+                if not isinstance(collisions, list) or any(not isinstance(item, str) or not item for item in collisions) or len(collisions) != len(set(collisions)):
+                    raise SafetyError("INVALID_COLLISION_SCOPE")
+                if set(collisions) & excluded:
+                    raise SafetyError("EXCLUDED_COLLISION_ID")
                 # This is deliberately after all exclusion checks. No metadata access
                 # occurs even if an excluded ID exists in the supplied dictionary.
-                before = snapshot(metadata_by_id[source_id])
+                before = normalize(metadata_by_id[source_id])
                 if before["id"] != source_id:
                     raise SafetyError("ID_MISMATCH")
                 if resolution.get("live_snapshot_sha256") != digest(before):
                     raise SafetyError("STALE_LIVE_METADATA_RESOLUTION")
-                descendant_ids = {x["id"] for x in before["subtree"].get("members", [])}
+                descendant_ids = {x["id"] for x in before.get("subtree", {}).get("members", [])}
                 if ({source_id} | set(before["parents"]) | descendant_ids) & excluded:
                     raise SafetyError("EXCLUDED_SCOPE_OR_DESCENDANT")
                 if record["action"] == "MOVE":
@@ -210,7 +230,7 @@ def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
                         raise SafetyError("EXCLUDED_DESTINATION")
                     target = {"parents": sorted(targets)}
                     for parent_id in set(before["parents"]) | set(targets):
-                        parent = snapshot(metadata_by_id[parent_id])
+                        parent = normalize(metadata_by_id[parent_id])
                         if parent["id"] != parent_id or parent["mime_type"] != FOLDER:
                             raise SafetyError("DESTINATION_OR_ORIGINAL_PARENT_INVALID")
                 else:
@@ -221,8 +241,10 @@ def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
                     target = {"name": exact_name}
                 operation_id = "op-" + digest({"batch_id": batch_id, "input_sha256": input_hash, "reference": ref, "action": record["action"]})[:24]
                 op = Operation(operation_id, source_id, record["action"], before, target,
-                               (), tuple(record["proposal_refs"]))
-                op.validate()
+                               (), tuple(record["proposal_refs"]), allowed_collision_ids=tuple(collisions),
+                               extension_correction=copy.deepcopy(resolution.get("extension_correction") or {}))
+                validate_operation(op)
+                validate_extension_evidence(journal, op)
                 candidates[ref] = (op, dependencies)
                 entry.update(state="ELIGIBLE_PENDING_BATCH_APPROVAL", reason_code="EXPLICIT_BATCH_APPROVAL_REQUIRED", operation_id=operation_id)
             except KeyError:
@@ -250,20 +272,37 @@ def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
                         ready = []
                         break
                     resolved = Operation(op.operation_id, op.file_id, op.action, before, op.target,
-                                         tuple(candidates[d][0].operation_id for d in deps), op.proposal_refs)
+                                         tuple(candidates[d][0].operation_id for d in deps), op.proposal_refs,
+                                         allowed_collision_ids=op.allowed_collision_ids,
+                                         extension_correction=copy.deepcopy(op.extension_correction))
                     operations.append((ref, resolved))
                     simulated[op.file_id] = resolved.intended(before)
+                    if resolved.action == "RENAME":
+                        # A later ancestor MOVE must include only the already
+                        # planned descendant name updates in its exact subtree.
+                        updated_ancestors = set()
+                        for candidate, _ in candidates.values():
+                            if candidate.before["mime_type"] != FOLDER or candidate.file_id == resolved.file_id or candidate.file_id in updated_ancestors:
+                                continue
+                            updated_ancestors.add(candidate.file_id)
+                            ancestor = simulated.setdefault(candidate.file_id, copy.deepcopy(candidate.before))
+                            for member in ancestor.get("subtree", {}).get("members", []):
+                                if member.get("id") == resolved.file_id and "name" in member:
+                                    if member["name"] != before["name"]:
+                                        raise SafetyError("PLANNED_DESCENDANT_RENAME_BASELINE_MISMATCH")
+                                    member["name"] = resolved.target["name"]
                     pending.remove(ref)
             if len(operations) == len(selected) and all(r["state"] != "BLOCKED" for r in rows):
                 proposed = Plan(batch_id, batch_id, "workbook:" + input_hash, tuple(op for _, op in operations), tuple(sorted(excluded)))
                 try:
-                    proposed.validate()
+                    validate_plan(proposed)
                     plan = proposed
                 except SafetyError as error:
                     for entry in rows:
                         entry.update(state="BLOCKED", reason_code=str(error))
         manifest = {
             "schema_version": "uqmc.workbook.import.v1", "dry_run": True,
+            "metadata_profile": metadata_profile,
             "workbook_id": expected_workbook_id, "captured_at_utc": export["exported_at_utc"],
             "input_sha256": input_hash, "proposal_revision": "workbook:" + input_hash,
             "batch_id": batch_id, "selected_refs": selected, "rows": rows,

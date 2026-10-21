@@ -16,15 +16,21 @@ The configured local backup directory is ignored and private. No automatic sched
 
 `Journal.recover_to(new_directory)` preserves the original bytes, saves a forensic copy, and salvages only complete verified records before an incomplete terminal line. It never truncates the original. Interior corruption or a bad hash fails closed. Never copy a backup over the active store. Restored stores are marked by a manifest and the engine refuses dispatch from them. A later recovery implementation must reconcile every potentially affected source and uncertain request against live state, obtain fresh batch approval, and establish a new active store without erasing old evidence. A backup may predate successful remote actions.
 
-## Pilot requirements: all still pending
+## Current pilot gates
 
-1. A separate explicit human batch approval for a small, fixed selection, bound to the imported proposal revision/hash and exact move/rename fields. Rollback needs its own explicit scope and approval. The configuration request is not either approval.
-2. A supported connector transport under existing authorised access. Do not invent a standalone connection or extract credentials. Current agent-assisted CLI covers metadata reads only. Implement and review a future prepare/dispatch/receipt/reconcile mutation handoff before any source write.
-3. Complete live source, original-parent and destination metadata: stable IDs, exact titles, MIME, parent arrays, version/time, trash/owner/drive state, actual capabilities and full permission baselines. Native Google titles must not acquire display suffixes; uploaded file extensions must survive.
-4. Complete effective-access and descendant evidence, including inheritance, limited-access restrictions, destination audience and all paginated membership. Any excluded descendant blocks an ancestor action; never open a permanently withdrawn item to resolve a gap. Any access change needs explicit approval of that exact reviewed difference.
-5. An enforceable concurrency/precondition guard or a separately reviewed operational alternative. Two reads alone do not eliminate the race between check and write. Unknown request outcomes need terminal/quiescence evidence before retry or compensation; a matching snapshot alone is insufficient.
-6. Verified backup/restore readiness and adequate private disk space. Confirm durable local storage is the intended location and establish an approved off-device recovery copy before relying on it against hardware failure.
-7. Agreed workbook/viewer projection installation with readback and delivery acknowledgements. Check snapshot ID/watermark parity and make stale/unknown status visible. A sync retry must never invoke an action. Evidence remains outside the viewer.
+A section-level movement approval can authorize the exact derived operations. It does not require invented `Yes` cells or a new human confirmation of a hash. The journal binding must preserve that approval's original reference, exact reviewed source set, destination mode, operation fields and any explicit access exposure acceptance. A changed section or later added source IDs do not inherit that approval.
+
+Before actual dispatch, the coordinator must:
+
+1. Supply the complete current workbook export, independently reviewed membership and destination mapping, explicit REUSE or NEW_FOLDER_REQUIRED mode and exact operation dependencies. Retain the original containers. The selected section's current proposal must be independently validated; passing synthetic tests is not that validation.
+2. Import and inspect the frozen plan with the section approval overlay. Bind allowed duplicate-name peer IDs to exact names and target parents. Preserve every distinct identity. Record access differences and available grants; scoped acceptance of exposure does not authorize permission API edits.
+3. Supply a reviewed dispatch-enable record for one controller and the frozen plan, then explicitly release the local validation hold. Local defaults are `migration_paused=true` in the configured project and `agent_handoff_enabled=false`. The configuration request alone does not enable dispatch.
+4. Obtain fresh source, original-parent, target-parent, descendant/membership and collision evidence immediately before each ticket. Stable IDs, exact names, MIME and parent relationships are mandatory. Missing version, trash, owner, capability or inheritance fields remain unknown and are recorded as limitations. Known conflicting metadata or missing critical identity evidence blocks. Unknown move capability may result in a terminal refusal; inverse capability is not guaranteed in advance.
+5. Use one assistant controller, issue the exact returned narrow tool arguments once and save the raw result before independent readback. The connector has no atomic CAS, so fresh reads reduce but cannot remove the check/write race. Any suspected concurrent change blocks. A timeout, lost ticket or crash remains uncertain and cannot be retried merely because the old location is observed.
+6. Create and verify a local checkpoint. Retain a private recovery copy using an existing authorised backup destination if protection from disk loss is needed; no new remote sharing is configured.
+7. Read back the action and publish only derived statuses through the agreed workbook/HTML interface. Retry publication independently, never by rerunning an action. Compare snapshot IDs and watermarks. Evidence and permission baselines remain private.
+
+The command workflow and exact trust boundaries are in [action handoff](action-handoff.md). Code cannot authenticate a human by itself: provenance evidence and supplied tool receipts are assertions from the trusted controller, not signed provider attestations. No real pilot has been executed by this project.
 
 ## Native API references
 

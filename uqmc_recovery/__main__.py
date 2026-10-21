@@ -11,7 +11,7 @@ from uuid import uuid4
 from .adapters import MockAdapter, fixture_state
 from .engine import Engine
 from .journal import Journal
-from .model import Approval, FOLDER, Operation, Plan, SafetyError
+from .model import Approval, FOLDER, Operation, Plan, SafetyError, digest
 from .projection import build_projections
 
 
@@ -39,6 +39,13 @@ def save_new(path, value):
         # Preserve uncertain/partial output for diagnosis; never overwrite it.
         raise
     return str(path.absolute())
+
+
+def plan_from_json(value):
+    """Parse a frozen manifest without adding defaults or broadening its scope."""
+    body = dict(value)
+    body["operations"] = tuple(Operation(**operation) for operation in body["operations"])
+    return Plan(**body)
 
 
 def demo(root):
@@ -84,6 +91,61 @@ def demo(root):
     return report, projections
 
 
+def handoff_demo(root):
+    """Bootstrap a separate synthetic handoff store, then run every API stage."""
+    from .action_bridge import ActionBridge
+    store = Journal(root)
+    states = {"fixture-origin": fixture_state("fixture-origin", "Original", FOLDER, ()),
+              "fixture-target": fixture_state("fixture-target", "Target", FOLDER, ()),
+              "fixture-source": fixture_state("fixture-source", "Report.pdf", parents=("fixture-origin",))}
+    adapter = MockAdapter(states)
+    before = states["fixture-source"]
+    op = Operation("fixture-handoff-op", "fixture-source", "MOVE", before,
+                   {"parents": ["fixture-target"]}, proposal_refs=("MOVE-fixture",))
+    plan = Plan("fixture-handoff-batch", "fixture-handoff-batch", "fixture-revision", (op,))
+    Engine(store, adapter).register(plan)
+    current = datetime.now(timezone.utc)
+    approval = Approval(str(uuid4()), plan.run_id, plan.batch_id, plan.proposal_revision,
+                        plan.proposal_hash, (op.operation_id,), "fixture-actor", current.isoformat(),
+                        (current + timedelta(hours=1)).isoformat())
+    check = adapter.preflight(op, before, set())
+    check.update(ancestors_complete=True, ancestor_ids=[])
+    proof = store.evidence({"mode": "TEST_ONLY", "mechanism": "FIXTURE_ATOMIC_CAS",
+                            "enforced": True, "file_id": op.file_id,
+                            "before_hash": digest(before), "safety_hash": digest(check)})
+    check["concurrency"] = {"mechanism": "FIXTURE_ATOMIC_CAS", "enforced": True, "evidence_ref": proof}
+    bridge = ActionBridge(store, mode="TEST_ONLY")
+    envelope = bridge.prepare_action(plan, op.operation_id, approval, before, check)
+    ticket = bridge.mark_attempt(envelope["envelope_hash"], before, check)
+    try:
+        bridge.mark_attempt(envelope["envelope_hash"], before, check)
+    except SafetyError as error:
+        duplicate_blocked = str(error)
+    else:
+        raise AssertionError("A consumed handoff ticket was reissued")
+    # In-memory remote fixture only. No connector is called or resolved.
+    raw = adapter.apply(op, before, adapter.preflight(op, before, set()), ticket["attempt_key"])
+    bridge.ingest_result(envelope["envelope_hash"], ticket["attempt_key"], raw)
+    observed = adapter.get(op.file_id)
+    terminal = {"mode": "TEST_ONLY", "kind": "FIXTURE_TERMINAL", "terminal": True,
+                "attempt_key": ticket["attempt_key"], "envelope_hash": envelope["envelope_hash"]}
+    result = bridge.reconcile_action(envelope["envelope_hash"], observed, check, terminal)
+    # Save exact JSON inputs to document each process boundary, including the
+    # prerequisite frozen store and its content-addressed fixture proof.
+    save_new(Path(root) / "fixture-prepare.json", {"plan": plan.body(), "operation_id": op.operation_id,
+             "approval": approval.body(), "before": before, "preflight": check})
+    save_new(Path(root) / "fixture-mark.json", {"envelope_hash": envelope["envelope_hash"],
+             "observed_before": before, "preflight": check})
+    save_new(Path(root) / "fixture-result.json", {"envelope_hash": envelope["envelope_hash"],
+             "attempt_key": ticket["attempt_key"], "raw": raw})
+    save_new(Path(root) / "fixture-reconcile.json", {"envelope_hash": envelope["envelope_hash"],
+             "observed": observed, "postflight": check, "terminal_evidence": terminal})
+    return {"simulation_only": True, "live_mutations": 0, "external_tool_calls": 0,
+            "fixture_tool": ticket["tool"], "result": result["kind"],
+            "duplicate_attempt_blocked": duplicate_blocked, "mock_dispatches": len(adapter.calls),
+            "fixture_store": str(Path(root).absolute())}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--private-dir", default="private", type=Path)
@@ -91,7 +153,18 @@ def main():
     sub.add_parser("init")
     sub.add_parser("status")
     sub.add_parser("export")
+    p = sub.add_parser("evidence")
+    p.add_argument("--input", required=True, type=Path)
+    p = sub.add_parser("disable-agent-dispatch")
+    p.add_argument("--controller-id", required=True)
+    p.add_argument("--reason-code", default="HOLD")
+    p = sub.add_parser("rollback-plan")
+    p.add_argument("--plan", required=True, type=Path)
+    p.add_argument("--selected", nargs="+", required=True)
+    p.add_argument("--batch-id", required=True)
     p = sub.add_parser("demo")
+    p.add_argument("--output", type=Path)
+    p = sub.add_parser("handoff-demo")
     p.add_argument("--output", type=Path)
     p = sub.add_parser("backup")
     p.add_argument("destination", type=Path)
@@ -111,6 +184,28 @@ def main():
     p.add_argument("--selected", nargs="+", required=True)
     p.add_argument("--batch-id", required=True)
     p.add_argument("--expected-input-sha256")
+    p = sub.add_parser("import-section")
+    p.add_argument("--input", required=True, type=Path)
+    p.add_argument("--projection", required=True, type=Path)
+    p.add_argument("--owner-approval-ref", required=True)
+    p.add_argument("--review-context-ref", required=True)
+    p.add_argument("--metadata-profile", choices=("STRICT", "AGENT_ASSISTED"), default="STRICT")
+    p.add_argument("--section-id", required=True)
+    p.add_argument("--metadata", required=True, type=Path)
+    p.add_argument("--resolutions", required=True, type=Path)
+    p.add_argument("--batch-id", required=True)
+    p = sub.add_parser("authorize-agent-dispatch")
+    p.add_argument("--input", required=True, type=Path)
+    p.add_argument("--controller-id", required=True)
+    for command in ("prepare-action", "mark-attempt", "ingest-result", "reconcile-action"):
+        p = sub.add_parser(command)
+        p.add_argument("--input", required=True, type=Path)
+        modes = p.add_mutually_exclusive_group()
+        modes.add_argument("--fixture-mode", action="store_true",
+                       help="Synthetic handoff only, stored separately from real state")
+        modes.add_argument("--agent-mode", action="store_true",
+                           help="Local handoff only; requires reviewed private enablement before preparing or marking")
+        p.add_argument("--controller-id")
     args = parser.parse_args()
     private = args.private_dir.absolute()
     private.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -118,6 +213,7 @@ def main():
     policy_file = private / "policy.json"
     if args.command == "init" and not policy_file.exists():
         save_new(policy_file, {"schema_version": 1, "live_mutations_enabled": False,
+                              "agent_handoff_enabled": False,
                               "connector_mode": "agent_read_receipts_only", "denied_source_ids": [],
                               "workbook_id": None, "automatic_backups": False})
     if not policy_file.exists():
@@ -125,6 +221,18 @@ def main():
     policy = read_json(policy_file)
     if policy.get("live_mutations_enabled") is not False:
         raise SafetyError("LIVE_EXECUTION_DISABLED")
+    if policy.get("migration_paused") and args.command in {"prepare", "import-workbook", "import-section"}:
+        raise SafetyError("MIGRATION_VALIDATION_PAUSE")
+    if args.command == "import-workbook" and policy.get("required_method_profile"):
+        raise SafetyError("REVIEWED_SECTION_PROFILE_REQUIRED")
+    agent_selected = args.command == "authorize-agent-dispatch" or getattr(args, "agent_mode", False)
+    if agent_selected and not args.controller_id:
+        raise SafetyError("CONTROLLER_ID_REQUIRED")
+    if agent_selected and args.command in {"authorize-agent-dispatch", "prepare-action", "mark-attempt"}:
+        if policy.get("migration_paused"):
+            raise SafetyError("MIGRATION_VALIDATION_PAUSE")
+        if policy.get("agent_handoff_enabled") is not True:
+            raise SafetyError("AGENT_HANDOFF_DISABLED")
     journal = Journal(private / "state")
     for file_id in policy.get("denied_source_ids", []):
         if not any(r["kind"] == "EXCLUDED" and r["payload"]["file_id"] == file_id for r in journal.records()):
@@ -132,6 +240,9 @@ def main():
     if args.command in ("init", "status"):
         records = journal.records()
         result = {"live_mutations_enabled": False, "connector_mode": "agent_read_receipts_only",
+                  "migration_paused": policy.get("migration_paused", False),
+                  "agent_handoff_enabled": policy.get("agent_handoff_enabled", False),
+                  "required_method_profile": policy.get("required_method_profile"),
                   "private_store": str(journal.root), "journal_records": len(records),
                   "journal_tip": records[-1]["hash"] if records else None,
                   "denied_source_count": len(policy.get("denied_source_ids", []))}
@@ -141,8 +252,23 @@ def main():
         result["report_path"] = save_new(output / "report.json", result)
         save_new(output / "projection-private.json", projections["workbook"])
         save_new(output / "projection-redacted.json", projections["html"])
+    elif args.command == "handoff-demo":
+        output = args.output or private / ("handoff-demo-" + str(uuid4()))
+        result = handoff_demo(output)
+        result["report_file"] = save_new(output / "report.json", result)
     elif args.command == "backup":
         result = journal.backup(args.destination)
+    elif args.command == "evidence":
+        result = {"evidence_ref": journal.evidence(read_json(args.input)), "private": True, "external_tool_calls": 0}
+    elif args.command == "disable-agent-dispatch":
+        from .action_bridge import ActionBridge
+        record = ActionBridge(journal, mode="AGENT_ASSISTED", controller_id=args.controller_id).disable_agent_dispatch(args.reason_code)
+        result = {"record_sequence": record["seq"], "agent_handoff_enabled": False, "external_tool_calls": 0}
+    elif args.command == "rollback-plan":
+        from .agent_profile import rollback_agent_plan
+        result_plan = rollback_agent_plan(journal, plan_from_json(read_json(args.plan)), args.selected, args.batch_id)
+        result = {"manifest_file": save_new(private / "imports" / (str(uuid4()) + "-rollback.json"), result_plan.body()),
+                  "execution_approved": False, "external_tool_calls": 0}
     elif args.command == "export":
         projections = build_projections(journal)
         identifier = str(uuid4())
@@ -161,6 +287,53 @@ def main():
     elif args.command == "reconcile":
         from .bridge import reconcile_reads
         result = reconcile_reads(journal, args.request_id)
+    elif args.command == "import-section":
+        from .section_importer import import_section
+        projection = read_json(args.projection)
+        if policy.get("required_method_profile") and projection.get("method_profile") != policy["required_method_profile"]:
+            raise SafetyError("METHOD_PROFILE_MISMATCH")
+        imported = import_section(journal, read_json(args.input), projection=projection,
+                                  owner_approval_ref=args.owner_approval_ref, expected_section_id=args.section_id,
+                                  review_context_ref=args.review_context_ref,
+                                  metadata_profile=args.metadata_profile,
+                                  batch_id=args.batch_id, metadata_by_id=read_json(args.metadata),
+                                  resolutions=read_json(args.resolutions), expected_workbook_id=policy.get("workbook_id"),
+                                  expected_method_profile=policy.get("required_method_profile", projection.get("method_profile")))
+        output = {"manifest": imported.manifest, "plan": imported.plan.body() if imported.plan else None,
+                  "evidence_ref": imported.evidence_ref}
+        result = {"manifest_file": save_new(private / "imports" / (str(uuid4()) + ".json"), output),
+                  "executable_approval_created": False, "plan_ready_for_review": imported.plan is not None}
+    elif args.command == "authorize-agent-dispatch":
+        from .action_bridge import ActionBridge
+        from .agent_profile import register_agent_plan
+        payload = read_json(args.input)
+        plan = plan_from_json(payload["plan"])
+        register_agent_plan(journal, plan)
+        bridge = ActionBridge(journal, mode="AGENT_ASSISTED", controller_id=args.controller_id)
+        result = bridge.authorize_agent_dispatch(plan, Approval(**payload["approval"]),
+                                                 payload["authorization_evidence"], payload["enable_evidence"])
+    elif args.command in ("prepare-action", "mark-attempt", "ingest-result", "reconcile-action"):
+        from .action_bridge import ActionBridge
+        mode = "TEST_ONLY" if args.fixture_mode else ("AGENT_ASSISTED" if args.agent_mode else "DISABLED")
+        # Fixture approval/action records must never enter the real journal.
+        action_journal = Journal(private / "handoff-fixture-state") if args.fixture_mode else journal
+        bridge = ActionBridge(action_journal, mode=mode, controller_id=args.controller_id)
+        payload = read_json(args.input)
+        if args.command == "prepare-action":
+            plan = plan_from_json(payload["plan"])
+            if args.fixture_mode:
+                Engine(action_journal, MockAdapter({})).register(plan)
+            result = bridge.prepare_action(plan, payload["operation_id"],
+                                           Approval(**payload["approval"]), payload["before"], payload["preflight"])
+        elif args.command == "mark-attempt":
+            result = bridge.mark_attempt(payload["envelope_hash"], payload["observed_before"], payload["preflight"])
+        elif args.command == "ingest-result":
+            ref = bridge.ingest_result(payload["envelope_hash"], payload["attempt_key"], payload["raw"],
+                                       receipt_id=payload.get("receipt_id"))
+            result = {"receipt_ref": ref, "execution_ready": False, "action_success_claimed": False}
+        else:
+            result = bridge.reconcile_action(payload["envelope_hash"], payload["observed"],
+                                              payload["postflight"], payload["terminal_evidence"])
     else:
         from .importer import import_workbook
         imported = import_workbook(journal, read_json(args.input), batch_id=args.batch_id,

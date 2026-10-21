@@ -8,7 +8,8 @@ import copy
 from dataclasses import asdict
 from datetime import datetime, timezone
 
-from .model import Approval, FOLDER, Operation, Plan, SafetyError, WITHDRAWN_ID, digest, semantic, snapshot
+from .model import (Approval, FOLDER, Operation, Plan, SafetyError, WITHDRAWN_ID, digest, semantic,
+                    snapshot, validate_extension_evidence, validate_rollback_links)
 
 SUCCESS = {"VERIFIED_APPLIED", "RECONCILED_AT_TARGET", "SKIPPED"}
 ACTION_STATES = SUCCESS | {"PREPARED", "ATTEMPTED", "UNCERTAIN", "FAILED_NOT_APPLIED", "BLOCKED_CONFLICT"}
@@ -84,9 +85,11 @@ class Engine:
                 if record["kind"] in ACTION_STATES and record["operation_id"]:
                     latest_by_id[record["operation_id"]] = record
             for previous_id, record in latest_by_id.items():
-                if previous_id in {item.operation_id for item in plan.operations} or record["kind"] not in {"ATTEMPTED", "UNCERTAIN"}:
+                reserved = record["kind"] in {"ATTEMPTED", "UNCERTAIN"} or (
+                    record["kind"] == "PREPARED" and record["payload"].get("bridge"))
+                if previous_id in {item.operation_id for item in plan.operations} or not reserved:
                     continue
-                previous_scope = {record["payload"]["file_id"]}
+                previous_scope = {record["payload"]["file_id"]} | set(record["payload"].get("scope_ids", []))
                 ref = record["payload"].get("before_ref")
                 if ref:
                     old = self.journal.read_evidence(ref)
@@ -101,6 +104,9 @@ class Engine:
             for item in plan.excluded_ids:
                 self.exclude(item)
             self._guard_plan(plan)
+            validate_rollback_links(self.journal, plan)
+            for operation in plan.operations:
+                validate_extension_evidence(self.journal, operation)
             existing = [r for r in self.journal.records() if r["kind"] == "DRAFTED" and r["payload"]["run_id"] == plan.run_id]
             if existing:
                 if existing[-1]["payload"]["proposal_hash"] != plan.proposal_hash:
@@ -179,7 +185,9 @@ class Engine:
         check = self.adapter.preflight(op, before, excluded)
         if not check.get("complete") or not check.get("rollback_possible"):
             raise SafetyError("INCOMPLETE_PREFLIGHT")
-        if check.get("collision_ids"):
+        # Drive permits identical names. Only exact, frozen, approved peer IDs
+        # may already occupy the intended parent/name; no overwrite is issued.
+        if set(check.get("collision_ids", [])) - set(op.allowed_collision_ids):
             raise SafetyError("NAME_COLLISION")
         if not check.get("no_cycle"):
             raise SafetyError("FOLDER_CYCLE")
@@ -235,6 +243,9 @@ class Engine:
     def reconcile(self, plan, op):
         with self.journal.locked():
             self._require_frozen(plan, op)
+            current = self.latest(op.operation_id)
+            if current and current["payload"].get("bridge"):
+                raise SafetyError("HANDOFF_OWNS_OPERATION")
             self._guard_plan(plan)
             latest = self.latest(op.operation_id)
             if not latest or latest["kind"] not in {"ATTEMPTED", "UNCERTAIN"}:
@@ -276,6 +287,10 @@ class Engine:
             from .adapters import MockAdapter
             if type(self.adapter) is not MockAdapter:
                 raise SafetyError("LIVE_EXECUTION_DISABLED")
+            for operation in plan.operations:
+                current = self.latest(operation.operation_id)
+                if current and current["payload"].get("bridge"):
+                    raise SafetyError("HANDOFF_OWNS_OPERATION")
             if (self.journal.root / "snapshot-manifest.json").exists():
                 raise SafetyError("RESTORED_STORE_REQUIRES_RECONCILIATION")
             self.register(plan)
