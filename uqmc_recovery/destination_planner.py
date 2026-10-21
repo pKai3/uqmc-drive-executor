@@ -230,6 +230,7 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths):
                 raise SafetyError('SECTION_PARENT_ANCHOR_UNRESOLVED:' + cursor)
             required.add(cursor)
             cursor = logical_parent(cursor)
+    explicit_folder_name_paths = set(names)
     names = {p: names.get(p, p.rsplit('/', 1)[-1]) for p in required}
     paths = dict(anchor_paths)
     unused = set(paths) - (required | {anchor})
@@ -245,6 +246,12 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths):
         state = metadata_by_id.get(sid)
         if not state or state.get('id') != sid or state.get('mime_type') != FOLDER or state.get('trashed') is True:
             raise SafetyError('ANCHOR_FOLDER_METADATA_REQUIRED:' + path)
+        # Logical collection labels trim legacy outer whitespace. Without an
+        # explicit source-folder name claim this is an existing destination,
+        # not an instruction to rename it. Preserve its exact observed title.
+        if (path in names and path not in explicit_folder_name_paths
+                and state['name'].strip() == path.rsplit('/', 1)[-1].strip()):
+            names[path] = state['name']
     proofs, reasons = {}, {}
     folders = {sid for sid in groups if states[sid]['mime_type'] == FOLDER}
     for sid in sorted(folders):

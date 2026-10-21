@@ -258,6 +258,35 @@ class HybridPlannerTests(unittest.TestCase):
         with self.assertRaisesRegex(SafetyError,'DESTINATION_ANCHOR_OUTSIDE_SECTION_OR_MISSING'):
             self.plan({'Parent':'anchor','Parent/Unrelated':'unrelated-folder'})
 
+    def test_existing_mapped_destination_whitespace_is_preserved_without_name_claim(self):
+        del self.source['records']['Mroot'];del self.source['records']['Rroot']
+        self.states['destination']=state('destination','Skills ',['anchor'],True)
+        layout=self.plan({'Parent':'anchor',SECTION:'destination'})
+        self.assertEqual(layout['destination_folder_names'][SECTION],'Skills ')
+        self.assertEqual(layout['reused_folder_ids'],[])
+        paths=dict(layout['destination_paths'])
+        for index,spec in enumerate(layout['missing_folders']):
+            sid='created-'+str(index);paths[spec['logical_path']]=sid
+            self.states[sid]=state(sid,spec['folder_name'],[paths[spec['parent_path']]],True)
+        result=build_hybrid_preparation(self.source,section_path=SECTION,section_id='skills',workbook_id='fixture',
+            metadata_by_id=self.states,destination_paths=paths,destination_path_evidence_ref='proof')
+        self.assertEqual(result['projection']['destination_folder_names'][SECTION],'Skills ')
+        self.assertNotIn('destination',{o['source_id'] for o in result['projection']['operations']})
+
+    def test_explicit_folder_rename_remains_exact_despite_matching_trimmed_current_name(self):
+        self.states['root']['name']='Skills '
+        result=self.build()
+        self.assertEqual(result['projection']['destination_folder_names'][SECTION],'Skills')
+        rename=next(o for o in result['projection']['operations'] if o['reference']=='Rroot')
+        self.assertEqual(rename['exact_target_name'],'Skills')
+
+    def test_substantive_mapped_name_drift_is_not_adopted_as_expected_name(self):
+        del self.source['records']['Mroot'];del self.source['records']['Rroot']
+        self.states['destination']=state('destination','Unrelated title',['anchor'],True)
+        layout=self.plan({'Parent':'anchor',SECTION:'destination'})
+        self.assertEqual(layout['destination_folder_names'][SECTION],'Skills')
+        self.assertNotEqual(layout['destination_folder_names'][SECTION],self.states['destination']['name'])
+
     def test_native_suffix_conversion_requires_bound_proof(self):
         self.states['child']['mime_type'] = 'application/vnd.google-apps.document'
         self.states['root']['subtree']['members'][0]['mime_type'] = self.states['child']['mime_type']

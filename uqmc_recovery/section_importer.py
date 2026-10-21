@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .importer import ImportResult, WORKBOOK_ID, catalog, import_workbook, destination_route_record
-from .model import FOLDER, Plan, SafetyError, digest, snapshot
+from .model import FOLDER, NATIVE, Plan, SafetyError, digest, snapshot
 
 _SEAL = object()
 
@@ -98,11 +98,7 @@ def _workbook_rename_target(journal, record, binding, before):
         raise SafetyError("WORKBOOK_PROPOSED_RENAME_REQUIRED")
     if proposed == target:
         return
-    suffix = {
-        "application/vnd.google-apps.document": ".gdoc",
-        "application/vnd.google-apps.spreadsheet": ".gsheet",
-        "application/vnd.google-apps.presentation": ".gslides",
-    }.get(before["mime_type"])
+    suffix = NATIVE.get(before["mime_type"])
     if not suffix or not isinstance(target, str) or not target or proposed != target + suffix:
         raise SafetyError("WORKBOOK_RENAME_TARGET_MISMATCH")
     proof_ref = binding.get("native_display_conversion_ref")

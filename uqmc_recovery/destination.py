@@ -113,6 +113,30 @@ def normalize_history(value):
     return agent_snapshot(value) if 'mime_type' in value else normalize(value)
 
 
+
+def proposal_original_name(rename_record, move_record, state):
+    """Resolve a native display label without discarding a literal title suffix.
+
+    Whitespace variation is accepted only when exact manifest title and source
+    path independently preserve that original, and the native display label
+    explains the difference. Unmatched names retain the proposal baseline and
+    are rejected by normal live-state reconciliation.
+    """
+    old=rename_record['row']['Current name + type suffix']
+    suffix=NATIVE.get(state['mime_type']);current=state['name']
+    if not suffix:return old
+    if current==old:return old
+    stripped=old[:-len(suffix)] if old.endswith(suffix) else old
+    if current==stripped:return stripped
+    if move_record:
+        row=move_record['row'];exact=row.get('Current item');source_path=row.get('Source path')
+        if (isinstance(exact,str) and exact and isinstance(source_path,str)
+                and current==exact and source_path.endswith('/'+exact)
+                and old==exact.strip()+suffix):
+            return exact
+    return stripped
+
+
 def read_and_plan(config, section, journal, capture, factory, registry, report, *, preview=False):
     from .importer import catalog
     source=catalog(capture,expected_workbook_id=config['workbook_id'])
@@ -192,6 +216,7 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
         return value
     def folder(sid):
         if sid in excluded:raise SafetyError('EXCLUDED_DESTINATION')
+        if sid not in raw or sid not in listings:report({'stage':'destination_metadata','source_id':sid})
         if sid not in raw:raw[sid]=folder_read('get_file',sid)
         if raw[sid]['mimeType']!=FOLDER or raw[sid].get('trashed'):raise SafetyError('DESTINATION_NOT_ACTIVE_FOLDER:'+sid)
         if sid not in listings:listings[sid]=folder_read('list_children',sid)
@@ -249,8 +274,7 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
         desired={'id':sid,'name':route['exact_name'],'parents':[parent],'mime_type':metadata[sid]['mime_type']}
         baseline=copy.deepcopy(metadata[sid]);r=records_by_id[sid].get('RENAME')
         if not histories.get(sid) and r:
-            old=r['row']['Current name + type suffix'];suffix=NATIVE.get(baseline['mime_type'])
-            baseline['name']=old[:-len(suffix)] if suffix and old.endswith(suffix) else old
+            baseline['name']=proposal_original_name(r,records_by_id[sid].get('MOVE'),baseline)
         check=reconcile_item(histories.get(sid),desired,raw[sid],baseline=baseline,logical_destination=route['parent_path'])
         check['destination_unresolved']=unresolved
         check['verification_basis']='SAVED_VERIFIED_HISTORY' if sid in cached else 'CURRENT_READ'
