@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 from pathlib import Path
 import tempfile
 
@@ -36,8 +37,18 @@ def _token_path(value):
     if supplied.exists() or supplied.is_symlink():
         raise SafetyError("TOKEN_ALREADY_EXISTS_CHOOSE_NEW_PATH")
     path = supplied.resolve()
-    if any((p / ".git").exists() for p in (path.parent, *path.parent.parents)):
-        raise SafetyError("TOKEN_MUST_BE_OUTSIDE_GIT_WORKTREE")
+    repository = next((p for p in (path.parent, *path.parent.parents) if (p / ".git").exists()), None)
+    if repository:
+        relative = str(path.relative_to(repository))
+        try:
+            ignored = subprocess.run(["git", "check-ignore", "--quiet", "--", relative],
+                cwd=repository, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+            tracked = subprocess.run(["git", "ls-files", "--error-unmatch", "--", relative],
+                cwd=repository, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 1
+        except OSError:
+            raise SafetyError("TOKEN_MUST_BE_GIT_IGNORED_AND_UNTRACKED") from None
+        if not ignored or tracked:
+            raise SafetyError("TOKEN_MUST_BE_GIT_IGNORED_AND_UNTRACKED")
     path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     if path.parent.stat().st_mode & 0o077:
         raise SafetyError("TOKEN_DIRECTORY_REQUIRES_0700_PERMISSIONS")
@@ -103,7 +114,7 @@ def login(client_json, token, *, readonly=False, flow_factory=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--client-json", required=True, help="Downloaded OAuth Desktop app client JSON")
-    parser.add_argument("--token", required=True, help="New token file outside Git in a private directory")
+    parser.add_argument("--token", required=True, help="New private token file; inside a Git checkout it must be ignored and untracked")
     parser.add_argument("--readonly", action="store_true", help="Request Drive metadata read-only access")
     args = parser.parse_args(argv)
     print("This opens Google consent for the account you select. It does not run the migration.")

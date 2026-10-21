@@ -3,6 +3,7 @@ import io
 import json
 from pathlib import Path
 import stat
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -72,14 +73,32 @@ class GoogleLoginTests(unittest.TestCase):
         self.assertEqual(self.token.read_text(), "keep")
         self.assertEqual(list(self.token.parent.iterdir()), [self.token])
 
-    def test_output_rejects_git_worktree_and_public_directory(self):
+    def test_output_rejects_unignored_git_path_and_public_directory(self):
         (self.root / ".git").mkdir()
-        with self.assertRaisesRegex(SafetyError, "OUTSIDE_GIT"):
+        with self.assertRaisesRegex(SafetyError, "GIT_IGNORED_AND_UNTRACKED"):
             login(self.client, self.token, flow_factory=self.factory)
         (self.root / ".git").rmdir()
         self.token.parent.mkdir(mode=0o755)
         self.token.parent.chmod(0o755)
         with self.assertRaisesRegex(SafetyError, "0700"):
+            login(self.client, self.token, flow_factory=self.factory)
+        self.assertEqual(self.calls, [])
+
+    def test_ignored_untracked_token_inside_checkout_is_private(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        (self.root / ".gitignore").write_text("/protected/\n")
+        login(self.client, self.token, flow_factory=self.factory)
+        self.assertEqual(stat.S_IMODE(self.token.stat().st_mode), 0o600)
+        self.assertEqual(subprocess.run(["git", "check-ignore", "--quiet", str(self.token)], cwd=self.root).returncode, 0)
+
+    def test_previously_tracked_token_is_refused_even_if_ignore_rule_exists(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        (self.root / ".gitignore").write_text("/protected/\n")
+        self.token.parent.mkdir(mode=0o700)
+        self.token.write_text("synthetic fixture only")
+        subprocess.run(["git", "add", "-f", str(self.token)], cwd=self.root, check=True)
+        self.token.unlink()
+        with self.assertRaisesRegex(SafetyError, "GIT_IGNORED_AND_UNTRACKED"):
             login(self.client, self.token, flow_factory=self.factory)
         self.assertEqual(self.calls, [])
 

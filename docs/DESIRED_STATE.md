@@ -30,18 +30,18 @@ Install the existing optional dependencies with `python3 -m pip install -e '.[di
 ```sh
 python3 -m uqmc_recovery.desired preview \
   --store private/state --plan private/frozen-plan.json \
-  --token /absolute/protected/authorized-user-token.json
+  --token secrets/token.json
 
 python3 -m uqmc_recovery.desired apply --apply \
   --confirm-plan-sha256 FROZEN_PLAN_SHA256 \
   --store private/state --plan private/frozen-plan.json \
-  --token /absolute/protected/authorized-user-token.json \
+  --token secrets/token.json \
   --limit 10 --max-attempts 3 --export-dir private/exports
 
 python3 -m uqmc_recovery.desired resume --apply \
   --confirm-plan-sha256 FROZEN_PLAN_SHA256 \
   --store private/state --plan private/frozen-plan.json \
-  --token /absolute/protected/authorized-user-token.json \
+  --token secrets/token.json \
   --limit 10 --max-attempts 3 --export-dir private/exports
 ```
 
@@ -59,7 +59,7 @@ Rollback is never automatic. It applies only to transitions recorded by this run
 python3 -m uqmc_recovery.desired rollback --apply \
   --confirm-plan-sha256 FROZEN_PLAN_SHA256 \
   --store private/state --plan private/frozen-plan.json \
-  --token /absolute/protected/authorized-user-token.json \
+  --token secrets/token.json \
   --limit 10 --max-attempts 3 --export-dir private/exports
 ```
 
@@ -76,16 +76,16 @@ No credentials or OAuth grant have been created. The assistant's connector sessi
 ```sh
 python3 -m uqmc_recovery.google_login \
   --client-json secrets/API_KEY.json \
-  --token /absolute/private/uqmc-auth/authorized-user-token.json
+  --token secrets/token.json
 ```
 
-This command is the only entry point that initiates OAuth. It uses Google's installed-app browser flow on a temporary localhost port with account selection, and requests only `https://www.googleapis.com/auth/drive.metadata`. Add `--readonly` for a preview-only `drive.metadata.readonly` token. It saves the token with mode `0600` in a private directory outside Git and refuses to overwrite an existing token. It does not run the migration. A Sheets integration would need a separately disclosed Sheets scope; this login command does not request one.
+This command is the only entry point that initiates OAuth. It uses Google's installed-app browser flow on a temporary localhost port with account selection, and requests only `https://www.googleapis.com/auth/drive.metadata`. Add `--readonly` for a preview-only `drive.metadata.readonly` token. It saves the token with mode `0600` in a private directory and refuses to overwrite an existing token. Inside a checkout, the output path must be Git-ignored and untracked. It does not run the migration. A Sheets integration would need a separately disclosed Sheets scope; this login command does not request one.
 
 These are restricted account-wide metadata scopes. `drive.file` does not automatically cover arbitrary existing files merely because their IDs are known. No full file-content scope is proposed. See Google's [scope guide](https://developers.google.com/workspace/drive/api/guides/api-specific-auth), [metadata update API](https://developers.google.com/workspace/drive/api/reference/rest/v3/files/update), and [Python authorization quickstart](https://developers.google.com/workspace/drive/api/quickstart/python).
 
 ## Offline validation
 
-The focused suite passes 47 tests (20 desired-state recovery, 9 combined transport, 10 existing transport, 8 login). It exercises combined updates, existing renamed/moved effects, interruptions around dispatch and readback, lost responses, transient failures, bounded retry, concurrent drift, partial resume, partial rollback/restart, folder dependencies, account/capability checks and private token output.
+The focused suite passes 49 tests (20 desired-state recovery, 9 combined transport, 10 existing transport, 10 login). It exercises combined updates, existing renamed/moved effects, interruptions around dispatch and readback, lost responses, transient failures, bounded retry, concurrent drift, partial resume, partial rollback/restart, folder dependencies, account/capability checks and private token output.
 
 ```sh
 PYTHONPATH=.:tests python3 -m unittest \
