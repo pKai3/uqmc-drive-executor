@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import unittest
+from unittest.mock import patch
 
 import test_direct_runner as established
 from uqmc_recovery.action_bridge import ActionBridge, AGENT_LIMITATIONS
@@ -11,7 +12,7 @@ from uqmc_recovery.agent_profile import agent_snapshot, register_agent_plan
 from uqmc_recovery.direct_transport import TransportError
 from uqmc_recovery.journal import Journal, JournalBusy
 from uqmc_recovery.model import Approval, FOLDER, Operation, Plan, SafetyError, digest
-from uqmc_recovery.desired import DesiredRunner, compile_items, export_status
+from uqmc_recovery.desired import DesiredRunner, compile_items, core, export_status
 
 
 class ProcessDeath(BaseException):
@@ -70,6 +71,59 @@ class FakeDrive:
 
 
 class DesiredStateTests(unittest.TestCase):
+    def test_accepted_section_can_skip_all_permission_lists_for_preview_apply_and_rollback(self):
+        self.freeze()
+        runner = self.runner(audit_permissions=False)
+        # Permission changes are explicitly outside this mode's audit.
+        self.transport.files["fixture-source"]["permissions"] = []
+        preview = runner.preview()
+        self.assertEqual(preview["counts"], {"NOT_APPLIED": 1})
+        self.assertFalse(preview["audit_permissions"])
+        result = self.run_plan(runner)
+        self.assertEqual(result["counts"], {"APPLIED": 1})
+        self.assertEqual(self.transport.calls[0], {"fileId": "fixture-source", "name": "Renamed.pdf",
+            "addParents": "fixture-destination", "removeParents": "fixture-parent"})
+        self.assertEqual(self.run_plan(runner, rollback=True)["counts"], {"ROLLED_BACK": 1})
+        self.assertEqual(self.transport.permission_reads, {})
+        self.assertTrue(all(r["payload"]["audit_permissions"] is False
+            for r in self.journal.records() if r["kind"] == "DESIRED_ATTEMPTED"))
+
+    def test_skipping_permission_audit_requires_existing_scoped_exposure_acceptance(self):
+        self.freeze()
+        runner = self.runner(audit_permissions=False)
+        auth_ref = next(r["payload"]["authorization_ref"] for r in reversed(self.journal.records())
+            if r["kind"] == "HANDOFF_AUTHORIZED")
+        original_read = self.journal.read_evidence
+        def without_exposure_acceptance(ref):
+            value = original_read(ref)
+            return value | {"access_policy": "PRESERVE_ACCESS"} if ref == auth_ref else value
+        with patch.object(self.journal, "read_evidence", side_effect=without_exposure_acceptance):
+            with self.assertRaisesRegex(SafetyError, "SKIP_PERMISSION_AUDIT_REQUIRES_ACCEPTED_SECTION_EXPOSURE"):
+                runner.preview()
+        self.assertEqual(self.transport.reads, {})
+        self.assertEqual(self.transport.calls, [])
+
+    def test_rename_only_without_permission_audit_keeps_identity_and_capability_checks(self):
+        self.freeze()
+        runner = self.runner(audit_permissions=False)
+        item = runner.items[0]
+        def rename_only():
+            raw, _, _ = runner.observe(item)
+            return runner.transition(item, raw, core(raw) | {"name": item["target"]["name"]})
+        with self.journal.locked():
+            self.transport.files["fixture-source"]["capabilities"] = {"canRename": False}
+            with self.assertRaisesRegex(SafetyError, "SOURCE_CANNOT_RENAME"):
+                rename_only()
+            self.transport.files["fixture-source"]["capabilities"] = {"canRename": True}
+            self.transport.files["fixture-source"]["name"] = "Human edit.pdf"
+            with self.assertRaisesRegex(SafetyError, "UNAPPROVED_NAME_DRIFT"):
+                rename_only()
+            self.transport.files["fixture-source"]["name"] = "Original.pdf"
+            self.assertEqual(rename_only()["state"], "APPLIED")
+        self.assertEqual(self.transport.calls, [{"fileId": "fixture-source", "name": "Renamed.pdf"}])
+        self.assertEqual(self.transport.files["fixture-source"]["parents"], ["fixture-parent"])
+        self.assertEqual(self.transport.permission_reads, {})
+
     def test_preview_shared_parent_request_count_and_run_scope(self):
         for number in range(9):
             self.add_file("fixture-extra-" + str(number), "Extra " + str(number) + ".pdf")

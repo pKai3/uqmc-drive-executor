@@ -28,6 +28,14 @@ FILE_FIELDS = (
     "owners,driveId,capabilities,permissions,shortcutDetails,"
     "inheritedPermissionsDisabled,shared,hasAugmentedPermissions"
 )
+# Explicitly accepted no-audit mode still reads fields used for identity,
+# content/concurrency and mutation-capability checks. It neither fetches nor
+# changes sharing. The default field selection remains unchanged.
+NO_PERMISSION_AUDIT_FIELDS = (
+    "id,name,mimeType,parents,modifiedTime,version,trashed,size,md5Checksum,"
+    "owners,driveId,shortcutDetails,"
+    "capabilities(canRename,canAddChildren,canMoveItemWithinDrive,canMoveItemOutOfDrive)"
+)
 # Membership and collision checks use only these fields. Full source and
 # parent reads retain FILE_FIELDS and separate paginated permission reads.
 CHILD_FIELDS = "id,name,mimeType,parents"
@@ -133,11 +141,15 @@ class GoogleDriveTransport:
     """Only exact-ID reads and metadata-only rename/reparent calls are exposed."""
 
     def __init__(self, service, *, apply=False, allowed_ids, excluded_ids=(), mutation_ids=None,
-                 refresh_credentials=None):
+                 refresh_credentials=None, audit_permissions=True):
         if type(apply) is not bool:
             raise TransportError("EXPLICIT_APPLY_BOOLEAN_REQUIRED")
+        if type(audit_permissions) is not bool:
+            raise TransportError("EXPLICIT_PERMISSION_AUDIT_BOOLEAN_REQUIRED")
         self.service = service
         self.apply_enabled = apply
+        self.audit_permissions = audit_permissions
+        self.file_fields = FILE_FIELDS if audit_permissions else NO_PERMISSION_AUDIT_FIELDS
         self.allowed_ids = frozenset(allowed_ids)
         self.mutation_ids = self.allowed_ids if mutation_ids is None else frozenset(mutation_ids)
         self.excluded_ids = frozenset(excluded_ids)
@@ -187,7 +199,7 @@ class GoogleDriveTransport:
         response_headers = {}
         def request():
             value = self.service.files().get(
-                fileId=file_id, fields=FILE_FIELDS, supportsAllDrives=True)
+                fileId=file_id, fields=self.file_fields, supportsAllDrives=True)
             if hasattr(value, "add_response_callback"):
                 value.add_response_callback(lambda headers: response_headers.update(headers))
             return value
@@ -248,6 +260,8 @@ class GoogleDriveTransport:
 
     def list_permissions(self, file_id):
         file_id = self._guard(file_id)
+        if not self.audit_permissions:
+            raise TransportError("PERMISSION_AUDIT_DISABLED")
         return self._pages(lambda token: self.service.permissions().list(
             fileId=file_id, pageSize=100, pageToken=token,
             fields="nextPageToken,permissions", supportsAllDrives=True), "permissions", request="permissions.list", item_id=file_id)
@@ -282,7 +296,7 @@ class GoogleDriveTransport:
         if etag is not None and (not isinstance(etag, str) or len(etag) > 2048
                 or not re.fullmatch(r'(?:W/)?"[\x21\x23-\x7e\x80-\xff]*"', etag)):
             raise TransportError("EXACT_HTTP_ETAG_REQUIRED")
-        parameters = {"fileId": file_id, "fields": FILE_FIELDS, "supportsAllDrives": True, "body": {}}
+        parameters = {"fileId": file_id, "fields": self.file_fields, "supportsAllDrives": True, "body": {}}
         if rename:
             if not isinstance(args["name"], str) or not args["name"] or "\x00" in args["name"]:
                 raise TransportError("EXACT_NONEMPTY_NAME_REQUIRED")
@@ -322,7 +336,8 @@ class GoogleDriveTransport:
 
     @classmethod
     def from_authorized_user_file(cls, token_path, *, apply=False, allowed_ids,
-                                  excluded_ids=(), mutation_ids=None, timeout=DEFAULT_REQUEST_TIMEOUT):
+                                  excluded_ids=(), mutation_ids=None, timeout=DEFAULT_REQUEST_TIMEOUT,
+                                  audit_permissions=True):
         """Load one explicit pre-existing grant; never run OAuth or persist tokens.
 
         This function is used only by an operator's later command. No token path
@@ -379,4 +394,5 @@ class GoogleDriveTransport:
         except Exception:
             raise TransportError("DRIVE_CLIENT_INITIALIZATION_FAILED") from None
         return cls(service, apply=apply, allowed_ids=allowed_ids,
-                   excluded_ids=excluded_ids, mutation_ids=mutation_ids, refresh_credentials=refresh)
+                   excluded_ids=excluded_ids, mutation_ids=mutation_ids, refresh_credentials=refresh,
+                   audit_permissions=audit_permissions)

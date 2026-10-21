@@ -91,10 +91,13 @@ def compile_items(plan, journal):
 
 
 class DesiredRunner:
-    def __init__(self, journal, plan, transport, *, max_attempts=3, retry_delay=1, fault=None, progress=None):
+    def __init__(self, journal, plan, transport, *, max_attempts=3, retry_delay=1, fault=None, progress=None, audit_permissions=True):
         if not 1 <= max_attempts <= 5:
             raise SafetyError("MAX_ATTEMPTS_MUST_BE_1_TO_5")
         self.journal, self.plan, self.transport = journal, plan, transport
+        if type(audit_permissions) is not bool:
+            raise SafetyError("EXPLICIT_PERMISSION_AUDIT_BOOLEAN_REQUIRED")
+        self.audit_permissions = audit_permissions
         self.max_attempts, self.retry_delay = max_attempts, retry_delay
         self.fault = fault or (lambda *args: None)
         self.stop_requested = False
@@ -122,14 +125,16 @@ class DesiredRunner:
                 "source_id": item["source_id"], "direction": direction,
                 "operation_order": item["operation_order"], "dependencies": item["dependencies"],
                 "original_operation_ids": [o.operation_id for o in item["operations"]],
-                "historical_uncertain_operation_ids": item["historical_uncertain_operation_ids"], **payload})
+                "historical_uncertain_operation_ids": item["historical_uncertain_operation_ids"], **payload,
+                "audit_permissions": self.audit_permissions})
 
     def read(self, source_id):
         raw = self.transport.get_file(source_id)
         if raw.get("id") != source_id or raw.get("trashed") is True:
             raise SafetyError("SOURCE_ID_OR_TRASH_CONFLICT")
         core(raw)
-        raw["_permissions"] = sorted(self.transport.list_permissions(source_id), key=digest)
+        if self.audit_permissions:
+            raw["_permissions"] = sorted(self.transport.list_permissions(source_id), key=digest)
         return raw
 
     def authority(self):
@@ -141,6 +146,8 @@ class DesiredRunner:
         auth = self.journal.read_evidence(auths[-1]["payload"]["authorization_ref"])
         if auth.get("authorized") is not True or auth.get("proposal_hash") != self.plan.proposal_hash:
             raise SafetyError("AUTHORIZATION_MISMATCH")
+        if not self.audit_permissions and auth.get("access_policy") != "SCOPED_EXPOSURE_ACCEPTED":
+            raise SafetyError("SKIP_PERMISSION_AUDIT_REQUIRES_ACCEPTED_SECTION_EXPOSURE")
         return auth
 
     def latest_change(self, item):
@@ -169,9 +176,9 @@ class DesiredRunner:
             for old, native in IMMUTABLE.items():
                 if baseline.get(old) is not None and raw.get(native) != baseline[old]:
                     raise SafetyError("KNOWN_CONTENT_OR_OWNER_DRIFT")
-            # At original parents, every historically known permission field
-            # remains mandatory. Additional native fields stay in raw evidence.
-            if current["parents"] == item["original"]["parents"] and baseline.get("permissions") is not None:
+            # When auditing, retain every historically known permission field
+            # at original parents. An explicit accepted no-audit mode skips it.
+            if self.audit_permissions and current["parents"] == item["original"]["parents"] and baseline.get("permissions") is not None:
                 old = baseline["permissions"]
                 keys = set().union(*(set(p) for p in old)) if old else set()
                 projected = [{k: p.get(k) for k in keys} for p in raw["_permissions"]]
@@ -179,14 +186,13 @@ class DesiredRunner:
                     raise SafetyError("KNOWN_PERMISSION_DRIFT")
         return current
 
-    @staticmethod
-    def unchanged(before, after, *, strict=False, moving=False):
+    def unchanged(self, before, after, *, strict=False, moving=False):
         for key in ("id", "mimeType", "size", "md5Checksum", "owners", "driveId", "shortcutDetails", "trashed"):
             if key in before and before[key] != after.get(key):
                 raise SafetyError("PROTECTED_METADATA_DRIFT")
-        if not moving and before.get("_permissions") != after.get("_permissions"):
+        if self.audit_permissions and not moving and before.get("_permissions") != after.get("_permissions"):
             raise SafetyError("PERMISSION_DRIFT")
-        if moving:
+        if self.audit_permissions and moving:
             current = {p.get("id"): p for p in after.get("_permissions", [])}
             for p in before.get("_permissions", []):
                 if any(d.get("inherited") is False for d in p.get("permissionDetails", [])):
@@ -416,7 +422,8 @@ class DesiredRunner:
             self.journal.backup(backup / ("desired-before-" + str(uuid.uuid4())))
             self.journal.append("DESIRED_POLICY_BOUND", payload={"plan_sha256": self.plan.proposal_hash,
                 "run_id": self.plan.run_id, "policy": "exact-desired-state-v1", "direction": "ROLLBACK" if rollback else "FORWARD",
-                "dependencies": {i["source_id"]: i["dependencies"] for i in self.items}, "global_phases_removed": True})
+                "dependencies": {i["source_id"]: i["dependencies"] for i in self.items}, "global_phases_removed": True,
+                "audit_permissions": self.audit_permissions})
             output, satisfied, changed = [], set(), 0
             try:
                 for item in reversed(self.items) if rollback else self.items:
@@ -473,7 +480,7 @@ class DesiredRunner:
             "coverage": "items_observed_this_invocation", "total_plan_items": len(self.items),
             "processed_items": len(items), "unprocessed_items": len(self.items) - len(items),
             "counts": dict(Counter(i["state"] for i in items)), "items": items, "paused": self.stop_requested,
-            "progress_output_failed": self.progress_output_failed, **extra}
+            "progress_output_failed": self.progress_output_failed, "audit_permissions": self.audit_permissions, **extra}
 
 
 def export_status(journal, summary, directory):
@@ -515,6 +522,8 @@ def main(argv=None):
     p.add_argument("--limit", type=int, default=999)
     p.add_argument("--max-attempts", type=int, default=3)
     p.add_argument("--export-dir")
+    p.add_argument("--skip-permission-audit", action="store_true",
+        help="Skip permission reads/comparisons only with existing accepted section exposure; never edits sharing")
     args = p.parse_args(argv)
     if args.limit < 1:
         p.error("--limit must be positive")
@@ -541,13 +550,15 @@ def main(argv=None):
                     allowed.update(journal.read_evidence(auth["exposure_review_ref"]).get("access_baselines", {}))
         excluded = set(plan.excluded_ids) | {r["payload"]["file_id"] for r in journal.records() if r["kind"] == "EXCLUDED"}
         transport = GoogleDriveTransport.from_authorized_user_file(args.token, apply=mutating, allowed_ids=allowed,
-            mutation_ids={i["source_id"] for i in items}, excluded_ids=excluded)
+            mutation_ids={i["source_id"] for i in items}, excluded_ids=excluded,
+            audit_permissions=not args.skip_permission_audit)
         account = transport.get_account()
         if args.expect_account and account["emailAddress"].casefold() != args.expect_account.casefold():
             raise SafetyError("AUTHENTICATED_ACCOUNT_MISMATCH")
         print(json.dumps({"authenticated_account": account, "source_mutation_allowlist_count": len(items)}), flush=True)
         runner = DesiredRunner(journal, plan, transport, max_attempts=args.max_attempts,
-            progress=lambda event: print(json.dumps(event), flush=True))
+            progress=lambda event: print(json.dumps(event), flush=True),
+            audit_permissions=not args.skip_permission_audit)
         def stop(signum, frame):
             runner.stop_requested = True
         signal.signal(signal.SIGINT, stop)

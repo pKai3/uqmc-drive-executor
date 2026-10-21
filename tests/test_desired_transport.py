@@ -8,7 +8,7 @@ import unittest
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import patch
 
-from uqmc_recovery.direct_transport import GoogleDriveTransport, TransportError, FILE_FIELDS, CHILD_FIELDS, METADATA_SCOPE
+from uqmc_recovery.direct_transport import GoogleDriveTransport, TransportError, FILE_FIELDS, CHILD_FIELDS, NO_PERMISSION_AUDIT_FIELDS, METADATA_SCOPE
 
 
 class Request:
@@ -60,6 +60,42 @@ def transport(*values, apply=True, headers=None):
 
 
 class DesiredTransportTests(unittest.TestCase):
+    def test_permission_audit_off_uses_narrow_metadata_and_never_lists_grants(self):
+        service = Service({"id": "file-a"}, {"id": "file-a"})
+        t = GoogleDriveTransport(service, apply=True, allowed_ids={"file-a"}, audit_permissions=False)
+        t.get_file("file-a")
+        t.update_metadata({"fileId": "file-a", "name": "approved.pdf"})
+        self.assertEqual([method for method, _ in service.requests], ["get", "update"])
+        for _, args in service.requests:
+            self.assertEqual(args["fields"], NO_PERMISSION_AUDIT_FIELDS)
+            self.assertNotIn("permissions", args["fields"].lower())
+            self.assertIn("capabilities(canRename,canAddChildren,canMoveItemWithinDrive,canMoveItemOutOfDrive)", args["fields"])
+            for field in ("id", "name", "mimeType", "parents", "version", "size", "md5Checksum", "owners"):
+                self.assertIn(field, args["fields"].split(","))
+        with self.assertRaisesRegex(TransportError, "PERMISSION_AUDIT_DISABLED"):
+            t.list_permissions("file-a")
+        self.assertEqual(len(service.requests), 2)
+        default, default_service = transport({"id": "file-a"})
+        default.get_file("file-a")
+        self.assertTrue(default.audit_permissions)
+        self.assertEqual(default_service.requests[0][1]["fields"], FILE_FIELDS)
+
+    def test_authorized_loader_preserves_explicit_permission_audit_mode(self):
+        try:
+            from google.oauth2.credentials import Credentials
+        except ImportError:
+            self.skipTest("Optional direct dependencies are not installed")
+        credentials = Credentials(token="fixture-only-token", scopes=[METADATA_SCOPE])
+        with tempfile.TemporaryDirectory() as folder:
+            token = Path(folder) / "fixture-token.json"
+            token.write_text("fixture only; patched loader")
+            token.chmod(0o600)
+            with patch.object(Credentials, "from_authorized_user_file", return_value=credentials):
+                t = GoogleDriveTransport.from_authorized_user_file(token, apply=False,
+                    allowed_ids={"file-a"}, audit_permissions=False)
+            self.assertFalse(t.audit_permissions)
+            self.assertEqual(t.file_fields, NO_PERMISSION_AUDIT_FIELDS)
+
     def test_membership_fields_are_narrow_and_all_pages_are_read(self):
         rows = [
             {"id": "child-a", "name": "First.pdf", "mimeType": "application/pdf", "parents": ["parent-a"]},
