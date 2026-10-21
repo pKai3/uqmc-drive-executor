@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "source": "fixture-hashes",
+    "reference": "Synthetic hash fixture only",
+    "captured_at": "2026-10-21T00:00:00Z"
+  },
+  "records": [
+    {
+      "file_id": "synthetic-native-a",
+      "version": "1",
+      "kind": "export",
+      "algorithm": "sha256",
+      "value": "5b95d78b8ffc6e84b263db1234c197fcfacd80a4814d518a9fd7754042b1fc15",
+      "size": 35,
+      "representation": "text/plain-example-v1"
+    },
+    {
+      "file_id": "synthetic-native-b",
+      "version": "1",
+      "kind": "export",
+      "algorithm": "sha256",
+      "value": "5b95d78b8ffc6e84b263db1234c197fcfacd80a4814d518a9fd7754042b1fc15",
+      "size": 35,
+      "representation": "text/plain-example-v1"
+    },
+    {
+      "file_id": "synthetic-trip-a",
+      "version": "1",
+      "kind": "text_fingerprint",
+      "algorithm": "sha256-token-set-v1",
+      "representation": "synthetic-tokenization-v1",
+      "token_hashes": [
+        "70c5e6c8dac4107d8e5423ca398b74f0030ae6f5596fb82437bc139fb0fed93d",
+        "58bd86581b63a61ec0f423a3e6f375bc2d191c04f5eaa26fc794ef1f6b1b8aa4",
+        "edaac48e0caf94e6ff2b0e2c8bb1b6a034b334caf7b5d20fd3bfb191d9f0ab3d",
+        "c88457979822f57ffdc01366e8bf004ca955824d247b3d03ed7e725b6c553af3",
+        "09880b4b1fa5f71eb5760f0f8283380dbc415b8a1080f10bce567f1bffa5b0b5",
+        "b43ce298c66f2da0946a154f16329f10b8cab44e7a56c701cddbcbb8cd74ff92",
+        "e2fbb6958b12a3301a1873fe65bb856a4e59544d168d49875a82ab0f1397f9eb",
+        "a7fb942b23f6ce58ac975441965cda96df5086ac2777876d15d9b923b8392c69"
+      ]
+    },
+    {
+      "file_id": "synthetic-trip-b",
+      "version": "1",
+      "kind": "text_fingerprint",
+      "algorithm": "sha256-token-set-v1",
+      "representation": "synthetic-tokenization-v1",
+      "token_hashes": [
+        "70c5e6c8dac4107d8e5423ca398b74f0030ae6f5596fb82437bc139fb0fed93d",
+        "58bd86581b63a61ec0f423a3e6f375bc2d191c04f5eaa26fc794ef1f6b1b8aa4",
+        "edaac48e0caf94e6ff2b0e2c8bb1b6a034b334caf7b5d20fd3bfb191d9f0ab3d",
+        "c88457979822f57ffdc01366e8bf004ca955824d247b3d03ed7e725b6c553af3",
+        "09880b4b1fa5f71eb5760f0f8283380dbc415b8a1080f10bce567f1bffa5b0b5",
+        "b43ce298c66f2da0946a154f16329f10b8cab44e7a56c701cddbcbb8cd74ff92",
+        "e2fbb6958b12a3301a1873fe65bb856a4e59544d168d49875a82ab0f1397f9eb",
+        "a7fb942b23f6ce58ac975441965cda96df5086ac2777876d15d9b923b8392c69"
+      ]
+    }
+  ]
+}

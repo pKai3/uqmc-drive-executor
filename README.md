@@ -2,6 +2,21 @@
 
 Local safety infrastructure for reviewed, partial Drive reorganisations. **Live mutation is disabled.** This repository contains no Drive credentials and cannot invoke an assistant's connected tools from Python. Current runnable capabilities are durable storage, spreadsheet import, read-only agent request/receipt reconciliation, status exports, and a fixture executor with rollback and failure injection. A successful simulation is not a live pilot.
 
+## Offline duplicate review
+
+The independent [deduplication report CLI](docs/deduplication.md) compares exported
+metadata and optional supplied hashes without contacting Drive or reading document
+bodies. It separates trusted binary checksum matches, name/content candidates and
+identity references, requires a private exclusion policy, and writes private JSON
+and CSV reports. Native-file exports never establish full equivalence; every
+finding requires manual review and preserves distinct version and usage context.
+
+```sh
+python3 -m uqmc_recovery.dedup --inventory examples/dedup/inventory.example.json --ignore-config examples/dedup/ignore.example.json --hashes examples/dedup/hashes.example.json --output-dir private/dedup-demo
+```
+
+This example uses synthetic data only. Use a new output directory for each run.
+
 ## Run locally
 
 Python 3.11+ and the standard library are sufficient; no installation or network is required.
