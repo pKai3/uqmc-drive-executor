@@ -9,7 +9,7 @@ from __future__ import annotations
 import copy
 from .agent_profile import agent_snapshot
 from .importer import destination_route_record
-from .model import FOLDER, SafetyError, digest
+from .model import FOLDER, NATIVE, SafetyError, digest
 from .section_prepare import (_inside, _path, _record_path as nested_record_path, _order_groups,
                               exact_rename, select_records as nested_select_records)
 
@@ -39,7 +39,11 @@ def file_parent_path(move, rename, state):
     sid = state['id']
     if move is None:
         return _record_path(rename)
-    path = _record_path(move)
+    # This field contains both a logical route and an opaque exact title. Do
+    # not parse title slashes (including // or a final /) as folder separators.
+    path = move['row'].get('Exact target path')
+    if not isinstance(path, str) or not path:
+        raise SafetyError('EXACT_LOGICAL_PATH_REQUIRED')
     if move.get('whole_subtree_origin_reference'):
         return _path(move['coverage_target_parent_path'])
     expected = _record_path(rename) if rename else None
@@ -52,9 +56,18 @@ def file_parent_path(move, rename, state):
     labels = [move['row'].get('Current item')]
     if rename:
         labels.append(rename['row'].get('Current name + type suffix'))
+    suffix = NATIVE.get(state['mime_type'])
     for label in labels:
-        parent = strip_title(label)
-        if parent is not None:
+        variants = [label]
+        # The sheet uses .gdoc/.gsheet display labels, not actual native titles.
+        # Only the known suffix for this stable ID's verified MIME is removed.
+        if suffix and isinstance(label, str) and label.endswith(suffix):
+            variants.append(label[:-len(suffix)])
+        candidates = {p for title in variants if (p := strip_title(title)) is not None}
+        if len(candidates) > 1:
+            raise SafetyError('AMBIGUOUS_FILE_TITLE_PATH:' + sid)
+        if candidates:
+            parent = candidates.pop()
             break
     if parent is None:
         alternatives = {state['name']}
@@ -63,7 +76,9 @@ def file_parent_path(move, rename, state):
         candidates = {p for title in alternatives if (p := strip_title(title)) is not None}
         if len(candidates) > 1:
             raise SafetyError('AMBIGUOUS_FILE_TITLE_PATH:' + sid)
-        parent = next(iter(candidates)) if candidates else logical_parent(path)
+        if not candidates:
+            raise SafetyError('FILE_TITLE_PATH_EVIDENCE_REQUIRED:' + sid)
+        parent = candidates.pop()
     if rename and parent != expected:
         raise SafetyError('FILE_MOVE_RENAME_DESTINATION_DISAGREEMENT:' + sid)
     return parent
@@ -81,7 +96,7 @@ def select_destination_records(source, section_path):
              if r['action'] == 'MOVE' and r['row'].get('Exact target path') == section
              and r['source_id'] not in blocked}
     if '/' in section:
-        records = nested_select_records(source, section)
+        records = nested_select_records(source, section, defer_move_title_validation=True)
         refs = {r['reference'] for r in records}
         # A canonical root alias can retain its old collection label while its
         # separately approved folder name changes. Include that same-ID pair.
@@ -103,7 +118,7 @@ def select_destination_records(source, section_path):
         if r.get('decision') not in {'', 'Yes'}:
             raise SafetyError('SECTION_DECISION_UNRECOGNIZED')
         additions.append(copy.deepcopy(r))
-    records = nested_select_records(source, section) + additions
+    records = nested_select_records(source, section, defer_move_title_validation=True) + additions
     if len({(r['source_id'], r['action']) for r in records}) != len(records):
         raise SafetyError('SECTION_DUPLICATE_SOURCE_ACTION')
     return sorted(records, key=lambda r: r['reference'])

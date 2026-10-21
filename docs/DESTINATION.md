@@ -5,6 +5,12 @@ token. The command takes the canonical destination path exactly as it appears in
 the proposal spreadsheet. It does not need an assistant to construct a batch or
 write per-file mappings.
 
+Quote the exact canonical destination path, preserving any spaces. File titles
+are opaque: literal slashes and trailing spaces are retained. The planner binds
+a file's parent using its stable ID, exact title/MIME and structured destination
+fields; it never creates folders from slash fragments inside a title. Missing or
+conflicting title-boundary evidence stops with an explicit error.
+
 ```sh
 cd /Users/bcsinger/Documents/GitHub/uqmc-drive-executor
 .venv/bin/python -m uqmc_recovery.destination '06 Trip Leaders'

@@ -34,7 +34,7 @@ def _record_path(record):
     return _path(record['row'].get(field))
 
 
-def select_records(source, section_path):
+def select_records(source, section_path, *, defer_move_title_validation=False):
     """Select exact path-prefix records; exclusions override section approval."""
     section = _path(section_path)
     excluded = set(source.get('excluded_ids', []))
@@ -54,7 +54,11 @@ def select_records(source, section_path):
             matches = True
         if not matches:
             continue
-        _path(path)
+        # Hybrid planning resolves a MOVE's opaque title using same-ID metadata
+        # and structured rename/coverage fields. Only that caller may defer this
+        # check; actual folder and resolved parent paths remain strictly checked.
+        if not (defer_move_title_validation and record['action'] == 'MOVE'):
+            _path(path)
         if (record.get('withdrawn') or record.get('decision') == 'No' or record['source_id'] in excluded
                 or record['reference'] in excluded_refs or set(record.get('proposal_refs', [])) & excluded_refs):
             continue
