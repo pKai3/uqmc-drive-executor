@@ -1,0 +1,42 @@
+# Private runtime data and projections must never enter source control.
+/private/
+/sync/
+/inventories/
+/evidence/
+/journals/
+/backups/
+/receipts/
+/exports/
+/artifacts/
+/test-artifacts/
+/test-results/
+*.jsonl
+*.sqlite*
+*.db
+*.log
+
+# Credentials and local configuration.
+.env
+.env.*
+credentials*
+*credentials*.json
+*token*.json
+*.pem
+*.key
+config.local.*
+
+# Python, editors and OS output.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.DS_Store
+.idea/
+.vscode/
+*.swp

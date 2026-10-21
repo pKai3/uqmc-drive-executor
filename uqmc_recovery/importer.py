@@ -1,0 +1,287 @@
+"""Read-only workbook export -> frozen candidate Plan. Never grants approval.
+
+The workbook is a proposal input, not an executor. This module consumes bounded,
+complete connector range exports and separately verified metadata/ID resolutions.
+It contains no network calls and never opens a Drive file.
+"""
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+from .model import FOLDER, Operation, Plan, SafetyError, WITHDRAWN_ID, digest, snapshot
+
+# Live identity is supplied from ignored private configuration, never from a repo.
+WORKBOOK_ID = "fixture-workbook"
+HEADERS = {
+    "Proposed Moves": ["Proposal ID", "Current item", "Source path", "Proposed target path", "Action", "Rationale", "Visible descendants / 1 file", "Priority", "Dependencies", "Access concerns", "Decision (Yes/No)", "Status", "Target exists?", "Coverage / exceptions", "Last verified"],
+    "Move Manifest": ["Current item", "Exact target path", "Scope", "Visible scope items", "Source path", "Rationale", "Access / dependencies", "Exceptions", "Last verified", "Proposal ID", "Manifest item", "Source ID"],
+    "Proposed Renames": ["Rename necessity (guide)", "Current name + type suffix", "Proposed name + type suffix", "Necessity rationale (assistant)", "Decision (Yes/No)", "Review state", "Proposed destination folder", "Current source path", "Evidence / rationale", "Checks before execution", "Document date / year", "Evidence confidence", "Type code", "Rename ID", "Move proposal ID", "Manifest item", "Source ID", "Verified on"],
+    "Rename Coverage": ["Rename necessity", "Assessment", "Current name + type suffix", "Proposed name / retained name", "Necessity rationale (assistant)", "Rename proposal", "Source link", "Existing proposed target", "Evidence / rationale", "Remaining checks", "Item kind", "Assessment scope", "Move proposal", "Manifest item / root reference", "Source ID", "Verified MIME type", "Verified on", "Coverage basis"],
+}
+WITHDRAWN_VALUES = {"excluded", "withdrawn"}
+
+
+def _text(value):
+    return value if isinstance(value, str) else ""
+
+
+def _rows(export, tab):
+    matrix = export["sheets"].get(tab)
+    if not isinstance(matrix, list) or not matrix or not isinstance(matrix[0], list):
+        raise SafetyError("MISSING_WORKBOOK_RANGE:" + tab)
+    headers = matrix[0]
+    if len(headers) != len(set(headers)) or not set(HEADERS[tab]) <= set(headers):
+        raise SafetyError("WORKBOOK_HEADER_MISMATCH:" + tab)
+    if any(not isinstance(h, str) for h in headers):
+        raise SafetyError("INVALID_WORKBOOK_HEADER")
+    result = []
+    for number, values in enumerate(matrix[1:], 2):
+        if not isinstance(values, list) or len(values) > len(headers):
+            raise SafetyError("INVALID_WORKBOOK_ROW")
+        if not any(v not in (None, "") for v in values):
+            continue
+        row = {h: copy.deepcopy(values[i]) if i < len(values) else "" for i, h in enumerate(headers)}
+        row["_row"] = number
+        result.append(row)
+    return result
+
+
+def workbook_fingerprint(export, *, expected_workbook_id=WORKBOOK_ID):
+    """Hash exact selected source ranges, including decisions, excluding fetch timestamp."""
+    if not expected_workbook_id or export.get("workbook_id") != expected_workbook_id:
+        raise SafetyError("WRONG_WORKBOOK")
+    if set(export.get("sheets", {})) != set(HEADERS):
+        raise SafetyError("WORKBOOK_SCOPE_INCOMPLETE")
+    if any(export.get("complete", {}).get(tab) is not True for tab in HEADERS):
+        raise SafetyError("WORKBOOK_RANGE_NOT_COMPLETE")
+    if not export.get("exported_at_utc"):
+        raise SafetyError("WORKBOOK_CAPTURE_TIME_REQUIRED")
+    for tab in HEADERS:
+        _rows(export, tab)
+    return digest({"workbook_id": export["workbook_id"], "sheets": export["sheets"], "complete": export["complete"]})
+
+
+def _index(rows, key):
+    result = {}
+    for row in rows:
+        value = _text(row[key]).strip()
+        if not value or value in result:
+            raise SafetyError("DUPLICATE_OR_MISSING_PROPOSAL_REFERENCE")
+        result[value] = row
+    return result
+
+
+def _withdrawn(row, fields):
+    return any(_text(row.get(key)).strip().lower() in WITHDRAWN_VALUES for key in fields)
+
+
+def catalog(export, *, expected_workbook_id=WORKBOOK_ID):
+    """Find explicit source-ID proposal records without retrieving source metadata."""
+    input_hash = workbook_fingerprint(export, expected_workbook_id=expected_workbook_id)
+    moves = _index(_rows(export, "Proposed Moves"), "Proposal ID")
+    result, excluded, excluded_refs = {}, {WITHDRAWN_ID}, set()
+    for row in _rows(export, "Move Manifest"):
+        pid, item = _text(row["Proposal ID"]).strip(), _text(row["Manifest item"]).strip()
+        ref = f"{pid}/{item}"
+        if not pid or not item or ref in result:
+            raise SafetyError("DUPLICATE_OR_MISSING_MANIFEST_REFERENCE")
+        proposal = moves.get(pid)
+        source_id = _text(row["Source ID"]).strip()
+        decision = _text(proposal["Decision (Yes/No)"]).strip() if proposal else ""
+        is_excluded = (proposal and _withdrawn(proposal, ("Status", "Decision (Yes/No)"))) or _withdrawn(row, ("Scope", "Exceptions"))
+        if decision == "No":
+            excluded_refs.update((ref, pid))
+        if is_excluded and source_id:
+            excluded.add(source_id)
+        result[ref] = {"reference": ref, "proposal_refs": [pid, item], "action": "MOVE", "source_id": source_id,
+                       "decision": decision, "withdrawn": bool(is_excluded), "row": row, "proposal": proposal,
+                       "row_sha256": digest({"manifest": row, "proposal": proposal})}
+    for row in _rows(export, "Proposed Renames"):
+        ref = _text(row["Rename ID"]).strip()
+        if not ref or ref in result:
+            raise SafetyError("DUPLICATE_OR_MISSING_RENAME_REFERENCE")
+        source_id = _text(row["Source ID"]).strip()
+        decision = _text(row["Decision (Yes/No)"]).strip()
+        is_excluded = _withdrawn(row, ("Review state", "Decision (Yes/No)"))
+        if decision == "No":
+            excluded_refs.add(ref)
+        if is_excluded and source_id:
+            excluded.add(source_id)
+        result[ref] = {"reference": ref, "proposal_refs": [ref], "action": "RENAME", "source_id": source_id,
+                       "decision": decision, "withdrawn": is_excluded, "row": row,
+                       "row_sha256": digest(row)}
+    for row in _rows(export, "Rename Coverage"):
+        if _withdrawn(row, ("Assessment", "Rename necessity", "Coverage basis")):
+            source_id = _text(row["Source ID"]).strip()
+            if source_id:
+                excluded.add(source_id)
+    return {"input_sha256": input_hash, "records": result, "excluded_ids": sorted(excluded),
+            "excluded_refs": sorted(excluded_refs)}
+
+
+@dataclass(frozen=True)
+class ImportResult:
+    plan: Plan | None
+    manifest: dict
+    evidence_ref: str
+
+
+def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
+                    resolutions=None, expected_input_sha256=None, expected_workbook_id=WORKBOOK_ID):
+    """Freeze only an explicitly selected, wholly resolved batch.
+
+    resolutions[reference] binds input_sha256, row_sha256, source_id and supplies
+    target_parent_ids (MOVE) or exact_target_name (RENAME), plus depends_on_refs.
+    A resolution is review evidence, never approval. Metadata comes from already
+    authorized reads. Blocked selected rows produce plan=None, never silent scope
+    reduction. Exclusions are persisted before accessing metadata_by_id.
+    """
+    if not batch_id or not isinstance(batch_id, str):
+        raise SafetyError("BATCH_ID_REQUIRED")
+    selected = list(selected_refs)
+    if len(set(selected)) != len(selected) or not selected:
+        raise SafetyError("EXPLICIT_SELECTION_REQUIRED")
+    resolutions = resolutions or {}
+    with journal.locked():
+        source = catalog(export, expected_workbook_id=expected_workbook_id)
+        input_hash = source["input_sha256"]
+        recorded_exclusions = {r["payload"]["file_id"] for r in journal.records() if r["kind"] == "EXCLUDED"}
+        recorded_refs = {r["payload"]["proposal_ref"] for r in journal.records() if r["kind"] == "PROPOSAL_EXCLUDED"}
+        for source_id in source["excluded_ids"]:
+            if source_id not in recorded_exclusions:
+                journal.append("EXCLUDED", payload={"file_id": source_id, "reason_code": "WORKBOOK_WITHDRAWN_OR_EXCLUDED", "input_sha256": input_hash})
+        for ref in source["excluded_refs"]:
+            if ref not in recorded_refs:
+                journal.append("PROPOSAL_EXCLUDED", payload={"proposal_ref": ref, "reason_code": "WORKBOOK_DECISION_NO", "input_sha256": input_hash})
+        excluded = set(source["excluded_ids"]) | recorded_exclusions
+        excluded_refs = set(source["excluded_refs"]) | recorded_refs
+        rows, candidates = [], {}
+        stale = expected_input_sha256 is not None and expected_input_sha256 != input_hash
+        for ref in selected:
+            record = source["records"].get(ref)
+            entry = {"reference": ref, "state": "BLOCKED", "approval_state": "NOT_APPROVED", "reason_code": None}
+            rows.append(entry)
+            try:
+                if stale:
+                    raise SafetyError("WORKBOOK_CHANGED_REVALIDATION_REQUIRED")
+                if not record:
+                    raise SafetyError("SELECTED_REFERENCE_MISSING")
+                source_id = record["source_id"]
+                entry.update(source_id=source_id, action=record["action"], row_sha256=record["row_sha256"])
+                if not source_id:
+                    raise SafetyError("SOURCE_ID_REQUIRED")
+                if source_id in excluded:
+                    entry["approval_state"] = "WITHDRAWN"
+                    raise SafetyError("EXCLUDED")
+                if ref in excluded_refs or set(record["proposal_refs"]) & excluded_refs:
+                    entry["approval_state"] = "WITHDRAWN"
+                    raise SafetyError("PROPOSAL_EXCLUDED")
+                if record["decision"] != "Yes":
+                    raise SafetyError("PROPOSAL_DECISION_NOT_YES")
+                resolution = resolutions.get(ref)
+                if not isinstance(resolution, dict):
+                    raise SafetyError("EXACT_TARGET_RESOLUTION_REQUIRED")
+                if resolution.get("input_sha256") != input_hash or resolution.get("row_sha256") != record["row_sha256"]:
+                    raise SafetyError("STALE_TARGET_RESOLUTION")
+                if resolution.get("source_id") != source_id:
+                    raise SafetyError("RESOLUTION_SOURCE_MISMATCH")
+                dependencies = resolution.get("depends_on_refs")
+                if not isinstance(dependencies, list) or any(not isinstance(d, str) or d not in selected or d == ref for d in dependencies):
+                    raise SafetyError("EXPLICIT_DEPENDENCY_REVIEW_REQUIRED")
+                if resolution.get("reviewed_checks") is not True:
+                    raise SafetyError("PROPOSAL_CHECKS_NOT_REVIEWED")
+                # This is deliberately after all exclusion checks. No metadata access
+                # occurs even if an excluded ID exists in the supplied dictionary.
+                before = snapshot(metadata_by_id[source_id])
+                if before["id"] != source_id:
+                    raise SafetyError("ID_MISMATCH")
+                if resolution.get("live_snapshot_sha256") != digest(before):
+                    raise SafetyError("STALE_LIVE_METADATA_RESOLUTION")
+                descendant_ids = {x["id"] for x in before["subtree"].get("members", [])}
+                if ({source_id} | set(before["parents"]) | descendant_ids) & excluded:
+                    raise SafetyError("EXCLUDED_SCOPE_OR_DESCENDANT")
+                if record["action"] == "MOVE":
+                    targets = resolution.get("target_parent_ids")
+                    if not isinstance(targets, list) or not targets or any(not isinstance(x, str) or not x for x in targets):
+                        raise SafetyError("DESTINATION_IDS_REQUIRED")
+                    if set(targets) & excluded:
+                        raise SafetyError("EXCLUDED_DESTINATION")
+                    target = {"parents": sorted(targets)}
+                    for parent_id in set(before["parents"]) | set(targets):
+                        parent = snapshot(metadata_by_id[parent_id])
+                        if parent["id"] != parent_id or parent["mime_type"] != FOLDER:
+                            raise SafetyError("DESTINATION_OR_ORIGINAL_PARENT_INVALID")
+                else:
+                    exact_name = resolution.get("exact_target_name")
+                    if not isinstance(exact_name, str) or not exact_name:
+                        raise SafetyError("EXACT_NATIVE_TITLE_REQUIRED")
+                    # Never use the workbook's display title or strip an extension.
+                    target = {"name": exact_name}
+                operation_id = "op-" + digest({"batch_id": batch_id, "input_sha256": input_hash, "reference": ref, "action": record["action"]})[:24]
+                op = Operation(operation_id, source_id, record["action"], before, target,
+                               (), tuple(record["proposal_refs"]))
+                op.validate()
+                candidates[ref] = (op, dependencies)
+                entry.update(state="ELIGIBLE_PENDING_BATCH_APPROVAL", reason_code="EXPLICIT_BATCH_APPROVAL_REQUIRED", operation_id=operation_id)
+            except KeyError:
+                entry["reason_code"] = "LIVE_METADATA_MISSING"
+            except SafetyError as error:
+                entry["reason_code"] = str(error)
+        plan = None
+        if len(candidates) == len(selected):
+            operations, pending, simulated = [], list(selected), {}
+            while pending:
+                ready = [ref for ref in pending if set(candidates[ref][1]) <= {r for r, _ in operations}]
+                if not ready:
+                    for entry in rows:
+                        entry.update(state="BLOCKED", reason_code="DEPENDENCY_CYCLE")
+                    break
+                for ref in ready:
+                    op, deps = candidates[ref]
+                    before = copy.deepcopy(simulated.get(op.file_id, op.before))
+                    # Multiple operations on one item must explicitly order themselves.
+                    predecessors = [p for _, p in operations if p.file_id == op.file_id]
+                    if predecessors and predecessors[-1].operation_id not in {candidates[d][0].operation_id for d in deps}:
+                        for entry in rows:
+                            entry.update(state="BLOCKED", reason_code="UNORDERED_SAME_SOURCE")
+                        pending = []
+                        ready = []
+                        break
+                    resolved = Operation(op.operation_id, op.file_id, op.action, before, op.target,
+                                         tuple(candidates[d][0].operation_id for d in deps), op.proposal_refs)
+                    operations.append((ref, resolved))
+                    simulated[op.file_id] = resolved.intended(before)
+                    pending.remove(ref)
+            if len(operations) == len(selected) and all(r["state"] != "BLOCKED" for r in rows):
+                proposed = Plan(batch_id, batch_id, "workbook:" + input_hash, tuple(op for _, op in operations), tuple(sorted(excluded)))
+                try:
+                    proposed.validate()
+                    plan = proposed
+                except SafetyError as error:
+                    for entry in rows:
+                        entry.update(state="BLOCKED", reason_code=str(error))
+        manifest = {
+            "schema_version": "uqmc.workbook.import.v1", "dry_run": True,
+            "workbook_id": expected_workbook_id, "captured_at_utc": export["exported_at_utc"],
+            "input_sha256": input_hash, "proposal_revision": "workbook:" + input_hash,
+            "batch_id": batch_id, "selected_refs": selected, "rows": rows,
+            "excluded_ids": sorted(excluded), "excluded_refs": sorted(excluded_refs), "execution_approved": False,
+            "proposal_hash": plan.proposal_hash if plan else None,
+            "plan_ready_for_explicit_review": plan is not None,
+        }
+        evidence_ref = journal.evidence({"workbook_export": export, "resolutions": resolutions,
+                                         "manifest": manifest, "plan": plan.body() if plan else None})
+        # IMPORTED is evidence bookkeeping, not an Operation Log state or approval.
+        journal.append("IMPORTED", payload={"run_id": batch_id, "batch_id": batch_id,
+                                            "input_sha256": input_hash, "manifest_ref": evidence_ref,
+                                            "proposal_hash": manifest["proposal_hash"], "dry_run": True})
+        return ImportResult(plan, manifest, evidence_ref)
+
+
+def assert_frozen_input(manifest, current_export):
+    """Call on a fresh whole-scope export before separately approving a batch."""
+    if workbook_fingerprint(current_export, expected_workbook_id=manifest["workbook_id"]) != manifest["input_sha256"]:
+        raise SafetyError("WORKBOOK_CHANGED_REVALIDATION_REQUIRED")
+    return True
