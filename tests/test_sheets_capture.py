@@ -103,6 +103,50 @@ class SheetsCaptureTests(unittest.TestCase):
             data["sheets"][0]["data"][0]["rowData"].append({"values": [{
                 "userEnteredValue": {"formulaValue": "=A100"}, "effectiveValue": effective}]})
             with self.assertRaises(SafetyError): self.capture(data)
+    def test_missing_nonexecuting_display_result_is_unknown_and_annotated(self):
+        data = response()
+        formula = {"userEnteredValue": {"formulaValue": '=IFERROR(HYPERLINK("fixture","link"),"")'}}
+        cells = [{} for _ in range(6)]
+        cells[5] = formula
+        data["sheets"][3]["data"][0]["rowData"].append({"values": cells})
+        result = self.capture(data)
+        self.assertIsNone(result["sheets"]["Rename Coverage"][1][5])
+        self.assertEqual(result["cell_evidence"]["Rename Coverage"]["rowData"][1]["values"][5], formula)
+        self.assertEqual(result["unavailable_formula_cell_count"], 1)
+        self.assertEqual(result["unavailable_formula_cells"], [{"sheet": "Rename Coverage", "row": 2,
+            "column": 6, "a1": "'Rename Coverage'!F2",
+            "reason": "NONEXECUTING_DISPLAY_FORMULA_RESULT_UNAVAILABLE"}])
+
+    def test_unavailable_operational_formula_and_display_formula_error_still_block(self):
+        for title, header, effective in (
+                ("Rename Coverage", "Source ID", None),
+                ("Proposed Renames", "Decision (Yes/No)", None),
+                ("Proposed Renames", "Proposed name + type suffix", None),
+                ("Move Manifest", "Exact target path", None),
+                ("Rename Coverage", "Rename proposal", {"errorValue": {"type": "REF"}})):
+            with self.subTest(title=title, header=header, effective=effective):
+                data = response()
+                sheet = next(s for s in data["sheets"] if s["properties"]["title"] == title)
+                index = HEADERS[title].index(header)
+                cells = [{} for _ in range(index + 1)]
+                cells[index] = {"userEnteredValue": {"formulaValue": "=A100"}}
+                if effective is not None:
+                    cells[index]["effectiveValue"] = effective
+                sheet["data"][0]["rowData"].append({"values": cells})
+                with self.assertRaises(SafetyError):
+                    self.capture(data)
+
+    def test_display_allowance_requires_exact_header_at_column_six(self):
+        data = response()
+        sheet = data["sheets"][3]
+        headers = sheet["data"][0]["rowData"][0]["values"]
+        headers[5], headers[14] = headers[14], headers[5]
+        cells = [{} for _ in range(6)]
+        cells[5] = {"userEnteredValue": {"formulaValue": "=A100"}}
+        sheet["data"][0]["rowData"].append({"values": cells})
+        with self.assertRaisesRegex(SafetyError, "WORKBOOK_FORMULA_RESULT_UNAVAILABLE"):
+            self.capture(data)
+
     def test_unavailable_read_is_not_retried_or_replaced_by_cache(self):
         with self.assertRaisesRegex(TransportError, "DRIVE_REQUEST_TIMEOUT"):
             self.capture(TransportError("DRIVE_REQUEST_TIMEOUT"))

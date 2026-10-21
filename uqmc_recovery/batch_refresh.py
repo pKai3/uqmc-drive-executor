@@ -71,18 +71,25 @@ def _validate_policy(journal, plan, policy, binding, groups):
     destination_paths = policy.get("destination_paths")
     if not isinstance(destination_paths, dict) or not destination_paths:
         raise SafetyError("REFRESH_VERIFIED_DESTINATION_MAPPING_REQUIRED")
+    # MOVE cells name an item's full target path; RENAME cells name its
+    # containing folder. The same label can therefore resolve to different
+    # parents. Only an explicit second map may distinguish those semantics.
+    move_paths = policy.get("move_destination_paths", destination_paths)
+    if not isinstance(move_paths, dict) or not move_paths:
+        raise SafetyError("REFRESH_VERIFIED_MOVE_DESTINATION_MAPPING_REQUIRED")
     boundary = set(origin["projection"]["allowed_destination_parent_ids"])
-    for path, mapping in destination_paths.items():
-        if (not isinstance(path, str) or not path or not isinstance(mapping, dict) or
-                not isinstance(mapping.get("parent_ids"), list) or not mapping["parent_ids"] or
-                len(mapping["parent_ids"]) != len(set(mapping["parent_ids"])) or
-                not set(mapping["parent_ids"]) <= boundary or not mapping.get("provenance_ref")):
-            raise SafetyError("REFRESH_DESTINATION_OUTSIDE_APPROVED_BOUNDARY")
-        evidence = journal.read_evidence(mapping["provenance_ref"])
-        if (evidence.get("kind") != "VERIFIED_DESTINATION_PATH_BINDING" or
-                evidence.get("section_id") != policy["section_id"] or evidence.get("path") != path or
-                evidence.get("parent_ids") != mapping["parent_ids"]):
-            raise SafetyError("REFRESH_DESTINATION_PROVENANCE_MISMATCH")
+    for paths in (destination_paths, move_paths):
+        for path, mapping in paths.items():
+            if (not isinstance(path, str) or not path or not isinstance(mapping, dict) or
+                    not isinstance(mapping.get("parent_ids"), list) or not mapping["parent_ids"] or
+                    len(mapping["parent_ids"]) != len(set(mapping["parent_ids"])) or
+                    not set(mapping["parent_ids"]) <= boundary or not mapping.get("provenance_ref")):
+                raise SafetyError("REFRESH_DESTINATION_OUTSIDE_APPROVED_BOUNDARY")
+            evidence = journal.read_evidence(mapping["provenance_ref"])
+            if (evidence.get("kind") != "VERIFIED_DESTINATION_PATH_BINDING" or
+                    evidence.get("section_id") != policy["section_id"] or evidence.get("path") != path or
+                    evidence.get("parent_ids") != mapping["parent_ids"]):
+                raise SafetyError("REFRESH_DESTINATION_PROVENANCE_MISMATCH")
     return previous_catalog
 
 
@@ -226,7 +233,7 @@ def refresh_batch(journal, existing_plan, capture_callable, policy, *, batch_id)
                         rename_destination = record["row"].get("Proposed destination folder")
                     else:
                         path = record["row"].get("Exact target path")
-                        mapping = policy["destination_paths"].get(path)
+                        mapping = policy.get("move_destination_paths", policy["destination_paths"]).get(path)
                         if not mapping:
                             raise SafetyError("REFRESH_DESTINATION_UNRESOLVED_OR_OUTSIDE_SECTION")
                         target["parents"] = sorted(mapping["parent_ids"])
@@ -260,7 +267,7 @@ def refresh_batch(journal, existing_plan, capture_callable, policy, *, batch_id)
                 blocked.append({"source_id": source, "reason": str(exc)})
         # New IDs appearing in a known destination are changes in scope, not consent.
         for source, actions in latest.items():
-            if source and source not in groups and any(r["row"].get("Exact target path") in policy["destination_paths"] for r in actions.get("MOVE", [])):
+            if source and source not in groups and any(r["row"].get("Exact target path") in policy.get("move_destination_paths", policy["destination_paths"]) for r in actions.get("MOVE", [])):
                 blocked.append({"source_id": source, "reason": "REFRESH_NEW_SOURCE_OUTSIDE_APPROVED_SECTION"})
         capture_ref, policy_ref = journal.evidence(captured), journal.evidence(policy)
         snapshot = {"schema_version": "uqmc.batch-refresh.candidates.v1", "batch_id": batch_id,

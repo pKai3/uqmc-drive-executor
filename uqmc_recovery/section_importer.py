@@ -8,7 +8,7 @@ import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from .importer import ImportResult, WORKBOOK_ID, catalog, import_workbook
+from .importer import ImportResult, WORKBOOK_ID, catalog, import_workbook, destination_route_record
 from .model import FOLDER, Plan, SafetyError, digest, snapshot
 
 _SEAL = object()
@@ -22,6 +22,7 @@ class _Eligibility:
     owner_approval_ref: str
     approval_sha256: str
     approval_id: str
+    derived_records: tuple = ()
 
 
 def _not_revoked(journal, approval_id):
@@ -41,6 +42,30 @@ def _eligibility_refs(token, input_hash, selected, journal):
         raise SafetyError("SECTION_APPROVAL_EVIDENCE_CHANGED")
     _not_revoked(journal, token.approval_id)
     return token.refs
+
+
+def _eligibility_records(token):
+    if not isinstance(token, _Eligibility) or token.seal is not _SEAL:
+        raise SafetyError("INVALID_SECTION_ELIGIBILITY")
+    return {r["reference"]: copy.deepcopy(r) for r in token.derived_records}
+
+
+def _destination_catalog(source, projection):
+    if projection.get("method_profile") not in {"destination_scoped_files", "destination_hybrid"}:
+        return source
+    augmented = copy.deepcopy(source)
+    for operation in projection.get("operations", []):
+        reference = operation.get("reference", "")
+        if not isinstance(reference, str) or not reference.startswith("ROUTE/"):
+            continue
+        origin = source["records"].get(reference[len("ROUTE/"):])
+        if origin is None:
+            raise SafetyError("DESTINATION_ROUTE_ORIGIN_MISSING")
+        derived = destination_route_record(origin)
+        if derived["reference"] != reference or derived["source_id"] != operation.get("source_id"):
+            raise SafetyError("DESTINATION_ROUTE_ORIGIN_MISMATCH")
+        augmented["records"][reference] = derived
+    return augmented
 
 
 def _strings(values, code, *, empty=False):
@@ -109,9 +134,9 @@ def _projection(projection, source, expected_section_id, expected_workbook_id):
     if not allowed_actions <= {"MOVE", "RENAME"} or "MOVE" not in allowed_actions:
         raise SafetyError("SECTION_ACTIONS_UNSUPPORTED")
     profile = projection.get("method_profile")
-    if profile not in {"approved_folder_scope", "new_destination_individual_files", "existing_folder_consolidation"}:
+    if profile not in {"approved_folder_scope", "new_destination_individual_files", "existing_folder_consolidation", "approved_nested_section", "destination_scoped_files", "destination_hybrid"}:
         raise SafetyError("EXPLICIT_METHOD_PROFILE_REQUIRED")
-    if profile != "existing_folder_consolidation" and allowed_actions != {"MOVE"}:
+    if profile not in {"existing_folder_consolidation", "approved_nested_section", "destination_scoped_files", "destination_hybrid"} and allowed_actions != {"MOVE"}:
         raise SafetyError("SECTION_MOVE_ONLY")
     allow_unresolved = profile == "new_destination_individual_files"
     boundary = _strings(projection.get("allowed_destination_parent_ids"), "SECTION_TARGET_BOUNDARY_REQUIRED", empty=allow_unresolved)
@@ -237,7 +262,7 @@ def validate_section_authority(journal, plan):
         raise SafetyError("SECTION_PLAN_ORIGIN_MISMATCH")
     workbook_evidence = journal.read_evidence(evidence["workbook_import_ref"])
     workbook_manifest = workbook_evidence["manifest"]
-    source = catalog(workbook_evidence["workbook_export"], expected_workbook_id=manifest["workbook_id"])
+    source = _destination_catalog(catalog(workbook_evidence["workbook_export"], expected_workbook_id=manifest["workbook_id"]), projection)
     members, operations, boundary = _projection(projection, source, binding.get("section_id"), manifest["workbook_id"])
     approval = _approval(journal, owner_ref, projection, members, operations, boundary)
     expected_revision = "section:" + digest({"scope": binding, "workbook_revision": workbook_manifest["proposal_revision"]})
@@ -540,6 +565,256 @@ def _reuse_profile(journal, projection, members, operations, boundary, metadata_
     return None
 
 
+def _nested_profile(journal, projection, members, operations, boundary, metadata_by_id, source, normalize):
+    """Bind nested final folder identities to exact workbook paths.
+
+    The path evidence records deterministic preparation provenance; it is not
+    authority. Owner approval seals the entire projection, and complete source
+    snapshots below prove every indirect descendant remains inside that scope.
+    """
+    section_path = projection.get("section_path")
+    paths = projection.get("destination_paths")
+    if not isinstance(section_path, str) or not section_path or "/" not in section_path:
+        raise SafetyError("NESTED_SECTION_PATH_REQUIRED")
+    anchor = section_path.rsplit("/", 1)[0]
+    if not isinstance(paths, dict) or section_path not in paths or anchor not in paths:
+        raise SafetyError("NESTED_DESTINATION_PATHS_REQUIRED")
+    if any(not isinstance(path, str) or not path or not isinstance(folder_id, str) or not folder_id
+           for path, folder_id in paths.items()) or len(set(paths.values())) != len(paths):
+        raise SafetyError("NESTED_DESTINATION_PATH_AMBIGUOUS")
+    if any(path != anchor and path != section_path and not path.startswith(section_path + "/") for path in paths):
+        raise SafetyError("NESTED_DESTINATION_OUTSIDE_SECTION")
+    proof_ref = projection.get("destination_path_evidence_ref")
+    if not isinstance(proof_ref, str) or not proof_ref:
+        raise SafetyError("NESTED_DESTINATION_EVIDENCE_REQUIRED")
+    proof = journal.read_evidence(proof_ref)
+    if (proof.get("schema_version") != "uqmc.section.destination-paths.v1"
+            or proof.get("section_id") != projection["section_id"]
+            or proof.get("input_sha256") != source["input_sha256"]
+            or proof.get("destination_paths") != paths or not proof.get("provenance_ref")):
+        raise SafetyError("NESTED_DESTINATION_EVIDENCE_MISMATCH")
+    journal.read_evidence(proof["provenance_ref"])
+    # Use the same deterministic selector, including a renamed section root
+    # and explicit exclusions, as preparation. The selected ref set is sealed.
+    from .section_prepare import select_records
+    selected = {record["reference"] for record in select_records(source, section_path)}
+    if set(operations) != selected:
+        raise SafetyError("NESTED_SECTION_OPERATION_SET_MISMATCH")
+    by_source = {}
+    for ref, operation in operations.items():
+        group = by_source.setdefault(operation["source_id"], {})
+        if operation["action"] in group:
+            raise SafetyError("NESTED_DUPLICATE_SOURCE_EFFECT")
+        group[operation["action"]] = operation
+    states = {source_id: normalize(metadata_by_id[source_id]) for source_id in by_source}
+    for source_id, state in states.items():
+        if state["id"] != source_id:
+            raise SafetyError("ID_MISMATCH")
+    expected_boundary = set()
+    for ref, operation in operations.items():
+        record = source["records"][ref]
+        state = states[operation["source_id"]]
+        if operation["action"] == "MOVE":
+            full_path = record["row"].get("Exact target path")
+            if not isinstance(full_path, str) or "/" not in full_path:
+                raise SafetyError("NESTED_MOVE_PATH_REQUIRED")
+            parent_path = full_path.rsplit("/", 1)[0]
+            if parent_path not in paths or operation["target_parent_ids"] != [paths[parent_path]]:
+                raise SafetyError("NESTED_MOVE_TARGET_PATH_MISMATCH")
+            expected_boundary.add(paths[parent_path])
+            own_rename = by_source[operation["source_id"]].get("RENAME")
+            if own_rename and own_rename["reference"] not in operation["depends_on_refs"]:
+                raise SafetyError("NESTED_MOVE_REQUIRES_OWN_RENAME_DEPENDENCY")
+        else:
+            _workbook_rename_target(journal, record, operation, state)
+            parent_path = record["row"].get("Proposed destination folder")
+            if parent_path not in paths:
+                raise SafetyError("NESTED_RENAME_DESTINATION_UNRESOLVED")
+            move = by_source[operation["source_id"]].get("MOVE")
+            final_parents = move["target_parent_ids"] if move else state["parents"]
+            if final_parents != [paths[parent_path]]:
+                raise SafetyError("NESTED_RENAME_DESTINATION_MISMATCH")
+    if boundary != expected_boundary:
+        raise SafetyError("NESTED_DESTINATION_BOUNDARY_NOT_EXACT")
+    # Path lookup is never allowed to reinterpret a source ID as a destination
+    # simply because a display node carried that ID. Its actual final folder
+    # name and parent must explain its complete logical placement.
+    for path, folder_id in paths.items():
+        state = states.get(folder_id) or normalize(metadata_by_id[folder_id])
+        if state["id"] != folder_id or state["mime_type"] != FOLDER:
+            raise SafetyError("NESTED_DESTINATION_NOT_FOLDER")
+        effects = by_source.get(folder_id, {})
+        final_name = effects.get("RENAME", {}).get("exact_target_name", state["name"])
+        if path == anchor:
+            # Canonical sheet paths historically trim the outer anchor title.
+            if final_name.strip() != path.rsplit("/", 1)[-1].strip() or effects:
+                raise SafetyError("NESTED_ANCHOR_IDENTITY_MISMATCH")
+            continue
+        parent_path, basename = path.rsplit("/", 1)
+        final_parents = effects.get("MOVE", {}).get("target_parent_ids", state["parents"])
+        # Spreadsheet paths are logical labels: a folder's explicit rename can
+        # differ while descendants still refer to its old logical path. The
+        # stable ID, canonical MOVE path (or rename row's old/new title), exact
+        # approved title and final parent remain independently bound.
+        if "MOVE" in effects:
+            move_row = source["records"][effects["MOVE"]["reference"]]["row"]
+            if move_row.get("Exact target path") != path:
+                raise SafetyError("NESTED_SOURCE_FOLDER_PATH_MISMATCH")
+        elif "RENAME" in effects:
+            rename_row = source["records"][effects["RENAME"]["reference"]]["row"]
+            row_parent = rename_row.get("Proposed destination folder")
+            if path not in {str(row_parent) + "/" + state["name"], str(row_parent) + "/" + final_name}:
+                raise SafetyError("NESTED_SOURCE_FOLDER_PATH_MISMATCH")
+        expected_name = effects.get("RENAME", {}).get("exact_target_name", basename)
+        if parent_path not in paths or final_name != expected_name or final_parents != [paths[parent_path]]:
+            raise SafetyError("NESTED_DESTINATION_FOLDER_PLACEMENT_MISMATCH")
+    return None
+
+
+def _destination_files_profile(journal, projection, members, operations, boundary, metadata_by_id, source, normalize):
+    """Route exact assigned leaves into destination containers; never move origins."""
+    from .section_prepare import select_records, resolve_destination_paths
+    original = {**source, "records": {ref:r for ref,r in source["records"].items() if not r.get("derived_from_reference")}}
+    section_path = projection.get("section_path")
+    if not isinstance(section_path,str) or "/" not in section_path:
+        raise SafetyError("DESTINATION_SECTION_PATH_REQUIRED")
+    anchor=section_path.rsplit("/",1)[0]
+    paths=projection.get("destination_paths")
+    if not isinstance(paths,dict) or anchor not in paths or section_path not in paths or len(set(paths.values()))!=len(paths):
+        raise SafetyError("DESTINATION_PATHS_AMBIGUOUS")
+    selected=select_records(original,section_path)
+    states={r["source_id"]:normalize(metadata_by_id[r["source_id"]]) for r in selected}
+    containers={sid for sid,state in states.items() if state["mime_type"]==FOLDER}
+    leaves=set(states)-containers
+    if containers!=set(projection.get("source_container_ids",[])) or containers & set(paths.values()):
+        raise SafetyError("SOURCE_CONTAINERS_MUST_REMAIN_IN_PLACE")
+    if set(members)!=leaves or any(m["ancestor_move_operation_refs"] for m in members.values()):
+        raise SafetyError("DESTINATION_LEAF_MEMBERSHIP_MISMATCH")
+    if {o["source_id"] for o in operations.values()}!=leaves:
+        raise SafetyError("DESTINATION_SOURCE_MUTATION_SCOPE_MISMATCH")
+    leaf_records=[r for r in selected if r["source_id"] in leaves]
+    existing_moves={r["source_id"] for r in leaf_records if r["action"]=="MOVE"}
+    expected_refs={r["reference"] for r in leaf_records}
+    expected_refs.update("ROUTE/"+r["reference"] for r in leaf_records if r["action"]=="RENAME" and r["source_id"] not in existing_moves)
+    if set(operations)!=expected_refs:
+        raise SafetyError("DESTINATION_OPERATION_SET_MISMATCH")
+    resolved=resolve_destination_paths(selected,metadata_by_id,{anchor:paths[anchor]},section_path,
+                                       method_profile="destination_scoped_files")
+    names=resolved["destination_folder_names"]
+    if (projection.get("destination_folder_names")!=names
+            or projection.get("source_container_refs")!=resolved["source_container_refs"]
+            or set(paths)!=set(names)|{anchor}):
+        raise SafetyError("DESTINATION_CONTAINER_DEFINITION_MISMATCH")
+    proof=journal.read_evidence(projection.get("destination_path_evidence_ref"))
+    if (proof.get("schema_version")!="uqmc.section.destination-paths.v1"
+            or proof.get("section_id")!=projection["section_id"] or proof.get("input_sha256")!=source["input_sha256"]
+            or proof.get("destination_paths")!=paths or not proof.get("provenance_ref")):
+        raise SafetyError("DESTINATION_PATH_EVIDENCE_MISMATCH")
+    journal.read_evidence(proof["provenance_ref"])
+    for path,sid in paths.items():
+        state=normalize(metadata_by_id[sid])
+        if state["id"]!=sid or state["mime_type"]!=FOLDER:
+            raise SafetyError("DESTINATION_NOT_FOLDER")
+        if path==anchor:
+            if state["name"].strip()!=anchor.rsplit("/",1)[-1].strip():
+                raise SafetyError("DESTINATION_ANCHOR_MISMATCH")
+        elif state["name"]!=names[path] or state["parents"]!=[paths[path.rsplit("/",1)[0]]]:
+            raise SafetyError("DESTINATION_CONTAINER_PLACEMENT_MISMATCH")
+    groups={}
+    for ref,op in operations.items():
+        if op["action"] in groups.setdefault(op["source_id"],{}):
+            raise SafetyError("DESTINATION_REPEATED_SOURCE_EFFECT")
+        groups[op["source_id"]][op["action"]]=op
+    expected_boundary=set()
+    for ref,op in operations.items():
+        record=source["records"][ref];state=states[op["source_id"]]
+        if op["action"]=="MOVE":
+            parent_path=(record["row"]["Origin rename row"]["Proposed destination folder"]
+                         if record.get("derived_from_reference") else record["row"]["Exact target path"].rsplit("/",1)[0])
+            if parent_path not in paths or op["target_parent_ids"]!=[paths[parent_path]]:
+                raise SafetyError("DESTINATION_ROUTE_TARGET_MISMATCH")
+            expected_boundary.add(paths[parent_path])
+            rename=groups[op["source_id"]].get("RENAME")
+            if rename and rename["reference"] not in op["depends_on_refs"]:
+                raise SafetyError("DESTINATION_MOVE_REQUIRES_RENAME_DEPENDENCY")
+        else:
+            _workbook_rename_target(journal,record,op,state)
+            parent_path=record["row"]["Proposed destination folder"]
+            move=groups[op["source_id"]].get("MOVE")
+            if parent_path not in paths or not move or move["target_parent_ids"]!=[paths[parent_path]]:
+                raise SafetyError("DESTINATION_RENAME_PARENT_MISMATCH")
+    if boundary!=expected_boundary:
+        raise SafetyError("DESTINATION_BOUNDARY_NOT_EXACT")
+    return None
+
+
+
+def _hybrid_profile(journal, projection, members, operations, boundary, metadata_by_id, source, normalize):
+    """Rebuild the deterministic mixed/intact plan from sealed current evidence.
+
+    A matching row hash is insufficient: exact targets, reuse scope, dependencies
+    and logical path provenance must all agree with the independent derivation.
+    """
+    from .destination_planner import build_hybrid_preparation, logical_parent
+    original = {**source, "records": {ref: record for ref, record in source["records"].items()
+                                     if not record.get("derived_from_reference")}}
+    # Rebuild with the same durable exclusion authority as preparation. A
+    # cleared spreadsheet cell never reopens an already excluded identity/ref.
+    records = journal.records()
+    original["excluded_ids"] = sorted(set(original.get("excluded_ids", [])) | {
+        e["payload"]["file_id"] for e in records if e["kind"] == "EXCLUDED"})
+    original["excluded_refs"] = sorted(set(original.get("excluded_refs", [])) | {
+        e["payload"]["proposal_ref"] for e in records if e["kind"] == "PROPOSAL_EXCLUDED"})
+    paths = projection.get("destination_paths")
+    section_path = projection.get("section_path")
+    if not isinstance(paths, dict) or not isinstance(section_path, str) or not section_path:
+        raise SafetyError("HYBRID_DESTINATION_PATHS_REQUIRED")
+    proof = journal.read_evidence(projection.get("destination_path_evidence_ref"))
+    if (proof.get("schema_version") != "uqmc.section.destination-paths.v1"
+            or proof.get("section_id") != projection["section_id"]
+            or proof.get("input_sha256") != source["input_sha256"]
+            or proof.get("destination_paths") != paths or not proof.get("provenance_ref")):
+        raise SafetyError("HYBRID_DESTINATION_PATH_EVIDENCE_MISMATCH")
+    journal.read_evidence(proof["provenance_ref"])
+    normalized = {sid: normalize(state) for sid, state in metadata_by_id.items()}
+    rebuilt = build_hybrid_preparation(original, section_path=section_path,
+        section_id=projection["section_id"], workbook_id=projection["workbook_id"],
+        metadata_by_id=normalized, destination_paths=paths,
+        destination_path_evidence_ref=projection["destination_path_evidence_ref"],
+        native_conversion_refs={ref: operation["native_display_conversion_ref"]
+            for ref, operation in operations.items() if operation.get("native_display_conversion_ref")},
+        extension_corrections={ref: operation["extension_correction"]
+            for ref, operation in operations.items() if operation.get("extension_correction")})
+    if projection != rebuilt["projection"]:
+        raise SafetyError("HYBRID_DETERMINISTIC_PROJECTION_MISMATCH")
+    anchor = logical_parent(section_path)
+    groups = {}
+    for ref, operation in operations.items():
+        groups.setdefault(operation["source_id"], {})[operation["action"]] = operation
+        if operation["action"] == "RENAME":
+            _workbook_rename_target(journal, source["records"][ref], operation,
+                                   normalized[operation["source_id"]])
+    reused = set(projection["reused_folder_ids"])
+    for path, sid in paths.items():
+        state = normalized[sid]
+        if state["id"] != sid or state["mime_type"] != FOLDER or state.get("trashed"):
+            raise SafetyError("HYBRID_DESTINATION_NOT_FOLDER")
+        effects = groups.get(sid, {})
+        if path == anchor:
+            if effects or (path and state["name"].strip() != path.rsplit("/", 1)[-1].strip()):
+                raise SafetyError("HYBRID_ANCHOR_IDENTITY_MISMATCH")
+            continue
+        parent_path = logical_parent(path)
+        expected_name = projection["destination_folder_names"][path]
+        if sid not in reused and effects:
+            raise SafetyError("HYBRID_UNPROVED_SOURCE_DESTINATION_REUSE")
+        name = effects.get("RENAME", {}).get("exact_target_name", state["name"])
+        parents = effects.get("MOVE", {}).get("target_parent_ids", state["parents"])
+        if parent_path not in paths or name != expected_name or parents != [paths[parent_path]]:
+            raise SafetyError("HYBRID_DESTINATION_FOLDER_PLACEMENT_MISMATCH")
+    return None
+
+
 def import_section(journal, export, *, projection, owner_approval_ref, expected_section_id,
                    batch_id, metadata_by_id, resolutions, expected_workbook_id=WORKBOOK_ID,
                    expected_method_profile="new_destination_individual_files", review_context_ref=None,
@@ -559,7 +834,7 @@ def import_section(journal, export, *, projection, owner_approval_ref, expected_
             normalize, plan_validator = agent_snapshot, validate_agent_plan
         elif metadata_profile != "STRICT":
             raise SafetyError("UNKNOWN_METADATA_PROFILE")
-        source = catalog(export, expected_workbook_id=expected_workbook_id)
+        source = _destination_catalog(catalog(export, expected_workbook_id=expected_workbook_id), projection)
         if projection.get("method_profile") != expected_method_profile:
             raise SafetyError("SECTION_METHOD_PROFILE_NOT_AUTHORIZED")
         members, operations, boundary = _projection(projection, source, expected_section_id, expected_workbook_id)
@@ -579,6 +854,8 @@ def import_section(journal, export, *, projection, owner_approval_ref, expected_
         excluded_refs |= set(source["excluded_refs"])
         target_sections = {r.get("parent_section_id") for r in projection.get("destination_requirements", [])}
         target_sections.add(projection.get("reuse_target", {}).get("target_section_id"))
+        if projection["method_profile"] in {"approved_nested_section", "destination_scoped_files", "destination_hybrid"}:
+            target_sections.update(projection.get("destination_paths", {}).values())
         support = set(projection.get("supporting_container_ids", []))
         if (set(members) | support) & excluded_sources or (boundary | target_sections) & excluded_sources:
             return _blocked(journal, projection, owner_approval_ref, approval, batch_id, "SECTION_CONTAINS_EXCLUDED_SOURCE_OR_TARGET", review_context_ref)
@@ -603,8 +880,36 @@ def import_section(journal, export, *, projection, owner_approval_ref, expected_
                 reason = str(error)
             if reason:
                 return _blocked(journal, projection, owner_approval_ref, approval, batch_id, reason, review_context_ref)
+        elif projection["method_profile"] == "approved_nested_section":
+            try:
+                reason = _nested_profile(journal, projection, members, operations, boundary, metadata_by_id, source, normalize)
+            except KeyError:
+                reason = "LIVE_METADATA_MISSING"
+            except SafetyError as error:
+                reason = str(error)
+            if reason:
+                return _blocked(journal, projection, owner_approval_ref, approval, batch_id, reason, review_context_ref)
+        elif projection["method_profile"] == "destination_scoped_files":
+            try:
+                reason = _destination_files_profile(journal, projection, members, operations, boundary, metadata_by_id, source, normalize)
+            except KeyError:
+                reason = "LIVE_METADATA_MISSING"
+            except SafetyError as error:
+                reason = str(error)
+            if reason:
+                return _blocked(journal, projection, owner_approval_ref, approval, batch_id, reason, review_context_ref)
+        elif projection["method_profile"] == "destination_hybrid":
+            try:
+                reason = _hybrid_profile(journal, projection, members, operations, boundary, metadata_by_id, source, normalize)
+            except KeyError:
+                reason = "LIVE_METADATA_MISSING"
+            except SafetyError as error:
+                reason = str(error)
+            if reason:
+                return _blocked(journal, projection, owner_approval_ref, approval, batch_id, reason, review_context_ref)
         token = _Eligibility(_SEAL, source["input_sha256"], frozenset(operations), owner_approval_ref,
-                             digest(approval), approval["approval_id"])
+                             digest(approval), approval["approval_id"],
+                             tuple(r for r in source["records"].values() if r.get("derived_from_reference")))
         for old_id in _strings(approval.get("supersedes_approval_ids", []), "SECTION_SUPERSESSION_INVALID", empty=True):
             if old_id == approval["approval_id"]:
                 raise SafetyError("SECTION_SELF_SUPERSESSION")

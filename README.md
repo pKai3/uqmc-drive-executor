@@ -1,6 +1,8 @@
 # UQMC Drive executor and recovery journal
 
-Local safety infrastructure for reviewed, partial Drive reorganisations. **Live mutation is disabled.** This repository contains no Drive credentials and cannot invoke an assistant's connected tools from Python. Runnable capabilities include durable storage, spreadsheet and destination-section import, read receipts, a guarded agent handoff, status exports, and a fixture executor with rollback and failure injection. The agent handoff prepares and records a separately invoked assistant tool call; it does not connect Python to Drive. A successful simulation is not a live pilot.
+The current standalone workflow is [Run one destination section](docs/DESTINATION.md): supply a canonical destination path to read the fresh proposal, reconcile execution history, and preview the work. Add `--apply` explicitly to execute that section through the Google API and publish verified status. It uses the existing private project configuration and token; it does not require assistant-generated per-file mappings or start OAuth. Credentials and recovery evidence are not stored in Git.
+
+The sections below retain the original fixture and agent-handoff interfaces. Their disabled-live defaults and legacy retry rules do not describe the current destination CLI; use the destination guide for preview, apply, resume, explicit rollback and publication recovery.
 
 ## Run locally
 

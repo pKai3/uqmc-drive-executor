@@ -218,7 +218,8 @@ class GoogleDriveTransport:
     """Only exact-ID reads and metadata-only rename/reparent calls are exposed."""
 
     def __init__(self, service, *, apply=False, allowed_ids, excluded_ids=(), mutation_ids=None,
-                 refresh_credentials=None, audit_permissions=True, secret_values=None):
+                 refresh_credentials=None, audit_permissions=True, secret_values=None,
+                 creation_parent_ids=()):
         if type(apply) is not bool:
             raise TransportError("EXPLICIT_APPLY_BOOLEAN_REQUIRED")
         if type(audit_permissions) is not bool:
@@ -234,6 +235,10 @@ class GoogleDriveTransport:
             raise TransportError("VALID_EXACT_ID_ALLOWLIST_REQUIRED")
         if not self.mutation_ids <= self.allowed_ids:
             raise TransportError("MUTATION_IDS_MUST_BE_IN_READ_SCOPE")
+        self.creation_parent_ids = frozenset(creation_parent_ids)
+        if not self.creation_parent_ids <= self.allowed_ids - self.excluded_ids:
+            raise TransportError("CREATION_PARENT_OUTSIDE_FROZEN_SCOPE")
+        self._reserved_folder_ids = {}
         self._refresh_credentials = refresh_credentials or (lambda: None)
         self._secret_values = secret_values or (lambda: ())
 
@@ -344,6 +349,74 @@ class GoogleDriveTransport:
             fileId=file_id, pageSize=100, pageToken=token,
             fields="nextPageToken,permissions", supportsAllDrives=True), "permissions", request="permissions.list", item_id=file_id)
 
+    def reserve_folder_id(self, parent_id):
+        """Allocate an ID, without creating a Drive object. Caller journals it."""
+        self._creation_guard(parent_id)
+        result = self._read(lambda: self.service.files().generateIds(
+            count=1, space="drive", type="files"), request="files.generateIds", item_id=parent_id)
+        ids = result.get("ids")
+        if not isinstance(ids, list) or len(ids) != 1 or not self._valid_id(ids[0]):
+            raise TransportError("GENERATED_FOLDER_ID_INVALID")
+        if ids[0] in self.allowed_ids or ids[0] in self.excluded_ids:
+            raise TransportError("GENERATED_FOLDER_ID_COLLISION")
+        self.register_reserved_folder_id(ids[0], parent_id)
+        return ids[0]
+
+    def _creation_guard(self, parent_id):
+        if not self.apply_enabled:
+            raise TransportError("READ_ONLY_TRANSPORT")
+        self._guard(parent_id)
+        if parent_id not in self.creation_parent_ids:
+            raise TransportError("OUTSIDE_APPROVED_CREATION_PARENTS")
+
+    def register_reserved_folder_id(self, file_id, parent_id):
+        """Restore a WAL-bound allocation; does not authorize ordinary updates."""
+        self._creation_guard(parent_id)
+        if not self._valid_id(file_id) or file_id in self.excluded_ids or file_id == parent_id:
+            raise TransportError("INVALID_RESERVED_FOLDER_ID")
+        old = self._reserved_folder_ids.get(file_id)
+        if old is not None and old != parent_id:
+            raise TransportError("RESERVED_FOLDER_PARENT_MISMATCH")
+        self._reserved_folder_ids[file_id] = parent_id
+        self.allowed_ids = self.allowed_ids | {file_id}
+
+    def get_reserved_folder(self, file_id):
+        if file_id not in self._reserved_folder_ids:
+            raise TransportError("UNRESERVED_FOLDER_ID")
+        result = self._read(lambda: self.service.files().get(
+            fileId=self._guard(file_id), fields=self.file_fields + ",appProperties",
+            supportsAllDrives=True), request="files.get", item_id=file_id)
+        if result.get("id") != file_id:
+            raise TransportError("DRIVE_RESPONSE_ID_MISMATCH", outcome="READ_FAILED")
+        return copy.deepcopy(result)
+
+    def create_reserved_folder(self, file_id, *, name, parent_id, stable_key):
+        """One metadata-only create using a preallocated ID; never auto-replay.
+
+        Google documents pre-generated IDs for folders at
+        https://developers.google.com/workspace/drive/api/guides/create-file
+        """
+        self._creation_guard(parent_id)
+        if self._reserved_folder_ids.get(file_id) != parent_id:
+            raise TransportError("UNRESERVED_FOLDER_ID")
+        if not isinstance(name, str) or not name or "\x00" in name:
+            raise TransportError("EXACT_NONEMPTY_NAME_REQUIRED")
+        if not isinstance(stable_key, str) or not re.fullmatch(r"[a-f0-9]{64}", stable_key):
+            raise TransportError("EXACT_FOLDER_STABLE_KEY_REQUIRED")
+        self._ready(item_id=file_id)
+        try:
+            result = self.service.files().create(body={
+                "id": file_id, "name": name, "mimeType": "application/vnd.google-apps.folder",
+                "parents": [parent_id], "appProperties": {"uqmcFolderKey": stable_key}},
+                fields=self.file_fields + ",appProperties", supportsAllDrives=True,
+                ignoreDefaultVisibility=True).execute(num_retries=0)
+        except Exception as error:
+            raise _failure(error, dispatched=True, request="files.create", item_id=file_id,
+                           secret_values=self._secret_values) from None
+        if not isinstance(result, dict) or result.get("id") != file_id:
+            raise TransportError("DRIVE_WRITE_RESPONSE_UNPROVEN", outcome="UNKNOWN")
+        return copy.deepcopy(result)
+
     def update_file(self, args):
         """Legacy bridge entry point: one effect per call, kept compatible."""
         return self._update(args, combined=False)
@@ -415,7 +488,7 @@ class GoogleDriveTransport:
     @classmethod
     def from_authorized_user_file(cls, token_path, *, apply=False, allowed_ids,
                                   excluded_ids=(), mutation_ids=None, timeout=DEFAULT_REQUEST_TIMEOUT,
-                                  audit_permissions=True):
+                                  audit_permissions=True, creation_parent_ids=()):
         """Load one explicit pre-existing grant; never run OAuth or persist tokens.
 
         This function is used only by an operator's later command. No token path
@@ -450,6 +523,8 @@ class GoogleDriveTransport:
             permitted_profiles += ({READONLY_SCOPE},)
         if declared not in permitted_profiles:
             raise TransportError("EXACT_SUPPORTED_DRIVE_SCOPE_REQUIRED")
+        if creation_parent_ids and declared != {FULL_DRIVE_SCOPE}:
+            raise TransportError("FULL_DRIVE_SCOPE_REQUIRED_FOR_FOLDER_CREATION")
         # httplib2 otherwise has its own socket retry loop below HttpRequest.
         # This dedicated single-writer process uses one attempt at that layer.
         httplib2.RETRIES = 1
@@ -468,6 +543,8 @@ class GoogleDriveTransport:
             scopes = set(credentials.granted_scopes or credentials.scopes or ())
             if scopes not in permitted_profiles:
                 raise TransportError("EXACT_SUPPORTED_DRIVE_SCOPE_REQUIRED")
+            if creation_parent_ids and scopes != {FULL_DRIVE_SCOPE}:
+                raise TransportError("FULL_DRIVE_SCOPE_REQUIRED_FOR_FOLDER_CREATION")
         try:
             service = build("drive", "v3", http=auth_http,
                             cache_discovery=False, static_discovery=True)
@@ -475,5 +552,5 @@ class GoogleDriveTransport:
             raise TransportError("DRIVE_CLIENT_INITIALIZATION_FAILED") from None
         return cls(service, apply=apply, allowed_ids=allowed_ids,
                    excluded_ids=excluded_ids, mutation_ids=mutation_ids, refresh_credentials=refresh,
-                   audit_permissions=audit_permissions,
+                   audit_permissions=audit_permissions, creation_parent_ids=creation_parent_ids,
                    secret_values=lambda: (credentials.token, credentials.refresh_token, credentials.client_secret, credentials.client_id))

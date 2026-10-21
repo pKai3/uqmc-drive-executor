@@ -49,14 +49,18 @@ def _literal(value):
     raise SafetyError("WORKBOOK_CELL_VALUE_INVALID")
 
 
-def _cell_value(cell):
+def _cell_value(cell, *, allow_unavailable_display=False):
     if not isinstance(cell, dict):
         raise SafetyError("WORKBOOK_CELL_INVALID")
     entered, effective = cell.get("userEnteredValue", {}), cell.get("effectiveValue", {})
     if not isinstance(entered, dict) or not isinstance(effective, dict):
         raise SafetyError("WORKBOOK_CELL_VALUE_INVALID")
     if "formulaValue" in entered:
-        if len(entered) != 1 or not isinstance(entered["formulaValue"], str) or not effective:
+        if len(entered) != 1 or not isinstance(entered["formulaValue"], str):
+            raise SafetyError("WORKBOOK_FORMULA_RESULT_UNAVAILABLE")
+        if not effective:
+            if allow_unavailable_display:
+                return None  # Unknown display result, never an invented empty string.
             raise SafetyError("WORKBOOK_FORMULA_RESULT_UNAVAILABLE")
         return _literal(effective)
     return _literal(effective if effective else entered)
@@ -80,7 +84,7 @@ def normalize_capture(response, *, workbook_id, revision, started_at_utc, captur
             indexed[title] = sheet
     if set(indexed) != set(HEADERS):
         raise SafetyError("WORKBOOK_CAPTURE_INCOMPLETE")
-    matrices, evidence = {}, {}
+    matrices, evidence, unavailable = {}, {}, []
     for title, required in HEADERS.items():
         sheet = indexed[title]
         grid = sheet["properties"].get("gridProperties", {})
@@ -97,11 +101,26 @@ def normalize_capture(response, *, workbook_id, revision, started_at_utc, captur
         if not isinstance(rows, list) or not rows or len(rows) > row_count:
             raise SafetyError("WORKBOOK_RANGE_NOT_COMPLETE")
         matrix = []
-        for row in rows:
+        for row_index, row in enumerate(rows):
             cells = row.get("values", []) if isinstance(row, dict) else None
             if not isinstance(cells, list) or len(cells) > len(required):
                 raise SafetyError("WORKBOOK_CAPTURE_RANGE_MISMATCH")
-            values = [_cell_value(cell) for cell in cells]
+            values = []
+            for column_index, cell in enumerate(cells):
+                # Only this existing nonexecuting reference/display column may
+                # have an unavailable computed result. Check its actual header
+                # as well as coordinate, so column reordering cannot relax an
+                # identity, approval, proposed-name or destination field.
+                display = (title == "Rename Coverage" and row_index > 0 and
+                    column_index == 5 and len(matrix[0]) > 5 and
+                    matrix[0][5] == "Rename proposal")
+                value = _cell_value(cell, allow_unavailable_display=display)
+                values.append(value)
+                if value is None:
+                    unavailable.append({"sheet": title, "row": row_index + 1,
+                        "column": column_index + 1,
+                        "a1": "'Rename Coverage'!F" + str(row_index + 1),
+                        "reason": "NONEXECUTING_DISPLAY_FORMULA_RESULT_UNAVAILABLE"})
             while values and values[-1] == "":
                 values.pop()
             matrix.append(values)
@@ -115,6 +134,8 @@ def normalize_capture(response, *, workbook_id, revision, started_at_utc, captur
         "sheets": matrices, "complete": {title: True for title in HEADERS},
         "cell_evidence": evidence, "source_revision": copy.deepcopy(revision),
         "capture_started_at_utc": started_at_utc,
+        "unavailable_formula_cells": unavailable,
+        "unavailable_formula_cell_count": len(unavailable),
         "capture_method": "sheets.spreadsheets.get_with_drive_revision_bracket"}
     result["input_sha256"] = workbook_fingerprint(result, expected_workbook_id=workbook_id)
     result["capture_sha256"] = digest({key: result[key] for key in

@@ -15,7 +15,8 @@ NATIVE = {
     "application/vnd.google-apps.spreadsheet": ".gsheet",
     "application/vnd.google-apps.presentation": ".gslides",
 }
-MIME_EXTENSIONS = {"application/pdf": {".pdf"}, "image/png": {".png"},
+MIME_EXTENSIONS = {"application/vnd.openxmlformats-officedocument.wordprocessingml.document": {".docx"},
+                   "application/pdf": {".pdf"}, "image/png": {".png"},
                    "image/jpeg": {".jpg", ".jpeg"}, "image/gif": {".gif"},
                    "image/webp": {".webp"}, "image/heic": {".heic"},
                    "image/heif": {".heif"},

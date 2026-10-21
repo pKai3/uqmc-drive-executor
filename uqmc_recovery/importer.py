@@ -178,6 +178,28 @@ def catalog(export, *, expected_workbook_id=WORKBOOK_ID):
             "quarantined_tombstones": quarantined}
 
 
+def destination_route_record(rename_record):
+    """Derive a typed parent-routing effect from one exact rename destination row.
+
+    This record is usable only through validated section eligibility. It is not
+    a spreadsheet edit, inferred per-row approval, or a free-form target.
+    """
+    if rename_record.get("action") != "RENAME" or not rename_record.get("reference"):
+        raise SafetyError("DESTINATION_ROUTE_RENAME_REQUIRED")
+    row = rename_record["row"]
+    parent, title = row.get("Proposed destination folder"), row.get("Proposed name + type suffix")
+    if not isinstance(parent, str) or not parent or not isinstance(title, str) or not title:
+        raise SafetyError("DESTINATION_ROUTE_EXACT_ROW_REQUIRED")
+    origin = rename_record["reference"]
+    return {"reference": "ROUTE/" + origin, "proposal_refs": [origin], "action": "MOVE",
+            "source_id": rename_record["source_id"], "decision": rename_record["decision"],
+            "withdrawn": rename_record["withdrawn"], "derived_from_reference": origin,
+            "row": {"Exact target path": parent + "/" + title, "Scope": "Single item",
+                    "Source ID": rename_record["source_id"], "Origin rename row": copy.deepcopy(row)},
+            "row_sha256": digest({"derivation": "DESTINATION_ROUTE_FROM_RENAME",
+                                  "origin_row_sha256": rename_record["row_sha256"]})}
+
+
 @dataclass(frozen=True)
 class ImportResult:
     plan: Plan | None
@@ -217,8 +239,9 @@ def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
         if _section_eligibility is not None:
             # Internal extension point: only the validated section wrapper can mint
             # this token. It is not a public per-row approval switch.
-            from .section_importer import _eligibility_refs
+            from .section_importer import _eligibility_refs, _eligibility_records
             section_eligible_refs = _eligibility_refs(_section_eligibility, input_hash, selected, journal)
+            source["records"].update(_eligibility_records(_section_eligibility))
         recorded_exclusions = {r["payload"]["file_id"] for r in journal.records() if r["kind"] == "EXCLUDED"}
         recorded_refs = {r["payload"]["proposal_ref"] for r in journal.records() if r["kind"] == "PROPOSAL_EXCLUDED"}
         for source_id in source["excluded_ids"]:

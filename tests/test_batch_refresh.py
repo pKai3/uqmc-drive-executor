@@ -8,7 +8,7 @@ from unittest.mock import patch
 from test_importer import export_fixture, metadata, set_cell, append_row
 from uqmc_recovery.batch_refresh import refresh_batch
 from uqmc_recovery.journal import Journal
-from uqmc_recovery.model import Operation, Plan, SafetyError, digest
+from uqmc_recovery.model import FOLDER, Operation, Plan, SafetyError, digest
 
 
 class BatchRefreshTests(unittest.TestCase):
@@ -150,6 +150,61 @@ class BatchRefreshTests(unittest.TestCase):
         result = self.refresh()['snapshot']
         self.assertEqual({i['source_id'] for i in result['pending_candidates']}, {'source'})
         self.assertEqual(result['blocked'], [{'source_id': 'extra', 'reason': 'REFRESH_NEW_SOURCE_OUTSIDE_APPROVED_SECTION'}])
+
+    def test_reused_folder_item_path_can_equal_child_rename_parent_path(self):
+        root_before = metadata('root', 'Legacy folder', FOLDER, ['old'])
+        root_rename = Operation('root-rename', 'root', 'RENAME', root_before, {'name': 'Receiving'})
+        root_move = Operation('root-move', 'root', 'MOVE', root_rename.intended(), {'parents': ['new2']}, ('root-rename',))
+        child_before = metadata('child', 'Old.pdf', 'application/pdf', ['root'])
+        child_rename = Operation('child-rename', 'child', 'RENAME', child_before, {'name': 'Approved.pdf'})
+        self.plan = Plan('old-run', 'old-run', 'fixture-section', (root_rename, root_move, child_rename))
+        set_cell(self.old, 'Move Manifest', 1, 'Source ID', 'root')
+        set_cell(self.old, 'Move Manifest', 1, 'Exact target path', 'Club/Receiving')
+        set_cell(self.old, 'Proposed Renames', 1, 'Source ID', 'root')
+        set_cell(self.old, 'Proposed Renames', 1, 'Proposed name + type suffix', 'Receiving')
+        set_cell(self.old, 'Proposed Renames', 1, 'Proposed destination folder', 'Club')
+        append_row(self.old, 'Proposed Renames', {'Rename ID': 'RENAME-child', 'Source ID': 'child',
+            'Decision (Yes/No)': 'Yes', 'Proposed name + type suffix': 'Approved.pdf',
+            'Proposed destination folder': 'Club/Receiving'})
+        self.binding['section_manifest_ref'] = self.journal.evidence({
+            'manifest': {'workbook_id': self.old['workbook_id']},
+            'workbook_import_ref': self.journal.evidence({'workbook_export': self.old}),
+            'projection': {'allowed_destination_parent_ids': ['root', 'new2']}})
+        def mapped(path, parent):
+            return {'parent_ids': [parent], 'provenance_ref': self.journal.evidence({
+                'kind': 'VERIFIED_DESTINATION_PATH_BINDING', 'section_id': 'fixture-section',
+                'path': path, 'parent_ids': [parent]})}
+        self.policy.update(existing_plan_sha256=self.plan.proposal_hash, approved_source_ids=['root', 'child'],
+            destination_paths={'Club': mapped('Club', 'new2'), 'Club/Receiving': mapped('Club/Receiving', 'root')},
+            move_destination_paths={'Club/Receiving': mapped('Club/Receiving', 'new2')})
+        self.reauthorize()
+        self.fresh = copy.deepcopy(self.old)
+        # A row whose MOVE path is merely a rename-folder label must not be
+        # mistaken for an extra member of this section's explicit MOVE map.
+        append_row(self.fresh, 'Move Manifest', {'Proposal ID': 'MOVE-001', 'Manifest item': 'ITEM-unrelated',
+            'Source ID': 'unrelated', 'Exact target path': 'Club'})
+        snapshot = self.refresh()['snapshot']
+        self.assertEqual(snapshot['blocked'], [])
+        candidates = {item['source_id']: item for item in snapshot['pending_candidates']}
+        self.assertEqual(candidates['root']['target']['parents'], ['new2'])
+        self.assertEqual(candidates['root']['actions'], ['RENAME', 'MOVE'])
+        self.assertEqual(candidates['child']['target']['parents'], ['root'])
+        self.assertEqual(candidates['child']['actions'], ['RENAME'])
+
+    def test_separate_move_map_requires_provenance_boundary_and_exact_path(self):
+        original = self.policy['destination_paths']['Club/Archive/Minutes']
+        for invalid in ({'parent_ids': ['outside'], 'provenance_ref': original['provenance_ref']},
+                        {'parent_ids': ['new2'], 'provenance_ref': original['provenance_ref']},
+                        {'parent_ids': ['new']}):
+            self.policy['move_destination_paths'] = {'Club/Archive/Minutes': invalid}
+            with self.subTest(mapping=invalid):
+                with self.assertRaises(SafetyError):
+                    self.refresh()
+        self.assertEqual(self.calls, 0)
+        self.policy['move_destination_paths'] = {'Club/Other': self.policy['destination_paths']['Club/Other']}
+        result = self.refresh()['snapshot']
+        self.assertEqual(result['pending_candidates'], [])
+        self.assertEqual(result['blocked'][0]['reason'], 'REFRESH_DESTINATION_UNRESOLVED_OR_OUTSIDE_SECTION')
 
     def test_capture_failure_never_uses_old_export(self):
         before = self.journal.path.read_bytes()

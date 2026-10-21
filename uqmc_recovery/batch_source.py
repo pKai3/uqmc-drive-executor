@@ -123,6 +123,104 @@ def bind_batch_source(journal, plan, snapshot_ref):
             'input_sha256':snapshot['input_sha256'],'execution_approved':False})
 
 
+def _initial_source(journal, plan, capture, *, fresh):
+    """Prove this initial imported plan used this exact canonical capture."""
+    from .agent_profile import _require_frozen_agent
+    from .importer import catalog
+    from .section_importer import validate_section_authority
+    records = journal.records()
+    _require_frozen_agent(journal, plan, records)
+    authority = validate_section_authority(journal, plan)
+    if not authority or authority.get('refresh_snapshot_ref'):
+        raise SafetyError('INITIAL_BATCH_SECTION_IMPORT_REQUIRED')
+    origin = journal.read_evidence(authority['section_manifest_ref'])
+    workbook_id = origin['manifest']['workbook_id']
+    projection = origin['projection']
+    revision = capture.get('source_revision', {})
+    if (capture.get('workbook_id') != workbook_id or
+            capture.get('capture_method') != 'sheets.spreadsheets.get_with_drive_revision_bracket' or
+            not isinstance(revision, dict) or revision.get('id') != workbook_id or
+            revision.get('mimeType') != 'application/vnd.google-apps.spreadsheet' or
+            revision.get('trashed') is not False or
+            not isinstance(revision.get('version'), str) or not revision['version'].isdecimal() or
+            not isinstance(revision.get('modifiedTime'), str) or not revision['modifiedTime']):
+        raise SafetyError('INITIAL_BATCH_LIVE_CAPTURE_REQUIRED')
+    try:
+        capture_hash = digest({key: capture[key] for key in
+            ('workbook_id', 'sheets', 'complete', 'cell_evidence', 'source_revision')})
+    except KeyError:
+        raise SafetyError('INITIAL_BATCH_LIVE_CAPTURE_REQUIRED') from None
+    if capture.get('capture_sha256') != capture_hash:
+        raise SafetyError('INITIAL_BATCH_CAPTURE_HASH_MISMATCH')
+    source = catalog(capture, expected_workbook_id=workbook_id)
+    if (source['input_sha256'] != capture.get('input_sha256') or
+            source['input_sha256'] != projection.get('input_sha256')):
+        raise SafetyError('INITIAL_BATCH_WORKBOOK_DIFFERS_FROM_SECTION_IMPORT')
+    original = journal.read_evidence(origin['workbook_import_ref'])['workbook_export']
+    if (original.get('capture_sha256') != capture_hash or
+            original.get('source_revision') != revision or
+            original.get('exported_at_utc') != capture.get('exported_at_utc')):
+        raise SafetyError('INITIAL_BATCH_CAPTURE_DIFFERS_FROM_SECTION_IMPORT')
+    if fresh:
+        _age({'captured_at_utc': capture.get('exported_at_utc')})
+    return authority
+
+
+def bind_initial_section_source(journal, plan, capture):
+    """Bind an initial section import to its one fresh capture; never approve it.
+
+    The caller imports and registers the exact plan first. A later capture or
+    edited plan requires ordinary refresh/reconciliation, not this shortcut.
+    """
+    with journal.locked():
+        authority = _initial_source(journal, plan, capture, fresh=True)
+        records = journal.records()
+        if any(e['kind'] in {'INITIAL_BATCH_SOURCE_BOUND', 'BATCH_SOURCE_BOUND'} and
+                e['payload'].get('proposal_hash') == plan.proposal_hash for e in records):
+            raise SafetyError('BATCH_SOURCE_ALREADY_BOUND')
+        if any(e['kind'] in {'ATTEMPTED', 'DESIRED_ATTEMPTED'} and
+                e['payload'].get('plan_sha256', e['payload'].get('proposal_hash')) == plan.proposal_hash
+                for e in records):
+            raise SafetyError('INITIAL_BATCH_ALREADY_STARTED')
+        capture_ref = journal.evidence(capture)
+        return journal.append('INITIAL_BATCH_SOURCE_BOUND', payload={
+            'proposal_hash': plan.proposal_hash, 'run_id': plan.run_id,
+            'batch_id': plan.batch_id, 'section_id': authority['section_id'],
+            'section_manifest_ref': authority['section_manifest_ref'],
+            'capture_ref': capture_ref, 'capture_sha256': capture['capture_sha256'],
+            'input_sha256': capture['input_sha256'],
+            'source_revision': capture['source_revision'],
+            'history_sequence': records[-1]['seq'] if records else 0,
+            'history_tip_sha256': records[-1]['hash'] if records else None,
+            'execution_approved': False})
+
+
+def _require_initial_source(journal, plan, event):
+    payload = event['payload']
+    capture = journal.read_evidence(payload['capture_ref'])
+    authority = _initial_source(journal, plan, capture, fresh=True)
+    if (payload.get('run_id') != plan.run_id or payload.get('batch_id') != plan.batch_id or
+            payload.get('section_id') != authority['section_id'] or
+            payload.get('section_manifest_ref') != authority['section_manifest_ref'] or
+            payload.get('capture_sha256') != capture['capture_sha256'] or
+            payload.get('input_sha256') != capture['input_sha256'] or
+            payload.get('source_revision') != capture['source_revision'] or
+            payload.get('execution_approved') is not False):
+        raise SafetyError('INITIAL_BATCH_SOURCE_BINDING_MISMATCH')
+    records = journal.records()
+    sequence = payload.get('history_sequence')
+    if (type(sequence) is not int or sequence < 0 or sequence >= event['seq'] or
+            (records[sequence - 1]['hash'] if sequence else None) != payload.get('history_tip_sha256')):
+        raise SafetyError('FRESH_BATCH_HISTORY_MISMATCH')
+    sources = {op.file_id for op in plan.operations}
+    for later in records[sequence:]:
+        p = later['payload']
+        if (p.get('source_id', p.get('file_id')) in sources and later['kind'] in {
+                'ATTEMPTED', 'UNCERTAIN', 'VERIFIED_APPLIED', 'RECONCILED_AT_TARGET',
+                'DESIRED_ATTEMPTED', 'DESIRED_APPLIED', 'DESIRED_ROLLED_BACK', 'DESIRED_OBSERVED'}):
+            raise SafetyError('HISTORY_CHANGED_SINCE_BATCH_REFRESH')
+
+
 def require_batch_source(journal, plan, *, resume=False):
     with journal.locked():
         records = journal.records()
@@ -133,6 +231,11 @@ def require_batch_source(journal, plan, *, resume=False):
             e['payload'].get('plan_sha256',e['payload'].get('proposal_hash'))==plan.proposal_hash for e in records)
         if resume and started:
             return  # Same frozen run only; actual effect checks still skip success.
+        initial = [e for e in records if e['kind'] == 'INITIAL_BATCH_SOURCE_BOUND'
+            and e['payload'].get('proposal_hash') == plan.proposal_hash]
+        if initial:
+            _require_initial_source(journal, plan, initial[-1])
+            return
         links=[e for e in records if e['kind']=='BATCH_SOURCE_BOUND' and e['payload'].get('proposal_hash')==plan.proposal_hash]
         if not links:
             raise SafetyError('NEW_BATCH_REQUIRES_FRESH_WORKBOOK_CAPTURE_AND_BINDING')
