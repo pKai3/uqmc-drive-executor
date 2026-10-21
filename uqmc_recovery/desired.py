@@ -91,15 +91,24 @@ def compile_items(plan, journal):
 
 
 class DesiredRunner:
-    def __init__(self, journal, plan, transport, *, max_attempts=3, retry_delay=1, fault=None):
+    def __init__(self, journal, plan, transport, *, max_attempts=3, retry_delay=1, fault=None, progress=None):
         if not 1 <= max_attempts <= 5:
             raise SafetyError("MAX_ATTEMPTS_MUST_BE_1_TO_5")
         self.journal, self.plan, self.transport = journal, plan, transport
         self.max_attempts, self.retry_delay = max_attempts, retry_delay
         self.fault = fault or (lambda *args: None)
         self.stop_requested = False
+        self.progress = progress or (lambda event: None)
+        self.progress_output_failed = False
         self.items = compile_items(plan, journal)
         self.by_id = {i["source_id"]: i for i in self.items}
+
+    def report_progress(self, event, **value):
+        try:
+            self.progress({"event": event, **value})
+        except Exception:
+            # An output failure must not turn a verified action into a retry.
+            self.progress_output_failed = True
 
     def events(self, source_id=None):
         return [r for r in self.journal.records() if r["kind"].startswith("DESIRED_")
@@ -259,11 +268,15 @@ class DesiredRunner:
         partial = any(current[f] == item["target"][f] != item["original"][f] for f in ("name", "parents"))
         return raw, current, "TARGET" if current == item["target"] else "PARTIAL" if partial else "NOT_APPLIED"
 
-    def preview(self):
+    def preview(self, *, limit=None):
         with self.journal.locked():
             self.authority()
             output = []
             for item in self.items:
+                if self.stop_requested or (limit is not None and len(output) >= limit):
+                    break
+                self.report_progress("item_started", source_id=item["source_id"], mode="PREVIEW",
+                    completed_items=len(output), total_items=len(self.items))
                 try:
                     raw, current, state = self.observe(item)
                     parents = self.preflight(item, raw, item["target"])
@@ -276,12 +289,14 @@ class DesiredRunner:
                         "historical_uncertain_operation_ids": item["historical_uncertain_operation_ids"]})
                 except Exception as exc:
                     output.append(self.error_item(item, exc))
+                self.report_progress("item_finished", completed_items=len(output), total_items=len(self.items), **output[-1])
             return self.summary(output, preview=True)
 
     @staticmethod
     def error_item(item, exc):
         return {"source_id": item["source_id"], "state": "UNAVAILABLE" if isinstance(exc, (TransportError, TimeoutError, ConnectionError)) else "CONFLICT",
-                "reason": str(exc) if isinstance(exc, SafetyError) else type(exc).__name__}
+                "reason": str(exc) if isinstance(exc, SafetyError) else type(exc).__name__,
+                **({"request_error": exc.as_dict()} if isinstance(exc, TransportError) else {})}
 
     @staticmethod
     def effects(item, current):
@@ -336,6 +351,9 @@ class DesiredRunner:
                     response_ref=self.journal.evidence(response), request_outcome="RETURNED_SUCCESS", **payload)
             except Exception as exc:
                 error = exc
+                self.report_progress("request_failed", source_id=item["source_id"], direction=direction,
+                    request_error=exc.as_dict() if isinstance(exc, TransportError) else {"code": type(exc).__name__},
+                    next_step="READ_CURRENT_STATE_BEFORE_ANY_RETRY")
                 self.record("RECEIPT", item, direction=direction, attempt=attempt,
                     request_outcome="UNKNOWN", error_type=type(exc).__name__, http_status=getattr(exc, "status", None), **payload)
             observed = self.read(item["source_id"])
@@ -389,6 +407,8 @@ class DesiredRunner:
                 for item in reversed(self.items) if rollback else self.items:
                     if self.stop_requested or changed >= limit:
                         break
+                    self.report_progress("item_started", source_id=item["source_id"], mode="ROLLBACK" if rollback else "APPLY",
+                        completed_items=len(output), total_items=len(self.items))
                     try:
                         if rollback:
                             event = self.latest_change(item)
@@ -427,6 +447,7 @@ class DesiredRunner:
                         result = self.error_item(item, exc)
                         self.record("STOPPED", item, direction="ROLLBACK" if rollback else "FORWARD", **{k:v for k,v in result.items() if k != "source_id"})
                     output.append(result)
+                    self.report_progress("item_finished", completed_items=len(output), total_items=len(self.items), **result)
                 return self.summary(output, rollback=rollback)
             finally:
                 self.journal.backup(backup / ("desired-after-" + str(uuid.uuid4())))
@@ -436,7 +457,8 @@ class DesiredRunner:
             "generated_at_utc": utcnow(), "journal_sequence": len(self.journal.records()),
             "coverage": "items_observed_this_invocation", "total_plan_items": len(self.items),
             "processed_items": len(items), "unprocessed_items": len(self.items) - len(items),
-            "counts": dict(Counter(i["state"] for i in items)), "items": items, "paused": self.stop_requested, **extra}
+            "counts": dict(Counter(i["state"] for i in items)), "items": items, "paused": self.stop_requested,
+            "progress_output_failed": self.progress_output_failed, **extra}
 
 
 def export_status(journal, summary, directory):
@@ -508,19 +530,21 @@ def main(argv=None):
         account = transport.get_account()
         if args.expect_account and account["emailAddress"].casefold() != args.expect_account.casefold():
             raise SafetyError("AUTHENTICATED_ACCOUNT_MISMATCH")
-        print(json.dumps({"authenticated_account": account, "source_mutation_allowlist_count": len(items)}))
-        runner = DesiredRunner(journal, plan, transport, max_attempts=args.max_attempts)
+        print(json.dumps({"authenticated_account": account, "source_mutation_allowlist_count": len(items)}), flush=True)
+        runner = DesiredRunner(journal, plan, transport, max_attempts=args.max_attempts,
+            progress=lambda event: print(json.dumps(event), flush=True))
         def stop(signum, frame):
             runner.stop_requested = True
         signal.signal(signal.SIGINT, stop)
         signal.signal(signal.SIGTERM, stop)
-        summary = runner.run(apply=args.apply, confirm_plan_sha256=args.confirm_plan_sha256, limit=args.limit, rollback=args.command == "rollback") if mutating else runner.preview()
+        summary = runner.run(apply=args.apply, confirm_plan_sha256=args.confirm_plan_sha256, limit=args.limit, rollback=args.command == "rollback") if mutating else runner.preview(limit=args.limit)
         summary["authenticated_account"] = account
         print(json.dumps(summary))
         bad = {"CONFLICT", "UNAVAILABLE", "DEPENDENCY_BLOCKED"} | ({"NOT_APPLIED", "PARTIAL"} if mutating else set())
         return 0 if not any(i["state"] in bad for i in summary["items"]) else 2
     except Exception as exc:
-        print(json.dumps({"error": str(exc) if isinstance(exc, SafetyError) else type(exc).__name__}))
+        print(json.dumps({"error": str(exc) if isinstance(exc, SafetyError) else type(exc).__name__,
+            **({"request_error": exc.as_dict()} if isinstance(exc, TransportError) else {})}), flush=True)
         return 2
     finally:
         if args.export_dir and summary:

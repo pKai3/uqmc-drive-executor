@@ -66,6 +66,42 @@ class FakeDrive:
 
 
 class DesiredStateTests(unittest.TestCase):
+    def test_preview_limit_and_stop_keep_completed_progress_and_journal(self):
+        self.add_file()
+        self.freeze(self.operations() + self.operations("fixture-other", target_name="Other approved.pdf"))
+        before = self.journal.path.read_bytes()
+        events = []
+        runner = self.runner(progress=events.append)
+        result = runner.preview(limit=1)
+        self.assertEqual(result["processed_items"], 1)
+        self.assertEqual([e["event"] for e in events], ["item_started", "item_finished"])
+        self.assertNotIn("fixture-other", self.transport.reads)
+        self.assertEqual(self.journal.path.read_bytes(), before)
+        events.clear()
+        def stop_after_one(event):
+            events.append(event)
+            if event["event"] == "item_finished":
+                runner.stop_requested = True
+        runner.progress = stop_after_one
+        result = runner.preview()
+        self.assertEqual(result["processed_items"], 1)
+        self.assertTrue(result["paused"])
+        self.assertEqual(self.journal.path.read_bytes(), before)
+        self.assertEqual(self.transport.calls, [])
+
+    def test_preview_timeout_is_reported_with_item_before_final_summary(self):
+        self.freeze()
+        events = []
+        def timeout(source_id, count):
+            raise TransportError("DRIVE_REQUEST_TIMEOUT", outcome="READ_FAILED")
+        self.transport.on_get = timeout
+        result = self.runner(progress=events.append).preview()
+        self.assertEqual([e["event"] for e in events], ["item_started", "item_finished"])
+        self.assertEqual(events[1]["source_id"], "fixture-source")
+        self.assertEqual(events[1]["request_error"]["code"], "DRIVE_REQUEST_TIMEOUT")
+        self.assertEqual(result["counts"], {"UNAVAILABLE": 1})
+        self.assertEqual(self.transport.calls, [])
+
     def test_actual_capability_refusal_blocks_only_needed_effect(self):
         self.freeze()
         for source_caps, destination_caps, reason in (
@@ -236,17 +272,21 @@ class DesiredStateTests(unittest.TestCase):
         def timeout(item):
             raise TimeoutError("fake lost response")
         self.transport.after_update = timeout
-        result = self.run_plan()
+        events = []
+        result = self.run_plan(self.runner(progress=lambda event: events.append((event, self.transport.reads.get("fixture-source", 0)))))
+        failure = next((event, reads) for event, reads in events if event["event"] == "request_failed")
+        self.assertEqual(failure[0]["next_step"], "READ_CURRENT_STATE_BEFORE_ANY_RETRY")
+        self.assertGreater(self.transport.reads["fixture-source"], failure[1])
         self.assertIn(self.states(result)["fixture-source"], ("APPLIED", "TARGET"))
         self.assertEqual(len(self.transport.calls), 1)
         self.assertEqual(self.states(self.run_plan())["fixture-source"], "TARGET")
         self.assertEqual(len(self.transport.calls), 1)
 
-    def test_transient_unchanged_state_retries_with_fresh_reads_and_bound(self):
+    def test_timeout_unchanged_state_retries_with_fresh_reads_and_bound(self):
         self.freeze()
         def transient(args):
             if len(self.transport.calls) < 3:
-                raise TransportError("DRIVE_HTTP_ERROR", status=503, outcome="UNKNOWN")
+                raise TransportError("DRIVE_REQUEST_TIMEOUT", outcome="UNKNOWN")
         self.transport.before_update = transient
         self.assertEqual(self.states(self.run_plan())["fixture-source"], "APPLIED")
         self.assertEqual(len(self.transport.calls), 3)

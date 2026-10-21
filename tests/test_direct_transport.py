@@ -112,7 +112,7 @@ class DirectTransportTests(unittest.TestCase):
                          ["outside-listed-child", "file-a"])
         self.assertEqual([x["id"] for x in transport.list_permissions("file-a")],
                          ["123", "anyoneWithLink"])
-        self.assertTrue(all(call == ("execute", 2) for call in service.calls if call[0] == "execute"))
+        self.assertTrue(all(call == ("execute", 0) for call in service.calls if call[0] == "execute"))
         lists = [call[1] for call in service.calls if call[0] == "files.list"]
         self.assertEqual([q["pageToken"] for q in lists], [None, "page2"])
         self.assertEqual(lists[0]["q"], "'parent-a' in parents and trashed = false")
@@ -144,7 +144,7 @@ class DirectTransportTests(unittest.TestCase):
             self.assertNotIn("secret-token", output)
             self.assertNotIn("secret-refresh", output)
             self.assertEqual(captured.as_dict(),
-                             {"code": "DRIVE_HTTP_ERROR", "status": 503, "outcome": "UNKNOWN"})
+                             {"code": "DRIVE_HTTP_ERROR", "status": 503, "outcome": "UNKNOWN", "request": "files.update", "item_id": "file-a"})
         else:
             self.fail("Expected sanitized error")
         self.assertEqual(sum(call[0] == "files.update" for call in service.calls), 1)
@@ -243,8 +243,11 @@ class DirectTransportTests(unittest.TestCase):
             self.assertEqual(auth["max_refresh_attempts"], 0)
             self.assertEqual(auth["refresh_status_codes"], ())
             self.assertFalse(auth["http"].follow_redirects)
-            self.assertEqual(auth["http"].timeout, 30)
+            self.assertEqual(auth["http"].timeout, 15)
             self.assertEqual([call[0] for call in calls].count("refresh"), 1)
+            refresh_request = next(call[1] for call in calls if call[0] == "refresh")
+            self.assertIs(refresh_request[1], auth["http"])
+            self.assertEqual(refresh_request[1].timeout, 15)
             credentials.scopes = ["https://www.googleapis.com/auth/drive"]
             with self.assertRaisesRegex(TransportError, "EXACT_METADATA_SCOPE_REQUIRED"):
                 GoogleDriveTransport.from_authorized_user_file(token, allowed_ids={"file-a"})

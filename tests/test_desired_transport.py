@@ -1,11 +1,14 @@
 """Combined metadata requests and conditional headers; no credentials/network."""
 import copy
 import json
+from pathlib import Path
+import tempfile
 import types
 import unittest
 from urllib.parse import parse_qs, urlparse
+from unittest.mock import patch
 
-from uqmc_recovery.direct_transport import GoogleDriveTransport, TransportError, FILE_FIELDS
+from uqmc_recovery.direct_transport import GoogleDriveTransport, TransportError, FILE_FIELDS, METADATA_SCOPE
 
 
 class Request:
@@ -53,6 +56,55 @@ def transport(*values, apply=True, headers=None):
 
 
 class DesiredTransportTests(unittest.TestCase):
+    def test_real_client_loader_wires_15_seconds_and_surfaces_timeout_without_replay(self):
+        try:
+            from google.oauth2.credentials import Credentials
+        except ImportError:
+            self.skipTest("Optional direct dependencies are not installed")
+        credentials = Credentials(token="fixture-only-token", scopes=[METADATA_SCOPE])
+        with tempfile.TemporaryDirectory() as folder:
+            token = Path(folder) / "fixture-token.json"
+            token.write_text("fixture only; patched loader")
+            token.chmod(0o600)
+            with patch.object(Credentials, "from_authorized_user_file", return_value=credentials):
+                t = GoogleDriveTransport.from_authorized_user_file(token, apply=True,
+                    allowed_ids={"file-a", "parent-a", "parent-b"})
+            # These are the installed Google client and AuthorizedHttp objects,
+            # with only the network boundary replaced by a synthetic timeout.
+            http = t.service._http.http
+            self.assertEqual(http.timeout, 15)
+            for call, request, item_id, outcome in (
+                (t.get_account, "about.get", None, "READ_FAILED"),
+                (lambda: t.get_file("file-a"), "files.get", "file-a", "READ_FAILED"),
+                (lambda: t.list_children("parent-a"), "files.list", "parent-a", "READ_FAILED"),
+                (lambda: t.list_permissions("file-a"), "permissions.list", "file-a", "READ_FAILED"),
+                (lambda: t.update_metadata({"fileId": "file-a", "name": "approved.pdf"}), "files.update", "file-a", "UNKNOWN"),
+            ):
+                with self.subTest(request=request), patch.object(http, "request", side_effect=TimeoutError("private provider text")) as network:
+                    with self.assertRaises(TransportError) as caught:
+                        call()
+                    error = caught.exception
+                    self.assertEqual(error.code, "DRIVE_REQUEST_TIMEOUT")
+                    self.assertEqual(error.request, request)
+                    self.assertEqual(error.item_id, item_id)
+                    self.assertEqual(error.outcome, outcome)
+                    self.assertTrue(error.transient)
+                    self.assertNotIn("private provider text", str(error))
+                    self.assertEqual(network.call_count, 1)
+
+    def test_wrapped_auth_timeout_retains_context_without_dispatch(self):
+        def refresh():
+            error = RuntimeError(TimeoutError("secret refresh payload"))
+            raise error from None
+        service = Service()
+        t = GoogleDriveTransport(service, apply=True, allowed_ids={"file-a"}, refresh_credentials=refresh)
+        with self.assertRaises(TransportError) as caught:
+            t.update_metadata({"fileId": "file-a", "name": "approved.pdf"})
+        self.assertEqual(caught.exception.as_dict(), {"code": "AUTH_REQUEST_TIMEOUT", "status": None,
+            "outcome": "NOT_DISPATCHED", "request": "oauth.refresh", "item_id": "file-a"})
+        self.assertNotIn("secret", str(caught.exception))
+        self.assertEqual(service.requests, [])
+
     def test_account_read_is_verified_and_not_hardcoded(self):
         t, service = transport({"user": {"me": True, "emailAddress": "operator@example.test", "displayName": "Operator"}})
         self.assertEqual(t.get_account()["emailAddress"], "operator@example.test")
@@ -121,7 +173,7 @@ class DesiredTransportTests(unittest.TestCase):
         service.response_headers.clear()
         service.values.append({"id": "file-a", "version": "8"})
         self.assertNotIn("_http_etag", t.get_file("file-a"))
-        self.assertEqual([call["retries"] for call in service.executions], [2, 2])
+        self.assertEqual([call["retries"] for call in service.executions], [0, 0])
 
     def test_conflict_and_transient_errors_are_classified_without_replay(self):
         for status, conflict, transient in ((412, True, False), (429, False, True),

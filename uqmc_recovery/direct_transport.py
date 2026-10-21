@@ -22,6 +22,7 @@ from .model import SafetyError
 
 METADATA_SCOPE = "https://www.googleapis.com/auth/drive.metadata"
 READONLY_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
+DEFAULT_REQUEST_TIMEOUT = 15
 FILE_FIELDS = (
     "id,name,mimeType,parents,modifiedTime,version,trashed,size,md5Checksum,"
     "owners,driveId,capabilities,permissions,shortcutDetails,"
@@ -69,12 +70,19 @@ def _single_send_http_class(base):
 class TransportError(SafetyError):
     """Safe diagnostic only: no provider message, URL, headers or credentials."""
 
-    def __init__(self, code, *, status=None, outcome="NOT_DISPATCHED"):
+    def __init__(self, code, *, status=None, outcome="NOT_DISPATCHED", request=None, item_id=None):
         self.code, self.status, self.outcome = code, status, outcome
-        super().__init__(code + (f":HTTP_{status}" if status is not None else ""))
+        self.request, self.item_id = request, item_id
+        context = (":" + request if request else "") + (":" + item_id if item_id else "")
+        super().__init__(code + (f":HTTP_{status}" if status is not None else "") + context)
 
     def as_dict(self):
-        return {"code": self.code, "status": self.status, "outcome": self.outcome}
+        result = {"code": self.code, "status": self.status, "outcome": self.outcome}
+        if self.request is not None:
+            result["request"] = self.request
+        if self.item_id is not None:
+            result["item_id"] = self.item_id
+        return result
 
     @property
     def conflict(self):
@@ -85,18 +93,36 @@ class TransportError(SafetyError):
         # Classification is advice for a fresh-read recovery loop, never a
         # transport-level instruction to replay a mutation.
         return self.status in {408, 429, 500, 502, 503, 504} or (
-            self.status is None and self.code == "DRIVE_TRANSPORT_ERROR")
+            self.status is None and self.code in {"DRIVE_TRANSPORT_ERROR", "DRIVE_REQUEST_TIMEOUT"})
 
 
-def _failure(error, *, dispatched):
+def _is_timeout(error):
+    """Recognize socket timeout and auth wrappers without inspecting messages."""
+    pending, seen = [error], set()
+    while pending and len(seen) < 16:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, TimeoutError):
+            return True
+        pending.extend(x for x in (getattr(current, "__cause__", None),
+            getattr(current, "__context__", None), *getattr(current, "args", ()))
+            if isinstance(x, BaseException))
+    return False
+
+
+def _failure(error, *, dispatched, request=None, item_id=None):
     status = getattr(getattr(error, "resp", None), "status", None)
     if not isinstance(status, int) or isinstance(status, bool) or not 100 <= status <= 599:
         status = None
     # Even an HTTP refusal is left to the recovery layer, not auto-retried.
     return TransportError(
         "AUTOMATIC_HTTP_REPLAY_BLOCKED" if isinstance(error, _ReplayBlocked)
+        else "DRIVE_REQUEST_TIMEOUT" if _is_timeout(error)
         else "DRIVE_HTTP_ERROR" if status else "DRIVE_TRANSPORT_ERROR",
-        status=status, outcome="UNKNOWN" if dispatched else "READ_FAILED"
+        status=status, outcome="UNKNOWN" if dispatched else "READ_FAILED",
+        request=request, item_id=item_id
     )
 
 
@@ -131,20 +157,24 @@ class GoogleDriveTransport:
             raise TransportError("OUTSIDE_FROZEN_SCOPE")
         return value
 
-    def _ready(self):
+    def _ready(self, *, item_id=None):
         try:
             self._refresh_credentials()
         except TransportError:
             raise
-        except Exception:
+        except Exception as error:
+            if _is_timeout(error):
+                raise TransportError("AUTH_REQUEST_TIMEOUT", request="oauth.refresh", item_id=item_id) from None
             raise TransportError("AUTH_REFRESH_FAILED") from None
 
-    def _read(self, factory):
-        self._ready()
+    def _read(self, factory, *, request, item_id=None):
+        self._ready(item_id=item_id)
         try:
-            result = factory().execute(num_retries=2)
+            # Surface the first timeout/refusal promptly. No hidden read retry
+            # or backoff; a caller can make an explicitly bounded fresh read.
+            result = factory().execute(num_retries=0)
         except Exception as error:
-            raise _failure(error, dispatched=False) from None
+            raise _failure(error, dispatched=False, request=request, item_id=item_id) from None
         if not isinstance(result, dict):
             raise TransportError("INVALID_DRIVE_RESPONSE", outcome="READ_FAILED")
         return result
@@ -158,7 +188,7 @@ class GoogleDriveTransport:
             if hasattr(value, "add_response_callback"):
                 value.add_response_callback(lambda headers: response_headers.update(headers))
             return value
-        result = self._read(request)
+        result = self._read(request, request="files.get", item_id=file_id)
         if result.get("id") != file_id:
             raise TransportError("DRIVE_RESPONSE_ID_MISMATCH", outcome="READ_FAILED")
         # This is an HTTP response header, not a synthetic File resource field.
@@ -172,17 +202,17 @@ class GoogleDriveTransport:
 
     def get_account(self):
         result = self._read(lambda: self.service.about().get(
-            fields="user(displayName,emailAddress,permissionId,me)"))
+            fields="user(displayName,emailAddress,permissionId,me)"), request="about.get")
         user = result.get("user", {})
         if user.get("me") is not True or not user.get("emailAddress"):
             raise TransportError("AUTHENTICATED_ACCOUNT_UNVERIFIED", outcome="READ_FAILED")
         return {key: user.get(key) for key in ("displayName", "emailAddress", "permissionId")}
 
-    def _pages(self, factory, key):
+    def _pages(self, factory, key, *, request, item_id):
         token = None
         seen_tokens, seen_ids, items = set(), set(), []
         for _ in range(1000):
-            page = self._read(lambda: factory(token))
+            page = self._read(lambda: factory(token), request=request, item_id=item_id)
             if page.get("incompleteSearch") is True:
                 raise TransportError("INCOMPLETE_DRIVE_SEARCH", outcome="READ_FAILED")
             values = page.get(key)
@@ -211,13 +241,13 @@ class GoogleDriveTransport:
             q=f"'{parent_id}' in parents and trashed = false",
             pageSize=1000, pageToken=token, spaces="drive",
             fields=f"nextPageToken,incompleteSearch,files({FILE_FIELDS})",
-            supportsAllDrives=True, includeItemsFromAllDrives=True), "files")
+            supportsAllDrives=True, includeItemsFromAllDrives=True), "files", request="files.list", item_id=parent_id)
 
     def list_permissions(self, file_id):
         file_id = self._guard(file_id)
         return self._pages(lambda token: self.service.permissions().list(
             fileId=file_id, pageSize=100, pageToken=token,
-            fields="nextPageToken,permissions", supportsAllDrives=True), "permissions")
+            fields="nextPageToken,permissions", supportsAllDrives=True), "permissions", request="permissions.list", item_id=file_id)
 
     def update_file(self, args):
         """Legacy bridge entry point: one effect per call, kept compatible."""
@@ -275,25 +305,28 @@ class GoogleDriveTransport:
                 raise TransportError("PARENT_ADD_REMOVE_OVERLAP")
         # Pre-request refresh is separate; never retry the request following a
         # 401 or a socket/server error. The caller journals ATTEMPTED first.
-        self._ready()
+        self._ready(item_id=file_id)
         try:
             request = self.service.files().update(**parameters)
             if etag is not None:
                 request.headers["If-Match"] = etag
             result = request.execute(num_retries=0)
         except Exception as error:
-            raise _failure(error, dispatched=True) from None
+            raise _failure(error, dispatched=True, request="files.update", item_id=file_id) from None
         if not isinstance(result, dict) or result.get("id") != file_id:
             raise TransportError("DRIVE_WRITE_RESPONSE_UNPROVEN", outcome="UNKNOWN")
         return copy.deepcopy(result)
 
     @classmethod
     def from_authorized_user_file(cls, token_path, *, apply=False, allowed_ids,
-                                  excluded_ids=(), mutation_ids=None, timeout=30):
+                                  excluded_ids=(), mutation_ids=None, timeout=DEFAULT_REQUEST_TIMEOUT):
         """Load one explicit pre-existing grant; never run OAuth or persist tokens.
 
         This function is used only by an operator's later command. No token path
         is inferred from environment variables, a home directory, or ADC.
+        The default 15-second httplib2 socket timeout applies to Drive and auth
+        refresh requests. It bounds individual blocking network operations,
+        not total wall-clock duration while a response continues arriving.
         """
         path = Path(token_path)
         try:

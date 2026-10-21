@@ -17,7 +17,11 @@ Use the existing plan and journal. Checkpoint 508 and the 95 previously verified
 
 Current state and request history are separate. A fresh read showing the approved original name is a known current observation, even if an older request returned an ambiguous error. A read showing the target avoids another update; it does not retrospectively prove which request caused that state.
 
-Transient failures have a bounded attempt budget. Before another attempt, read again and recalculate the remaining change. Never blindly replay the previous request. If a read is unavailable, an item has unapproved changes, or the remaining outcome is unsafe, stop that item and its dependents with a reason. Independent work need not stop globally.
+The Google HTTP transport uses a 15-second socket timeout for account, metadata, permission and token-refresh requests. This bounds a blocked connection/read; it is not a strict 15-second wall-clock deadline for an entire response or batch. A response that continues transferring data, multiple network phases, or multiple paginated requests can take longer overall. Interactive OAuth consent keeps its separate five-minute allowance.
+
+Read requests have no hidden client retries. The CLI immediately flushes item start/result lines and safe endpoint/item error context; write failures are reported before reconciliation. Preview honors `--limit` (for example `--limit 1`) and checks Ctrl-C/termination requests between items, retaining completed results. An in-flight read must return or time out before that orderly stop can finish.
+
+Transient write failures have a bounded attempt budget (default three). Before another attempt, read again and recalculate the remaining change. Never blindly replay the previous request. A write timeout has an unknown request outcome; current-state readback decides whether the target is already satisfied, a bounded retry is justified, or the item must stop. If a read is unavailable, an item has unapproved changes, or the remaining outcome is unsafe, stop that item and its dependents with a reason. Independent work need not stop globally.
 
 For a blocked item, inspect the reported observation and reason, resolve the external conflict, then run preview and resume. If the desired change itself has changed, obtain a revised approved plan; do not edit the journal to erase the conflict. The program does not promise exactly-once execution or prove that every timed-out remote request was never processed.
 
@@ -85,7 +89,7 @@ These are restricted account-wide metadata scopes. `drive.file` does not automat
 
 ## Offline validation
 
-The focused suite passes 49 tests (20 desired-state recovery, 9 combined transport, 10 existing transport, 10 login). It exercises combined updates, existing renamed/moved effects, interruptions around dispatch and readback, lost responses, transient failures, bounded retry, concurrent drift, partial resume, partial rollback/restart, folder dependencies, account/capability checks and private token output.
+The focused suite covers desired-state recovery, combined and existing transports, and local login, including socket timeout wiring and immediate preview progress. It exercises combined updates, existing renamed/moved effects, interruptions around dispatch and readback, lost responses, transient failures, bounded retry, concurrent drift, partial resume, partial rollback/restart, folder dependencies, account/capability checks and private token output.
 
 ```sh
 PYTHONPATH=.:tests python3 -m unittest \
