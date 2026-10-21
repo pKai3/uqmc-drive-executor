@@ -1,13 +1,16 @@
 import copy
 import tempfile
 import unittest
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from test_importer import GuardedMetadata, append_row, export_fixture, metadata, resolutions, set_cell
 from uqmc_recovery.importer import catalog, import_workbook
 from uqmc_recovery.journal import Journal
 from uqmc_recovery.model import FOLDER, SafetyError, digest
-from uqmc_recovery.section_importer import import_section
+from uqmc_recovery.section_importer import import_section, validate_section_authority
 
 
 class SectionImporterTests(unittest.TestCase):
@@ -81,8 +84,51 @@ class SectionImporterTests(unittest.TestCase):
         self.assertEqual(result.plan.operations[0].action, "MOVE")
         self.assertTrue(result.manifest["section_approval_validated"])
         self.assertFalse(result.manifest["execution_approved"])
+        self.assertEqual(result.manifest["rows"][0]["state"], "ELIGIBLE_PENDING_EXACT_BATCH_BINDING")
+        self.assertEqual(result.manifest["rows"][0]["approval_basis"], "SECTION_OWNER_INSTRUCTION")
         self.assertTrue(result.plan.proposal_revision.startswith("section:"))
         self.assertNotIn("APPROVED", [r["kind"] for r in self.journal.records()])
+
+    def test_section_authority_revalidates_exact_import_origin(self):
+        result = self.run_section()
+        authority = validate_section_authority(self.journal, result.plan)
+        self.assertEqual(authority["section_manifest_ref"], result.evidence_ref)
+        self.assertEqual(authority["proposal_hash"], result.plan.proposal_hash)
+        self.assertEqual(authority["owner_approval_id"], result.manifest["authorization_scope"]["owner_approval_id"])
+
+    def test_section_authority_blocks_later_revocation(self):
+        result = self.run_section()
+        approval_id = result.manifest["authorization_scope"]["owner_approval_id"]
+        self.journal.append("SECTION_APPROVAL_REVOKED", payload={"approval_id": approval_id})
+        with self.assertRaisesRegex(SafetyError, "SECTION_APPROVAL_REVOKED_OR_SUPERSEDED"):
+            validate_section_authority(self.journal, result.plan)
+
+    def test_section_authority_blocks_later_supersession(self):
+        result = self.run_section()
+        approval_id = result.manifest["authorization_scope"]["owner_approval_id"]
+        self.journal.append("SECTION_APPROVAL_SUPERSEDED", payload={"approval_id": approval_id})
+        with self.assertRaisesRegex(SafetyError, "SECTION_APPROVAL_REVOKED_OR_SUPERSEDED"):
+            validate_section_authority(self.journal, result.plan)
+
+    def test_section_authority_blocks_expiry_after_import(self):
+        result = self.run_section(owner_approval_ref=self.approval(expires_at_utc="2999-01-01T00:00:00Z"))
+        with patch("uqmc_recovery.section_importer.datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime(3000, 1, 1, tzinfo=timezone.utc)
+            with self.assertRaisesRegex(SafetyError, "SECTION_APPROVAL_EXPIRED"):
+                validate_section_authority(self.journal, result.plan)
+
+    def test_section_authority_rejects_unrecorded_candidate(self):
+        result = self.run_section()
+        changed = replace(result.plan, proposal_revision="section:unrecorded")
+        with self.assertRaisesRegex(SafetyError, "SECTION_PLAN_ORIGIN_REQUIRED"):
+            validate_section_authority(self.journal, changed)
+
+    def test_non_section_fixture_has_no_section_authority(self):
+        set_cell(self.export, "Proposed Moves", 1, "Decision (Yes/No)", "Yes")
+        result = import_workbook(self.journal, self.export, batch_id="plain", selected_refs=["MOVE-001/ITEM-001"],
+            metadata_by_id=self.states, resolutions=resolutions(self.export, self.states))
+        self.assertIsNotNone(result.plan)
+        self.assertIsNone(validate_section_authority(self.journal, result.plan))
 
     def test_arbitrary_eligibility_refs_cannot_bypass(self):
         with self.assertRaisesRegex(SafetyError, "INVALID_SECTION_ELIGIBILITY"):
@@ -313,6 +359,11 @@ class ReuseSectionImporterTests(unittest.TestCase):
         result = self.run_import()
         self.assertEqual(result.manifest["section_reason_code"], "REUSE_INCOMING_FILE_PREIMAGE_MISMATCH")
 
+    def test_reuse_existing_file_set_rejects_folder_identity(self):
+        self.states["existing"]["mime_type"] = FOLDER
+        result = self.run_import()
+        self.assertEqual(result.manifest["section_reason_code"], "REUSE_EXISTING_MEMBER_NOT_FILE_UNDER_ROOT")
+
     def test_reuse_preserves_existing_children_no_direct_moves(self):
         self.projection["members"][0]["ancestor_move_operation_refs"] = []
         with self.assertRaisesRegex(SafetyError, "SECTION_MEMBER_UNMAPPED"):
@@ -347,9 +398,12 @@ class ReuseRenameSectionTests(ReuseSectionImporterTests):
         set_cell(self.export, "Proposed Renames", 1, "Decision (Yes/No)", "")
         names = {"source": ("RENAME-001", "Source renamed"), "source2": ("RENAME-002", "Other renamed"),
                  "existing": ("RENAME-EXISTING", "Historical renamed"), "reuse-root": ("RENAME-ROOT", "Renamed archive")}
-        for source_id, (ref, _) in names.items():
+        for source_id, (ref, title) in names.items():
             if source_id != "source":
-                append_row(self.export, "Proposed Renames", {"Rename ID": ref, "Source ID": source_id, "Decision (Yes/No)": ""})
+                append_row(self.export, "Proposed Renames", {"Rename ID": ref, "Source ID": source_id, "Decision (Yes/No)": "",
+                    "Current name + type suffix": self.states[source_id]["name"], "Proposed name + type suffix": title})
+            else:
+                set_cell(self.export, "Proposed Renames", 1, "Proposed name + type suffix", title)
         source = catalog(self.export)
         self.projection["input_sha256"] = source["input_sha256"]
         self.projection["allowed_actions"] = ["MOVE", "RENAME"]
@@ -387,6 +441,21 @@ class ReuseRenameSectionTests(ReuseSectionImporterTests):
         value = self.journal.read_evidence(ref)
         value["allowed_actions"] = self.projection["allowed_actions"]
         return self.journal.evidence(value)
+
+    def refresh_rename_review(self):
+        source = catalog(self.export)
+        self.projection["input_sha256"] = source["input_sha256"]
+        for binding in self.projection["rename_bindings"]:
+            binding["workbook_row_sha256"] = source["records"][binding["reference"]]["row_sha256"]
+        context = self.journal.read_evidence(self.context_ref)
+        spec = self.journal.read_evidence(context["destination_spec_evidence_ref"])
+        spec["rename_bindings"] = copy.deepcopy(self.projection["rename_bindings"])
+        spec["reuse_target"] = copy.deepcopy(self.projection["reuse_target"])
+        review = self.journal.read_evidence(spec["rename_collision_review_evidence_ref"])
+        review["rename_bindings_sha256"] = digest(spec["rename_bindings"])
+        spec["rename_collision_review_evidence_ref"] = self.journal.evidence(review)
+        context["destination_spec_evidence_ref"] = self.journal.evidence(spec)
+        self.context_ref = self.journal.evidence(context)
 
     def run_import(self, **overrides):
         resolved = resolutions(self.export, self.states)
@@ -433,6 +502,67 @@ class ReuseRenameSectionTests(ReuseSectionImporterTests):
         self.projection["rename_bindings"][0]["exact_target_name"] = "Unauthorized"
         result = self.run_import()
         self.assertEqual(result.manifest["section_reason_code"], "INDEPENDENT_RENAME_BINDING_MISMATCH")
+
+    def test_consistent_wrong_binding_and_resolution_cannot_override_workbook(self):
+        binding = next(item for item in self.projection["rename_bindings"] if item["source_id"] == "source")
+        operation = next(item for item in self.projection["operations"] if item["reference"] == binding["reference"])
+        binding["exact_target_name"] = operation["exact_target_name"] = "Unrelated approved-looking title"
+        self.refresh_rename_review()
+        result = self.run_import()
+        self.assertIsNone(result.plan)
+        self.assertEqual(result.manifest["section_reason_code"], "WORKBOOK_RENAME_TARGET_MISMATCH")
+
+    def test_folder_binding_cannot_override_workbook(self):
+        binding = next(item for item in self.projection["rename_bindings"] if item["source_id"] == "reuse-root")
+        operation = next(item for item in self.projection["operations"] if item["reference"] == binding["reference"])
+        binding["exact_target_name"] = operation["exact_target_name"] = "Wrong root title"
+        self.projection["reuse_target"]["final_folder_name"] = "Wrong root title"
+        self.refresh_rename_review()
+        result = self.run_import()
+        self.assertIsNone(result.plan)
+        self.assertEqual(result.manifest["section_reason_code"], "WORKBOOK_RENAME_TARGET_MISMATCH")
+
+    def test_native_display_suffix_requires_explicit_conversion_evidence(self):
+        set_cell(self.export, "Proposed Renames", 1, "Proposed name + type suffix", "Source renamed.gdoc")
+        self.refresh_rename_review()
+        result = self.run_import()
+        self.assertIsNone(result.plan)
+        self.assertEqual(result.manifest["section_reason_code"], "VERIFIED_NATIVE_DISPLAY_CONVERSION_REQUIRED")
+
+    def test_native_display_suffix_conversion_is_exact_and_mime_bound(self):
+        set_cell(self.export, "Proposed Renames", 1, "Proposed name + type suffix", "Source renamed.gdoc")
+        self.refresh_rename_review()
+        binding = next(item for item in self.projection["rename_bindings"] if item["source_id"] == "source")
+        provenance_ref = self.journal.evidence({"kind": "fixture_display_title_review"})
+        binding["native_display_conversion_ref"] = self.journal.evidence({
+            "schema_version": "uqmc.rename.native-display-conversion.v1", "source_id": "source",
+            "mime_type": "application/vnd.google-apps.document", "workbook_row_sha256": binding["workbook_row_sha256"],
+            "workbook_proposed_name": "Source renamed.gdoc", "exact_target_name": "Source renamed",
+            "display_suffix": ".gdoc", "provenance_ref": provenance_ref})
+        self.refresh_rename_review()
+        result = self.run_import()
+        self.assertIsNotNone(result.plan)
+        self.assertEqual(next(op.target["name"] for op in result.plan.operations if op.file_id == "source" and op.action == "RENAME"), "Source renamed")
+
+    def test_wrong_native_mime_suffix_is_not_normalized(self):
+        set_cell(self.export, "Proposed Renames", 1, "Proposed name + type suffix", "Source renamed.gsheet")
+        self.refresh_rename_review()
+        result = self.run_import()
+        self.assertIsNone(result.plan)
+        self.assertEqual(result.manifest["section_reason_code"], "WORKBOOK_RENAME_TARGET_MISMATCH")
+
+    def test_uploaded_file_binding_cannot_override_workbook(self):
+        self.states["source"]["mime_type"] = "application/pdf"
+        self.states["source"]["name"] = "Minutes.pdf"
+        set_cell(self.export, "Proposed Renames", 1, "Proposed name + type suffix", "Source renamed.pdf")
+        binding = next(item for item in self.projection["rename_bindings"] if item["source_id"] == "source")
+        operation = next(item for item in self.projection["operations"] if item["reference"] == binding["reference"])
+        binding["exact_current_name"] = "Minutes.pdf"
+        binding["exact_target_name"] = operation["exact_target_name"] = "Other title.pdf"
+        self.refresh_rename_review()
+        result = self.run_import()
+        self.assertIsNone(result.plan)
+        self.assertEqual(result.manifest["section_reason_code"], "WORKBOOK_RENAME_TARGET_MISMATCH")
 
     def test_source_parent_rename_collision_needs_reviewed_strategy(self):
         context = self.journal.read_evidence(self.context_ref)

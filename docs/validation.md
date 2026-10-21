@@ -1,13 +1,31 @@
 # Validation evidence
 
-Draft review checkpoint, macOS/Python 3.14.7, 2026-10-21.
+Validated on macOS/Python 3.14.7, 2026-10-21.
 
-`python3 -m unittest discover -s tests -v` passed **230 tests in 13.318 seconds** at this checkpoint. This is synthetic/local verification, not a real Drive pilot.
+`python3 -m unittest discover -s tests -v` passed **280 tests in 14.492 seconds**. All remote actions in these tests are synthetic fixtures or imported synthetic receipts. No actual Drive action was invoked.
 
-Coverage includes durable journals/evidence/backups; workbook and conversational section import; separate move/rename operations; dependency and exclusion checks; exact target-mode provenance; optional metadata without invented values; default-disabled agent handoff; uncertain-result fences; reverse plans; status projections; and publication failures independent of action outcomes. Seven collision tests include 32 duplicate-name pairs/64 preserved IDs and restart between peers. Eight name-policy tests include dotted stems, missing or wrong extensions, MIME-evidenced corrections, native display suffix rejection and exact historical restoration.
+| Area | Tests |
+| --- | ---: |
+| Journal integrity, durable evidence, locks and backups | 17 |
+| Read request/receipt bridge | 15 |
+| Fixture execution and rollback | 32 |
+| Workbook importer | 21 |
+| Section approval, exact names, method and origin | 63 |
+| Section-to-agent metadata integration | 3 |
+| Partial metadata and agent plan validation | 23 |
+| Agent rollback lineage and descendant chains | 16 |
+| Fixture and agent action handoff | 49 |
+| CLI boundaries and configured policy | 6 |
+| Known duplicate-name preservation | 7 |
+| MIME/name correction and exact restoration | 9 |
+| Private/public projections and publication recovery | 19 |
 
-The earlier fixture engine tests inject failures at 28 boundaries. Action-bridge tests cover preparation, attempted-before-ticket ordering, duplicate ticket denial, raw receipt storage, reconciliation and process restart. A raw success response alone does not produce verified application. Fixture CAS is a mock capability; agent mode records the missing remote atomic precondition.
+The fixture engine covers 28 injected crash boundaries. The handoff suite injects failures before/after agent authority, preparation, attempted-before-ticket, result, uncertainty and reconciliation transitions. It checks unknown outcomes, completion before local receipt, consumed-ticket loss, known pre-dispatch refusal, dependency baselines, fresh receipts, known metadata omission, audience drift and named descendant drift. No fixture CAS behavior is claimed for the actual connector.
 
-**This draft is not cleared for dispatch.** Independent review is still closing two concrete gaps: register/dispatch-time rollback postimage lineage (including two separately prepared inverse candidates), and binding known destination audience baselines to the accepted exposure review. Final integrated tests and the exact real 423-operation import remain pending. The local configured real journal has no APPROVED, PREPARED or ATTEMPTED events; its pause is active and agent handoff is disabled.
+Collision tests preserve 32 pairs/64 distinct IDs, including restart between pair members. Name tests cover dotted stems, dates, missing/wrong historical extensions, PDF/PNG/HEIF MIME-evidenced correction, native Google display suffix rejection and exact inverse titles. Rollback tests reject unrelated manual baselines, duplicate inverses and active dependencies.
 
-Parent-reported independent source/name audits are separate evidence, not claimed as local test results. Only workbook schema/metadata was read by this task. No source contents, live source mutations, permission operations or public publication were performed. Synthetic test success does not establish exactly-once delivery, hardware power-loss survival, remote inverse capability, or truth of supplied provenance.
+The CLI handoff demo independently produced one mock dispatch, RECONCILED_AT_TARGET, duplicate-ticket rejection and zero external calls. A private six-event policy/evidence checkpoint was backed up and verified locally; the real journal has no approval, preparation or attempted action records. Its validation hold remains active and agent handoff is disabled.
+
+Independent code review found no remaining blocker in the reviewed implementation delta. Actual raw evidence for the 423-operation section has not been imported locally. Section cancellation/expiry/supersession is tested at the authority validator and its handoff call sites were inspected; a full section-import-to-cancelled-handoff integration is not included. Read-only live work in this task inspected workbook metadata/schema only.
+
+See [audit findings](audit-findings.md) and [handoff protocol](action-handoff.md) for remaining exact-manifest, provenance, fresh-read, backup and controller-release requirements. Tests do not certify a live pilot, hardware power-loss survival, permission restoration or exactly-once remote delivery.

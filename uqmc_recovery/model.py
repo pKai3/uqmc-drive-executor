@@ -18,6 +18,7 @@ NATIVE = {
 MIME_EXTENSIONS = {"application/pdf": {".pdf"}, "image/png": {".png"},
                    "image/jpeg": {".jpg", ".jpeg"}, "image/gif": {".gif"},
                    "image/webp": {".webp"}, "image/heic": {".heic"},
+                   "image/heif": {".heif"},
                    "image/tiff": {".tif", ".tiff"}}
 
 
@@ -79,21 +80,121 @@ def validate_extension_evidence(journal, op):
 
 
 def validate_rollback_links(journal, plan):
+    """Bind inverse candidates to frozen, verified originals and exact images.
+
+    This is a local lineage check, not a live read or authority grant. The
+    handoff must still compare fresh metadata against the frozen inverse image.
+    """
+    inverse_ops = [op for op in plan.ordered() if op.direction == "ROLLBACK"]
+    if not inverse_ops:
+        return
+    if len(inverse_ops) != len(plan.operations):
+        raise SafetyError("MIXED_ROLLBACK_PLAN")
+    selected = {op.original_operation_id for op in inverse_ops}
+    if len(selected) != len(inverse_ops):
+        raise SafetyError("DUPLICATE_ROLLBACK_ORIGINAL")
     records = journal.records()
-    for op in plan.operations:
-        if op.direction != "ROLLBACK":
-            continue
+    verified = {"VERIFIED_APPLIED", "RECONCILED_AT_TARGET"}
+    action_states = verified | {"PREPARED", "ATTEMPTED", "UNCERTAIN", "FAILED_NOT_APPLIED", "BLOCKED_CONFLICT", "SKIPPED"}
+    latest = {}
+    for event in records:
+        if event["operation_id"] and event["kind"] in action_states:
+            latest[event["operation_id"]] = event
+    own_ids = {op.operation_id for op in inverse_ops}
+    if any(event["operation_id"] not in own_ids and (event["kind"] in {"ATTEMPTED", "UNCERTAIN"}
+           or (event["kind"] == "PREPARED" and event["payload"].get("bridge"))) for event in latest.values()):
+        raise SafetyError("RECONCILE_BEFORE_ROLLBACK")
+    originals, images, compare, original_plans = {}, {}, {}, {}
+    for op in inverse_ops:
         source = [r for r in records if r["operation_id"] == op.original_operation_id
-                  and r["kind"] in {"VERIFIED_APPLIED", "RECONCILED_AT_TARGET"}
-                  and r["payload"].get("direction") == "FORWARD"]
+                  and r["kind"] in verified and r["payload"].get("direction") == "FORWARD"]
         if not source:
             raise SafetyError("ROLLBACK_ORIGINAL_NOT_VERIFIED")
         event = source[-1]
-        before = journal.read_evidence(event["payload"]["before_ref"])
-        key = "name" if op.action == "RENAME" else "parents"
-        if (event["payload"]["file_id"] != op.file_id or event["payload"]["action"] != op.action
-                or op.target != {key: before[key]}):
+        payload = event["payload"]
+        if latest[op.original_operation_id]["kind"] not in verified:
+            raise SafetyError("ROLLBACK_STATE_REQUIRES_RECONCILIATION")
+        prior_inverses = [r for r in records if r["kind"] in verified
+                          and r["payload"].get("direction") == "ROLLBACK"
+                          and r["payload"].get("original_operation_id") == op.original_operation_id]
+        if any(r["operation_id"] != op.operation_id or r["payload"].get("proposal_hash") != plan.proposal_hash for r in prior_inverses):
+            raise SafetyError("ROLLBACK_ALREADY_REVERTED")
+        drafts = [r for r in records if r["kind"] == "DRAFTED"
+                  and r["payload"].get("run_id") == payload.get("run_id")
+                  and r["payload"].get("proposal_hash") == payload.get("proposal_hash")]
+        if not drafts:
+            raise SafetyError("ROLLBACK_ORIGINAL_NOT_FROZEN")
+        body = journal.read_evidence(drafts[-1]["payload"]["plan_ref"])
+        if digest(body) != payload.get("proposal_hash"):
+            raise SafetyError("ROLLBACK_FROZEN_PLAN_MISMATCH")
+        forward = Plan(body["run_id"], body["batch_id"], body["proposal_revision"],
+                       tuple(Operation(**item) for item in body["operations"]), tuple(body.get("excluded_ids", ())))
+        matches = [item for item in forward.operations if item.operation_id == op.original_operation_id]
+        if len(matches) != 1 or matches[0].direction != "FORWARD":
+            raise SafetyError("ROLLBACK_ORIGINAL_NOT_IN_FROZEN_PLAN")
+        original = matches[0]
+        if drafts[-1]["payload"].get("profile") == "AGENT_ASSISTED":
+            from .agent_profile import agent_semantic, agent_postimage_matches
+            comparator = agent_semantic
+            postimage_matches = lambda intended, observed: agent_postimage_matches(original, intended, observed)
+        else:
+            comparator = semantic
+            postimage_matches = lambda intended, observed: semantic(intended) == semantic(observed)
+        if any(not payload.get(key) for key in ("before_ref", "intended_ref", "observed_ref")):
+            raise SafetyError("ROLLBACK_EXACT_IMAGES_REQUIRED")
+        before, intended, after = [journal.read_evidence(payload[key]) for key in ("before_ref", "intended_ref", "observed_ref")]
+        field = "name" if op.action == "RENAME" else "parents"
+        if (payload.get("file_id") != op.file_id or payload.get("action") != op.action
+                or original.file_id != op.file_id or original.action != op.action
+                or op.target != {field: before[field]}):
             raise SafetyError("ROLLBACK_NOT_EXACT_PREIMAGE")
+        if comparator(before) != comparator(original.before):
+            raise SafetyError("ROLLBACK_PREIMAGE_MISMATCH")
+        if (any(intended[key] != original.intended(before)[key] for key in ("id", "name", "mime_type", "parents"))
+                or not postimage_matches(intended, after)):
+            raise SafetyError("ROLLBACK_EXACT_POSTIMAGE_REQUIRED")
+        originals[op.original_operation_id] = original
+        images[op.original_operation_id] = (before, after)
+        compare[op.original_operation_id] = comparator
+        original_plans[forward.proposal_hash] = forward
+    inverse_closure = {}
+    by_original = {op.original_operation_id: op for op in inverse_ops}
+    reverted = {r["payload"].get("original_operation_id") for r in records
+                if r["kind"] in verified and r["payload"].get("direction") == "ROLLBACK"}
+    for op in inverse_ops:
+        inverse_closure[op.operation_id] = set(op.depends_on)
+        for dep in op.depends_on:
+            inverse_closure[op.operation_id] |= inverse_closure[dep]
+    for forward in original_plans.values():
+        closure = {}
+        for original in forward.ordered():
+            closure[original.operation_id] = set(original.depends_on)
+            for dep in original.depends_on:
+                closure[original.operation_id] |= closure[dep]
+            active = original.operation_id in latest and latest[original.operation_id]["kind"] in verified and original.operation_id not in reverted
+            if active and original.operation_id not in selected and closure[original.operation_id] & selected:
+                raise SafetyError("ROLLBACK_HAS_ACTIVE_DEPENDENTS")
+            if original.operation_id in selected:
+                for predecessor in closure[original.operation_id] & selected:
+                    if by_original[original.operation_id].operation_id not in inverse_closure[by_original[predecessor].operation_id]:
+                        raise SafetyError("ROLLBACK_DEPENDENCY_ORDER")
+    simulated, child_changes = {}, []
+    for op in inverse_ops:
+        before, after = images[op.original_operation_id]
+        baseline = copy.deepcopy(simulated.get(op.file_id, after))
+        for child_id, previous_name, restored_name in child_changes:
+            for member in (baseline.get("subtree") or {}).get("members", []):
+                if member["id"] == child_id and "name" in member:
+                    if member["name"] == previous_name:
+                        member["name"] = restored_name
+                    elif member["name"] != restored_name:
+                        raise SafetyError("ROLLBACK_DESCENDANT_CHAIN_DRIFT")
+        comparator = compare[op.original_operation_id]
+        if comparator(baseline) != comparator(after) or comparator(op.before) != comparator(baseline):
+            raise SafetyError("ROLLBACK_POSTIMAGE_BASELINE_MISMATCH")
+        simulated[op.file_id] = copy.deepcopy(before)
+        if op.action == "RENAME":
+            child_changes.append((op.file_id, after["name"], before["name"]))
 
 
 class SafetyError(RuntimeError):

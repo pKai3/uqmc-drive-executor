@@ -183,6 +183,8 @@ class ActionBridge:
         if any(r["kind"] == "REVOKED" and r["payload"].get("approval_id") == approval.approval_id
                for r in self.journal.records()):
             raise SafetyError("APPROVAL_REVOKED")
+        from .section_importer import validate_section_authority
+        return validate_section_authority(self.journal, plan)
 
     def _provenance(self, reference, kind):
         evidence = self.journal.read_evidence(reference)
@@ -202,9 +204,11 @@ class ActionBridge:
             if self.mode != "AGENT_ASSISTED":
                 raise SafetyError("AGENT_MODE_REQUIRED")
             self._frozen(plan, plan.operations[0].operation_id)
-            self._agent_approval(plan, approval)
+            section_authority = self._agent_approval(plan, approval)
             authorization = copy.deepcopy(authorization_evidence)
             enable = copy.deepcopy(enable_evidence)
+            if authorization.get("section_authority") != section_authority:
+                raise SafetyError("AGENT_SECTION_AUTHORITY_BINDING_REQUIRED")
             if (authorization.get("kind") != "EXPLICIT_BATCH_AUTHORIZATION"
                     or authorization.get("authority") != "human_user" or authorization.get("authorized") is not True
                     or authorization.get("actor") != approval.actor
@@ -223,6 +227,7 @@ class ActionBridge:
                     or type(exposure.get("unknown_exposure")) is not bool
                     or authorization.get("access_policy") != "SCOPED_EXPOSURE_ACCEPTED"):
                 raise SafetyError("AGENT_SCOPED_EXPOSURE_APPROVAL_REQUIRED")
+            self._agent_exposure_baselines(plan, exposure)
             if (enable.get("kind") != "DISPATCH_ENABLE_REVIEW" or enable.get("controller_id") != self.controller_id
                     or enable.get("proposal_hash") != plan.proposal_hash or enable.get("approval_id") != approval.approval_id
                     or enable.get("authorization_hash") != digest(authorization)
@@ -265,7 +270,7 @@ class ActionBridge:
                 {"controller_id": self.controller_id, "reason_code": reason_code}, 0)
 
     def _agent_authority(self, plan, approval):
-        self._agent_approval(plan, approval)
+        section_authority = self._agent_approval(plan, approval)
         controls = [r for r in self.journal.records() if r["kind"] in
                     {"HANDOFF_DISPATCH_ENABLED", "HANDOFF_DISPATCH_DISABLED"}]
         if not controls or controls[-1]["kind"] != "HANDOFF_DISPATCH_ENABLED":
@@ -281,11 +286,52 @@ class ActionBridge:
                 raise SafetyError("AGENT_ENABLE_SCOPE_MISMATCH")
         enable = self.journal.read_evidence(p["enable_ref"])
         authorization = self.journal.read_evidence(p["authorization_ref"])
+        if authorization.get("section_authority") != section_authority:
+            raise SafetyError("AGENT_SECTION_AUTHORITY_CHANGED")
         if (enable["authorization_hash"] != digest(authorization)
                 or authorization["approval_hash"] != digest(approval.body())
                 or datetime.now(timezone.utc) >= parsed(enable["expires_at"])):
             raise SafetyError("AGENT_ENABLE_STALE")
         return p
+
+    @staticmethod
+    def _agent_access(value):
+        """Freeze available audience evidence without turning unknown into none."""
+        return {key: copy.deepcopy(value.get(key)) for key in ("permissions", "owners", "access")}
+
+    def _agent_exposure_baselines(self, plan, exposure):
+        from .agent_profile import agent_snapshot
+        required = {op.file_id for op in plan.operations}
+        for op in plan.operations:
+            required |= set(op.before["parents"]) | set(op.target.get("parents", []))
+        references = exposure.get("access_baselines")
+        if not isinstance(references, dict) or set(references) != required:
+            raise SafetyError("AGENT_APPROVED_ACCESS_BASELINES_REQUIRED")
+        baselines = {}
+        for file_id, reference in references.items():
+            value = agent_snapshot(self.journal.read_evidence(reference))
+            if value["id"] != file_id:
+                raise SafetyError("AGENT_ACCESS_BASELINE_ID_MISMATCH")
+            baselines[file_id] = self._agent_access(value)
+        return baselines
+
+    def _agent_approved_access(self, plan, authority, before, check, dependency_states):
+        authorization = self.journal.read_evidence(authority["authorization_ref"])
+        exposure = self._provenance(authorization["exposure_review_ref"], "SCOPED_EXPOSURE_REVIEW")
+        baselines = self._agent_exposure_baselines(plan, exposure)
+        # An approved preceding move can change the observed inherited grants
+        # of a folder subsequently used as a parent. Only verified dependency
+        # evidence may advance that audience baseline, never the new read.
+        for event in sorted(dependency_states, key=lambda item: item["seq"]):
+            file_id = event["payload"].get("file_id")
+            if file_id in baselines:
+                observed = self.journal.read_evidence(event["payload"]["observed_ref"])
+                if observed.get("id") != file_id:
+                    raise SafetyError("AGENT_DEPENDENCY_ACCESS_ID_MISMATCH")
+                baselines[file_id] = self._agent_access(observed)
+        for value in [before, *check["parents"].values()]:
+            if self._agent_access(value) != baselines[value["id"]]:
+                raise SafetyError("AGENT_APPROVED_ACCESS_BASELINE_DRIFT")
 
     def _agent_read(self, value, proof, minimum_time=None):
         from .agent_profile import agent_snapshot
@@ -324,9 +370,11 @@ class ActionBridge:
                    "shortcut_details": ("shortcut_details", "shortcutDetails"),
                    "md5_checksum": ("md5_checksum", "md5Checksum"), "size": ("size",), "access": ("access",)}
         for field, keys in aliases.items():
-            if current.get(field) is None:
-                continue
             found = [raw[key] for key in keys if key in raw]
+            if current.get(field) is None:
+                if any(value is not None for value in found):
+                    raise SafetyError("AGENT_KNOWN_OPTIONAL_FIELD_DROPPED")
+                continue
             if not found or any(value != current[field] for value in found):
                 raise SafetyError("AGENT_OPTIONAL_FIELD_UNPROVEN")
         return current
@@ -348,6 +396,20 @@ class ActionBridge:
         out["expected_after"] = agent_semantic(out["expected_after"])
         return out
 
+    @staticmethod
+    def _agent_member_fields(prior, current, removed=(), renames=None):
+        """Preserve every previously observed member field, allowing exact edits."""
+        after = {member["id"]: member for member in (current.get("subtree") or {}).get("members", [])}
+        for member in (prior.get("subtree") or {}).get("members", []):
+            if member["id"] in removed:
+                continue
+            expected = dict(member)
+            if renames and member["id"] in renames and "name" in expected:
+                expected["name"] = renames[member["id"]]
+            actual = after.get(member["id"], {})
+            if any(actual.get(key) != value for key, value in expected.items()):
+                raise SafetyError("AGENT_KNOWN_MEMBER_FIELD_DRIFT")
+
     def _agent_checks(self, op, before, check, plan, approval, *, source=None, minimum_time=None, controller_id=None):
         from .agent_profile import agent_snapshot, agent_semantic
         if not isinstance(check, dict) or check.get("complete") is not True or check.get("no_cycle") is not True:
@@ -360,6 +422,8 @@ class ActionBridge:
             parent = self._agent_read(value, check["parent_reads"][file_id], minimum_time)
             if parent["id"] != file_id or parent["mime_type"] != FOLDER:
                 raise SafetyError("INVALID_PARENT")
+            if parent["subtree"].get("membership_scope") not in {"DIRECT_CHILDREN", "DESCENDANTS"}:
+                raise SafetyError("AGENT_PARENT_MEMBERSHIP_SCOPE_REQUIRED")
         collisions = check.get("collision_ids")
         if not isinstance(collisions, list) or not set(collisions) <= set(getattr(op, "allowed_collision_ids", ())):
             raise SafetyError("UNAPPROVED_NAME_COLLISION")
@@ -375,10 +439,14 @@ class ActionBridge:
                 or sorted(collision.get("collision_ids", [])) != sorted(collisions)):
             raise SafetyError("AGENT_COLLISION_REVIEW_MISMATCH")
         if before["mime_type"] == FOLDER:
+            if before["subtree"].get("membership_scope") != "DESCENDANTS":
+                raise SafetyError("AGENT_SOURCE_DESCENDANTS_REQUIRED")
             members = sorted(m["id"] for m in (source or before)["subtree"]["members"])
             membership = self._provenance(check.get("membership_ref"), "COMPLETE_MEMBERSHIP_READ")
             if (membership.get("root_id") != op.file_id or membership.get("complete") is not True
-                    or membership.get("pagination_complete") is not True or sorted(membership.get("member_ids", [])) != members):
+                    or membership.get("pagination_complete") is not True
+                    or membership.get("membership_scope") != "DESCENDANTS"
+                    or sorted(membership.get("member_ids", [])) != members):
                 raise SafetyError("AGENT_MEMBERSHIP_INCOMPLETE")
             membership_time = parsed(membership["observed_at"])
             if not clock - timedelta(seconds=60) <= membership_time <= clock or (minimum_time and membership_time < parsed(minimum_time)):
@@ -402,9 +470,11 @@ class ActionBridge:
         return expected
 
     def _validate_agent(self, plan, op_id, approval, before, preflight):
-        from .agent_profile import agent_snapshot, agent_semantic
+        from .agent_profile import agent_snapshot, agent_semantic, adjust_descendant_renames
+        from .model import validate_rollback_links
         op, plan_ref = self._frozen(plan, op_id)
         authority = self._agent_authority(plan, approval)
+        validate_rollback_links(self.journal, plan)
         records = self.journal.records()
         excluded = {WITHDRAWN_ID} | set(plan.excluded_ids) | {r["payload"]["file_id"] for r in records if r["kind"] == "EXCLUDED"}
         excluded_refs = {r["payload"]["proposal_ref"] for r in records if r["kind"] == "PROPOSAL_EXCLUDED"}
@@ -426,15 +496,17 @@ class ActionBridge:
         same = [r for r in dependency_states if r["payload"].get("file_id") == op.file_id]
         if same:
             known = agent_snapshot(self.journal.read_evidence(max(same, key=lambda r: r["seq"])["payload"]["observed_ref"]))
+            known = adjust_descendant_renames(known, dependency_states, self.journal)
+            baseline = adjust_descendant_renames(baseline, dependency_states, self.journal)
             if agent_semantic(known) != agent_semantic(baseline):
                 raise SafetyError("DEPENDENCY_BASELINE_MISMATCH")
             baseline = known
-        from .agent_profile import adjust_descendant_renames
         baseline = adjust_descendant_renames(baseline, dependency_states, self.journal)
         before = agent_snapshot(before)
         if self._agent_exact(before) != self._agent_exact(baseline):
             raise SafetyError("HANDOFF_BASELINE_DRIFT")
         expected = self._agent_checks(op, before, preflight, plan, approval)
+        self._agent_approved_access(plan, authority, before, preflight, dependency_states)
         scope = {op.file_id} | set(before["parents"]) | set(op.target.get("parents", []))
         scope |= set(preflight.get("ancestor_ids", []))
         scope |= {m["id"] for m in (before.get("subtree") or {}).get("members", [])}
@@ -498,8 +570,11 @@ class ActionBridge:
                 envelope, event = self._load(previous[-1]["payload"]["envelope_hash"])
                 same_before = (self._agent_exact(self.journal.read_evidence(envelope["before_ref"])) == self._agent_exact(before)
                                if self.mode == "AGENT_ASSISTED" else self.journal.read_evidence(envelope["before_ref"]) == before)
+                saved_check = self.journal.read_evidence(envelope["preflight_ref"])
+                same_check = (self._agent_safety(saved_check) == self._agent_safety(check)
+                              if self.mode == "AGENT_ASSISTED" else saved_check == check)
                 if (envelope["approval_ref"] != approval_ref or not same_before
-                        or self.journal.read_evidence(envelope["preflight_ref"]) != check):
+                        or not same_check):
                     raise SafetyError("HANDOFF_PREPARED_CHANGED")
                 self._reservation(scope, envelope["envelope_hash"])
                 return envelope
@@ -703,22 +778,35 @@ class ActionBridge:
             raise SafetyError("HANDOFF_TERMINAL_PROOF_MISMATCH")
         attempted = [r for r in self._events(envelope["envelope_hash"]) if r["kind"] == "ATTEMPTED"][0]
         minimum_time = attempted["at"]
+        not_dispatched = terminal.get("kind") == "AGENT_TOOL_NOT_DISPATCHED"
         if terminal["terminal"]:
-            if terminal.get("kind") != "AGENT_TOOL_COMPLETED":
+            if terminal.get("kind") not in {"AGENT_TOOL_COMPLETED", "AGENT_TOOL_NOT_DISPATCHED"}:
                 raise SafetyError("AGENT_TERMINAL_COMPLETION_REQUIRED")
             receipts = [r for r in self._events(envelope["envelope_hash"]) if r["kind"] == "HANDOFF_RESULT_RECEIVED"
                         and r["payload"]["response_ref"] == terminal.get("response_ref")]
             if len(receipts) != 1:
                 raise SafetyError("AGENT_TERMINAL_RECEIPT_REQUIRED")
             receipt = self.journal.read_evidence(terminal["response_ref"])
-            completion = self._provenance(terminal.get("provenance_ref"), "TRUSTED_TOOL_COMPLETION")
+            completion = self._provenance(terminal.get("provenance_ref"),
+                         "TRUSTED_TOOL_NONDISPATCH" if not_dispatched else "TRUSTED_TOOL_COMPLETION")
             raw = receipt["raw"]
             returned = raw.get("structuredContent", {})
-            if (raw.get("isError") is True or not isinstance(returned, dict) or returned.get("id") != envelope["file_id"]
-                    or completion.get("outcome") != "completed_success" or not completion.get("tool_call_id")
-                    or completion.get("tool") != AGENT_TOOL or completion.get("args_hash") != digest(envelope["args"])
+            if (not completion.get("tool_call_id") or completion.get("tool") != AGENT_TOOL
+                    or completion.get("args_hash") != digest(envelope["args"])
                     or completion.get("raw_response_hash") != digest(raw)
                     or not parsed(attempted["at"]) <= parsed(completion["completed_at"]) <= datetime.now(timezone.utc)):
+                raise SafetyError("AGENT_TERMINAL_COMPLETION_UNPROVEN")
+            if not_dispatched:
+                # Only an explicit trusted dispatcher attestation that no
+                # external request was sent can release a refused attempt.
+                # A network error, timeout, or ordinary API error is insufficient.
+                if (completion.get("outcome") != "not_dispatched"
+                        or completion.get("rejection_stage") != "before_external_tool"
+                        or completion.get("dispatcher_attested") is not True
+                        or completion.get("external_request_sent") is not False):
+                    raise SafetyError("AGENT_NONDISPATCH_UNPROVEN")
+            elif (raw.get("isError") is True or not isinstance(returned, dict)
+                    or returned.get("id") != envelope["file_id"] or completion.get("outcome") != "completed_success"):
                 raise SafetyError("AGENT_TERMINAL_COMPLETION_UNPROVEN")
             minimum_time = completion["completed_at"]
         elif terminal.get("kind") != "AGENT_UNRESOLVED":
@@ -746,6 +834,14 @@ class ActionBridge:
             at_before = core(observed) == core(before) and members(observed) == members(before)
             if not at_target and not at_before:
                 raise SafetyError("AGENT_OBSERVED_METADATA_DRIFT")
+            if at_before and not not_dispatched:
+                # Positive completion disagrees with the observed preimage.
+                # A later preimage may be a manual reversal; it cannot establish
+                # that the request was never applied, or release its reservation.
+                raise SafetyError("AGENT_COMPLETED_SUCCESS_PREIMAGE_CONFLICT")
+            if not_dispatched and (not at_before or self._agent_exact(observed) != self._agent_exact(before)):
+                raise SafetyError("AGENT_NONDISPATCH_PREIMAGE_DRIFT")
+            self._agent_member_fields(intended if at_target else before, observed)
             stable = {"owners", "drive_id", "shortcut_details", "md5_checksum", "size"}
             if op.action == "RENAME" or at_before:
                 stable |= {"permissions", "access", "capabilities"}
@@ -760,7 +856,6 @@ class ActionBridge:
                     raise SafetyError("AGENT_DIRECT_PERMISSION_DRIFT")
             # A move predictably changes the full membership of its two direct
             # parent folders. Preserve every unrelated member by stable ID.
-            moving = {op.file_id} | members(before)
             for parent_id, prior in baseline_check["parents"].items():
                 after_parent = postflight["parents"][parent_id]
                 if core(prior) != core(after_parent):
@@ -769,6 +864,10 @@ class ActionBridge:
                 if any(prior.get(key) is not None and after_parent.get(key) != prior[key] for key in stable_parent):
                     raise SafetyError("AGENT_PARENT_KNOWN_FIELD_DRIFT")
                 expected_members = members(prior)
+                scope = prior["subtree"].get("membership_scope")
+                if scope != after_parent["subtree"].get("membership_scope"):
+                    raise SafetyError("AGENT_PARENT_MEMBERSHIP_SCOPE_DRIFT")
+                moving = {op.file_id} if scope == "DIRECT_CHILDREN" else {op.file_id} | members(before)
                 if at_target and op.action == "MOVE":
                     if parent_id in set(before["parents"]) - set(intended["parents"]):
                         expected_members -= moving
@@ -776,9 +875,18 @@ class ActionBridge:
                         expected_members |= moving
                 if members(after_parent) != expected_members:
                     raise SafetyError("AGENT_PARENT_MEMBERSHIP_DRIFT")
-            kind = "RECONCILED_AT_TARGET" if at_target else "FAILED_NOT_APPLIED"
-            reason = ("OBSERVED_TARGET_ATTRIBUTION_UNCERTAIN" if at_target
-                      else "TERMINAL_PREIMAGE_OBSERVED_ATTRIBUTION_UNCERTAIN")
+                removed = members(prior) - expected_members
+                renames = {op.file_id: intended["name"]} if at_target and op.action == "RENAME" else {}
+                self._agent_member_fields(prior, after_parent, removed, renames)
+                if at_target and op.action == "MOVE":
+                    known_names = {member["id"]: member["name"] for member in
+                                   (before.get("subtree") or {}).get("members", []) if "name" in member}
+                    known_names[op.file_id] = intended["name"]
+                    for member in after_parent["subtree"]["members"]:
+                        if member["id"] in moving and "name" in member and member["name"] != known_names.get(member["id"], member["name"]):
+                            raise SafetyError("AGENT_MOVED_MEMBER_NAME_DRIFT")
+            kind, reason = (("FAILED_NOT_APPLIED", "TRUSTED_NONDISPATCH_AND_EXACT_PREIMAGE") if not_dispatched else
+                            ("RECONCILED_AT_TARGET", "OBSERVED_TARGET_ATTRIBUTION_UNCERTAIN"))
         except (SafetyError, KeyError, TypeError, AttributeError, ValueError):
             kind, reason = "BLOCKED_CONFLICT", "AGENT_READBACK_OR_MEMBERSHIP_CONFLICT"
         payload.update(reason_code=reason, reconciled_at=now())

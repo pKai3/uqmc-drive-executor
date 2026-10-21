@@ -92,6 +92,20 @@ def agent_semantic(value):
     return {key: val for key, val in agent_snapshot(value).items() if key not in _INFORMATIONAL}
 
 
+def agent_postimage_matches(op, intended, observed):
+    """Accept verified MOVE access readback without pretending it was predicted.
+
+    Inheritance can change grants/capabilities when a parent changes. The exact
+    observed values remain the inverse baseline; all other fields still match.
+    """
+    expected, actual = agent_semantic(intended), agent_semantic(observed)
+    if op.action == "MOVE":
+        for field in ("permissions", "access", "capabilities"):
+            expected.pop(field, None)
+            actual.pop(field, None)
+    return expected == actual
+
+
 def adjust_descendant_renames(state, dependency_events, journal):
     """Apply only verified, known child-title changes to a container preimage.
 
@@ -100,6 +114,7 @@ def adjust_descendant_renames(state, dependency_events, journal):
     """
     result = copy.deepcopy(state)
     members = {member["id"]: member for member in _members(result)}
+    changes = {}
     for event in sorted(dependency_events, key=lambda event: event["seq"]):
         payload = event.get("payload", {})
         if event.get("kind") not in {"VERIFIED_APPLIED", "RECONCILED_AT_TARGET"} or payload.get("action") != "RENAME":
@@ -116,11 +131,15 @@ def adjust_descendant_renames(state, dependency_events, journal):
             raise SafetyError("DESCENDANT_RENAME_IDENTITY_MISMATCH")
         if before.get("mime_type") != observed.get("mime_type") or before.get("parents") != observed.get("parents"):
             raise SafetyError("DESCENDANT_RENAME_SCOPE_MISMATCH")
-        if member["name"] == observed["name"]:
-            continue
-        if member["name"] != before["name"]:
+        chain = changes.setdefault(source_id, [before["name"]])
+        if chain[-1] != before["name"]:
+            raise SafetyError("DESCENDANT_RENAME_EVIDENCE_CHAIN_MISMATCH")
+        chain.append(observed["name"])
+    for source_id, chain in changes.items():
+        member = members[source_id]
+        if member["name"] not in chain:
             raise SafetyError("DESCENDANT_RENAME_BASELINE_MISMATCH")
-        member["name"] = observed["name"]
+        member["name"] = chain[-1]
     return result
 
 
@@ -216,7 +235,7 @@ def _verified_images(journal, plan, op, event):
     if agent_semantic(before) != agent_semantic(op.before):
         raise SafetyError("ROLLBACK_PREIMAGE_MISMATCH")
     if (any(intended[key] != op.intended(before)[key] for key in ("id", "name", "mime_type", "parents"))
-            or agent_semantic(after) != agent_semantic(intended)):
+            or not agent_postimage_matches(op, intended, after)):
         raise SafetyError("ROLLBACK_EXACT_POSTIMAGE_REQUIRED")
     return before, after
 

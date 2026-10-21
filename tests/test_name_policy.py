@@ -51,6 +51,9 @@ class NamePolicyTests(unittest.TestCase):
     def test_mislabeled_png_corrected_then_historical_pdf_title_restored(self):
         self.roundtrip("Fixture FA.pdf", "2024.03.02 - Certificate.png", "image/png", correction=True)
 
+    def test_heif_mime_corrects_wrong_cpr_suffix_and_restores_exactly(self):
+        self.roundtrip("Fixture_Wilderness_FA.CPR", "2024.03.02 - Certificate.heif", "image/heif", correction=True)
+
     def test_mime_correction_without_explicit_evidence_rejected(self):
         op = Operation("op", "fixture-file", "RENAME", fixture_state("fixture-file", "Wrong.pdf", "image/png"),
                        {"name": "Correct.png"})

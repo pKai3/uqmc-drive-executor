@@ -90,6 +90,20 @@ class ActionCLITests(unittest.TestCase):
         self.assertIn("REVIEWED_SECTION_PROFILE_REQUIRED", result.stderr)
         self.assertEqual(Journal(self.private / "state").records(), [])
 
+    def test_generic_agent_plan_cannot_bypass_configured_method_at_authorization(self):
+        policy_path = self.private / "policy.json"
+        policy = json.loads(policy_path.read_text())
+        policy.update(required_method_profile="existing_folder_consolidation", agent_handoff_enabled=True)
+        policy_path.write_text(json.dumps(policy))
+        payload = self.root / "generic-authorize.json"
+        payload.write_text(json.dumps({"plan": self.plan.body()}))
+        args = [sys.executable, "-m", "uqmc_recovery", "--private-dir", str(self.private),
+                "authorize-agent-dispatch", "--controller-id", "fixture-controller", "--input", str(payload)]
+        result = subprocess.run(args, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("REVIEWED_SECTION_ORIGIN_REQUIRED", result.stderr)
+        self.assertEqual(Journal(self.private / "state").records(), [])
+
     def test_separate_processes_cannot_reissue_consumed_ticket(self):
         envelope = self.cli("prepare-action", self.prepare, fixture=True)
         mark = {"envelope_hash": envelope["envelope_hash"], "observed_before": self.before, "preflight": self.check}

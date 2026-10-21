@@ -42,7 +42,7 @@ Observed connector limits and the pilot gates are in [operations and recovery](d
 
 ## Evidence and recovery
 
-Events are append-only, canonical JSON with a SHA-256 chain, UUID event IDs, monotonic sequence and UTC time. Evidence is content-addressed, atomically installed, fsynced and read back. A process/thread lock serializes the full batch. Directories use `0700`; files use `0600`. Hashes detect accidental changes, but a local administrator can rewrite both history and hashes. This is not signed, hardware-immutable or exactly-once storage.
+Events are append-only, canonical JSON with a SHA-256 chain, UUID event IDs, monotonic sequence and UTC time. Evidence is content-addressed, atomically installed, fsynced and read back. A process/thread lock serializes local journal transitions; the fixture executor also holds it for its full batch. Directories use `0700`; files use `0600`. Hashes detect accidental changes, but a local administrator can rewrite both history and hashes. This is not signed, hardware-immutable or exactly-once storage.
 
 Every simulated action records full preimage, intended state, effective-access preflight and approval reference before `ATTEMPTED`. It re-reads before dispatch, checks a conditional write in the fixture, reads back afterward and records verification separately. The actual connector exposes no atomic conditional check. Agent mode records that limitation, serializes this controller and requires fresh reads, while explicitly retaining the race between the last read and the remote write. It does not invent optional metadata or claim an atomic transaction. Unknown outcomes remain fenced unless explicit terminal evidence supports reconciliation.
 

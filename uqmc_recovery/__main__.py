@@ -48,6 +48,48 @@ def plan_from_json(value):
     return Plan(**body)
 
 
+def require_policy_profile(journal, plan, policy):
+    """The configured task cannot bypass its section method by using raw JSON."""
+    profile = policy.get("required_method_profile")
+    if not profile:
+        return
+    from .section_importer import validate_section_authority
+    from .model import validate_rollback_links
+    with journal.locked():
+        if all(op.direction == "FORWARD" for op in plan.operations):
+            authority = validate_section_authority(journal, plan)
+            if not authority:
+                raise SafetyError("REVIEWED_SECTION_ORIGIN_REQUIRED")
+            origins = [journal.read_evidence(authority["section_manifest_ref"])]
+        elif plan.operations and all(op.direction == "ROLLBACK" for op in plan.operations):
+            # Cancellation must stop forwards while permitting separately
+            # approved recovery. Verify historical provenance, not old consent.
+            validate_rollback_links(journal, plan)
+            records = journal.records()
+            original_hashes = set()
+            for op in plan.operations:
+                successes = [r for r in records if r["operation_id"] == op.original_operation_id
+                             and r["kind"] in {"VERIFIED_APPLIED", "RECONCILED_AT_TARGET"}]
+                original_hashes.add(successes[-1]["payload"]["proposal_hash"])
+            origins = []
+            for original_hash in original_hashes:
+                imported = [r for r in records if r["kind"] == "SECTION_IMPORTED"
+                            and r["payload"].get("proposal_hash") == original_hash]
+                if not imported:
+                    raise SafetyError("REVIEWED_SECTION_ORIGIN_REQUIRED")
+                evidence = journal.read_evidence(imported[-1]["payload"]["manifest_ref"])
+                if digest(evidence.get("plan")) != original_hash:
+                    raise SafetyError("SECTION_PLAN_ORIGIN_MISMATCH")
+                origins.append(evidence)
+        else:
+            raise SafetyError("INVALID_TASK_DIRECTION_SCOPE")
+        for evidence in origins:
+            manifest = evidence.get("manifest", {})
+            if (manifest.get("section_approval_validated") is not True
+                    or manifest.get("authorization_scope", {}).get("method_profile") != profile):
+                raise SafetyError("METHOD_PROFILE_MISMATCH")
+
+
 def demo(root):
     """Synthetic TEST_ONLY approvals and in-memory remote state; never a pilot."""
     store = Journal(root)
@@ -308,6 +350,7 @@ def main():
         from .agent_profile import register_agent_plan
         payload = read_json(args.input)
         plan = plan_from_json(payload["plan"])
+        require_policy_profile(journal, plan, policy)
         register_agent_plan(journal, plan)
         bridge = ActionBridge(journal, mode="AGENT_ASSISTED", controller_id=args.controller_id)
         result = bridge.authorize_agent_dispatch(plan, Approval(**payload["approval"]),
@@ -321,11 +364,16 @@ def main():
         payload = read_json(args.input)
         if args.command == "prepare-action":
             plan = plan_from_json(payload["plan"])
+            if args.agent_mode:
+                require_policy_profile(action_journal, plan, policy)
             if args.fixture_mode:
                 Engine(action_journal, MockAdapter({})).register(plan)
             result = bridge.prepare_action(plan, payload["operation_id"],
                                            Approval(**payload["approval"]), payload["before"], payload["preflight"])
         elif args.command == "mark-attempt":
+            if args.agent_mode:
+                envelope, _ = bridge._load(payload["envelope_hash"])
+                require_policy_profile(action_journal, plan_from_json(action_journal.read_evidence(envelope["plan_ref"])), policy)
             result = bridge.mark_attempt(payload["envelope_hash"], payload["observed_before"], payload["preflight"])
         elif args.command == "ingest-result":
             ref = bridge.ingest_result(payload["envelope_hash"], payload["attempt_key"], payload["raw"],

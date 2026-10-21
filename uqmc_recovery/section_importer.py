@@ -61,6 +61,41 @@ def _time(value):
         raise SafetyError("SECTION_APPROVAL_TIME_INVALID") from None
 
 
+def _workbook_rename_target(journal, record, binding, before):
+    """Bind the target value, not just the row containing the proposal.
+
+    A known native display suffix may differ only with an explicit, sealed
+    conversion record. Uploaded titles and folders always match the cell.
+    """
+    proposed = record["row"].get("Proposed name + type suffix")
+    target = binding.get("exact_target_name")
+    if not isinstance(proposed, str) or not proposed:
+        raise SafetyError("WORKBOOK_PROPOSED_RENAME_REQUIRED")
+    if proposed == target:
+        return
+    suffix = {
+        "application/vnd.google-apps.document": ".gdoc",
+        "application/vnd.google-apps.spreadsheet": ".gsheet",
+        "application/vnd.google-apps.presentation": ".gslides",
+    }.get(before["mime_type"])
+    if not suffix or not isinstance(target, str) or not target or proposed != target + suffix:
+        raise SafetyError("WORKBOOK_RENAME_TARGET_MISMATCH")
+    proof_ref = binding.get("native_display_conversion_ref")
+    if not proof_ref:
+        raise SafetyError("VERIFIED_NATIVE_DISPLAY_CONVERSION_REQUIRED")
+    proof = journal.read_evidence(proof_ref)
+    expected = {
+        "schema_version": "uqmc.rename.native-display-conversion.v1",
+        "source_id": record["source_id"], "mime_type": before["mime_type"],
+        "workbook_row_sha256": record["row_sha256"],
+        "workbook_proposed_name": proposed, "exact_target_name": target,
+        "display_suffix": suffix,
+    }
+    if any(proof.get(key) != value for key, value in expected.items()) or not proof.get("provenance_ref"):
+        raise SafetyError("NATIVE_DISPLAY_CONVERSION_EVIDENCE_MISMATCH")
+    journal.read_evidence(proof["provenance_ref"])
+
+
 def _projection(projection, source, expected_section_id, expected_workbook_id):
     if projection.get("schema_version") != "uqmc.destination.section.v1":
         raise SafetyError("SECTION_SCHEMA_UNSUPPORTED")
@@ -163,6 +198,53 @@ def _approval(journal, approval_ref, projection, member_map, op_map, boundary):
         raise SafetyError("SECTION_APPROVAL_EXPIRED")
     _not_revoked(journal, approval["approval_id"])
     return approval
+
+
+def validate_section_authority(journal, plan):
+    """Recheck frozen section authority without reading Drive or editable cells.
+
+    Call under the action gate's journal lock at authorization and again before
+    preparation/dispatch. An ordinary non-section fixture plan returns None.
+    Section plans must retain their exact recorded import origin.
+    """
+    origins = [event for event in journal.records() if event["kind"] == "SECTION_IMPORTED"
+               and event["payload"].get("proposal_hash") == plan.proposal_hash]
+    if not origins:
+        if plan.proposal_revision.startswith("section:"):
+            raise SafetyError("SECTION_PLAN_ORIGIN_REQUIRED")
+        return None
+    origin = origins[-1]
+    payload = origin["payload"]
+    if payload.get("run_id") != plan.run_id or payload.get("batch_id") != plan.batch_id:
+        raise SafetyError("SECTION_PLAN_ORIGIN_MISMATCH")
+    evidence = journal.read_evidence(payload["manifest_ref"])
+    manifest, projection = evidence["manifest"], evidence["projection"]
+    binding = manifest.get("authorization_scope", {})
+    owner_ref = evidence.get("owner_approval_ref")
+    if (digest(evidence.get("plan")) != plan.proposal_hash
+            or manifest.get("schema_version") != "uqmc.section.import.v1"
+            or manifest.get("section_approval_validated") is not True
+            or manifest.get("proposal_hash") != plan.proposal_hash
+            or manifest.get("proposal_revision") != plan.proposal_revision
+            or binding.get("owner_approval_ref") != owner_ref
+            or payload.get("owner_approval_ref") != owner_ref
+            or binding.get("projection_sha256") != digest(projection)
+            or payload.get("projection_sha256") != digest(projection)):
+        raise SafetyError("SECTION_PLAN_ORIGIN_MISMATCH")
+    workbook_evidence = journal.read_evidence(evidence["workbook_import_ref"])
+    workbook_manifest = workbook_evidence["manifest"]
+    source = catalog(workbook_evidence["workbook_export"], expected_workbook_id=manifest["workbook_id"])
+    members, operations, boundary = _projection(projection, source, binding.get("section_id"), manifest["workbook_id"])
+    approval = _approval(journal, owner_ref, projection, members, operations, boundary)
+    expected_revision = "section:" + digest({"scope": binding, "workbook_revision": workbook_manifest["proposal_revision"]})
+    if expected_revision != plan.proposal_revision or binding.get("owner_approval_id") != approval["approval_id"]:
+        raise SafetyError("SECTION_PLAN_ORIGIN_MISMATCH")
+    return {"schema_version": "uqmc.section.authority-binding.v1",
+            "section_import_event_id": origin["event_id"], "section_import_event_seq": origin["seq"],
+            "section_manifest_ref": payload["manifest_ref"], "section_id": projection["section_id"],
+            "owner_approval_ref": owner_ref, "owner_approval_id": approval["approval_id"],
+            "projection_sha256": digest(projection), "proposal_hash": plan.proposal_hash,
+            "proposal_revision": plan.proposal_revision, "expires_at_utc": approval.get("expires_at_utc")}
 
 
 def _individual_profile(journal, projection, members, operations, boundary, metadata_by_id, review_context_ref):
@@ -356,8 +438,10 @@ def _reuse_profile(journal, projection, members, operations, boundary, metadata_
             raise SafetyError("RENAME_TARGET_BINDING_MISMATCH")
         if operation.get("extension_correction") != binding.get("extension_correction"):
             raise SafetyError("RENAME_EXTENSION_CORRECTION_BINDING_MISMATCH")
-        if normalize(metadata_by_id[source_id])["name"] != binding.get("exact_current_name"):
+        before = normalize(metadata_by_id[source_id])
+        if before["name"] != binding.get("exact_current_name"):
             raise SafetyError("RENAME_CURRENT_TITLE_DRIFT")
+        _workbook_rename_target(journal, record, binding, before)
     if "RENAME" in projection["allowed_actions"]:
         if set(rename_by_source) != expected | {root_id} or set(renames) != rename_refs:
             raise SafetyError("EXACT_COMPLETE_RENAME_SCOPE_REQUIRED")
@@ -416,6 +500,10 @@ def _reuse_profile(journal, projection, members, operations, boundary, metadata_
     descendants = root.get("subtree", {})
     if descendants.get("complete") is not True or {item["id"] for item in descendants.get("members", [])} != existing:
         raise SafetyError("REUSE_EXISTING_MEMBER_SCOPE_INCOMPLETE")
+    for source_id in existing:
+        state = normalize(metadata_by_id[source_id])
+        if state["id"] != source_id or state["mime_type"] == FOLDER or root_id not in state["parents"]:
+            raise SafetyError("REUSE_EXISTING_MEMBER_NOT_FILE_UNDER_ROOT")
     target_section = normalize(metadata_by_id[target["target_section_id"]])
     if target_section["id"] != target["target_section_id"] or target_section["mime_type"] != FOLDER or target["target_section_id"] in existing:
         raise SafetyError("REUSE_TARGET_SECTION_INVALID")
@@ -580,6 +668,11 @@ def import_section(journal, export, *, projection, owner_approval_ref, expected_
                         plan_ready_for_exact_batch_binding=plan is not None,
                         plan_ready_for_explicit_review=plan is not None,
                         section_reason_code=scope_reason)
+        for row in manifest["rows"]:
+            if row["state"] == "ELIGIBLE_PENDING_BATCH_APPROVAL":
+                row.update(state="ELIGIBLE_PENDING_EXACT_BATCH_BINDING",
+                           reason_code="SECTION_APPROVAL_BOUND_EXECUTION_GATES_PENDING",
+                           approval_basis="SECTION_OWNER_INSTRUCTION", approval_state="APPROVED")
         if scope_reason:
             for row in manifest["rows"]:
                 row.update(state="BLOCKED", reason_code=scope_reason)

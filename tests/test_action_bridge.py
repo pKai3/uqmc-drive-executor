@@ -418,7 +418,7 @@ class AgentAssistedBridgeTests(unittest.TestCase):
             "permissions": [{"id": "direct", "role": "writer", "permissionDetails": [{"inherited": False}]}], "version": None})
         def folder(key, members):
             return agent_snapshot({"id": key, "name": key, "mime_type": FOLDER, "parents": [], "parents_complete": True,
-                "subtree": {"complete": True, "members": [{"id": x} for x in members]},
+                "subtree": {"complete": True, "membership_scope": "DIRECT_CHILDREN", "members": [{"id": x} for x in members]},
                 "permissions": [{"id": "known-user", "role": "writer"}]})
         self.parents = {"agent-fixture-origin": folder("agent-fixture-origin", [self.before["id"]]),
                         "agent-fixture-target": folder("agent-fixture-target", [])}
@@ -436,7 +436,8 @@ class AgentAssistedBridgeTests(unittest.TestCase):
             "limitations_acknowledged": sorted(AGENT_LIMITATIONS), "access_policy": "SCOPED_EXPOSURE_ACCEPTED",
             "exposure_review_ref": self.journal.evidence({"kind": "SCOPED_EXPOSURE_REVIEW", "proposal_hash": self.plan.proposal_hash,
                 "operation_ids": list(self.approval.operation_ids), "warning_presented": True, "approved": True,
-                "newly_exposed_principals": ["synthetic-principal"], "unknown_exposure": True})}
+                "newly_exposed_principals": ["synthetic-principal"], "unknown_exposure": True,
+                "access_baselines": {value["id"]: self.journal.evidence(value) for value in [self.before, *self.parents.values()]}})}
         self.enable = {"kind": "DISPATCH_ENABLE_REVIEW", "controller_id": "synthetic-controller", "proposal_hash": self.plan.proposal_hash,
             "approval_id": self.approval.approval_id, "authorization_hash": digest(self.auth), "manifest_verified": True,
             "reviewer": "synthetic-reviewer", "reviewed_at": clock.isoformat(), "expires_at": (clock+timedelta(minutes=30)).isoformat(),
@@ -446,16 +447,18 @@ class AgentAssistedBridgeTests(unittest.TestCase):
         self.temp.cleanup()
 
     def read_proof(self, value):
-        raw = {key: copy.deepcopy(value[key]) for key in ("id", "name", "mime_type", "parents", "version", "permissions", "owners", "drive_id", "capabilities", "access") if key in value}
+        raw = {key: copy.deepcopy(value[key]) for key in ("id", "name", "mime_type", "parents", "version", "modified_time", "trashed", "permissions", "owners", "drive_id", "capabilities", "access") if key in value}
         return {"kind": "AGENT_CONNECTOR_READ", "observed_at": datetime.now(timezone.utc).isoformat(),
                 "snapshot_ref": self.journal.evidence(value), "receipt_ref": self.journal.evidence({"structuredContent": raw})}
 
-    def check(self, observed=None, parents=None, before=None):
+    def check(self, observed=None, parents=None, before=None, op=None):
         before, observed = before or self.before, observed or before or self.before
         parents = copy.deepcopy(parents or self.parents)
-        op = self.plan.operations[0]
+        op = op or self.plan.operations[0]
+        required = set(before["parents"]) | set(op.target.get("parents", []))
+        parents = {key: value for key, value in parents.items() if key in required}
         expected = op.intended(before)
-        return {"complete": True, "no_cycle": True, "parents": parents,
+        check = {"complete": True, "no_cycle": True, "parents": parents,
             "parent_reads": {key: self.read_proof(value) for key, value in parents.items()}, "source_read": self.read_proof(observed),
             "collision_ids": [], "collision_review_ref": self.journal.evidence({"kind": "COLLISION_REVIEW",
                 "proposal_hash": self.plan.proposal_hash, "operation_id": op.operation_id, "complete": True,
@@ -463,6 +466,32 @@ class AgentAssistedBridgeTests(unittest.TestCase):
                 "observed_at": datetime.now(timezone.utc).isoformat()}), "expected_after": expected, "ancestor_ids": [],
             "concurrency": {"mechanism": "SINGLE_CONTROLLER_FRESH_READS", "controller_id": "synthetic-controller",
                             "atomic_precondition": False, "race_window_acknowledged": True}}
+        if before["mime_type"] == FOLDER:
+            check["membership_ref"] = self.journal.evidence({"kind": "COMPLETE_MEMBERSHIP_READ", "root_id": before["id"],
+                "complete": True, "pagination_complete": True, "membership_scope": "DESCENDANTS",
+                "member_ids": [m["id"] for m in observed["subtree"]["members"]],
+                "observed_at": datetime.now(timezone.utc).isoformat()})
+        return check
+
+    def configure(self, operations, parents=None):
+        from uqmc_recovery.agent_profile import register_agent_plan
+        self.parents = parents or self.parents
+        self.plan = Plan("agent-fixture-rebound", "agent-fixture-rebound", "r2", tuple(operations))
+        register_agent_plan(self.journal, self.plan)
+        self.approval = replace(self.approval, approval_id="agent-fixture-rebound-approval", run_id=self.plan.run_id,
+            batch_id=self.plan.batch_id, proposal_revision="r2", proposal_hash=self.plan.proposal_hash,
+            operation_ids=tuple(op.operation_id for op in operations))
+        exposure = self.journal.read_evidence(self.auth["exposure_review_ref"])
+        required = {op.file_id for op in operations}
+        for op in operations:
+            required |= set(op.before["parents"]) | set(op.target.get("parents", []))
+        available = {value["id"]: value for value in [*(op.before for op in operations), *self.parents.values()]}
+        exposure.update(proposal_hash=self.plan.proposal_hash, operation_ids=list(self.approval.operation_ids),
+            access_baselines={file_id: self.journal.evidence(available[file_id]) for file_id in required})
+        self.auth.update(approval_hash=digest(self.approval.body()), proposal_hash=self.plan.proposal_hash,
+                         exposure_review_ref=self.journal.evidence(exposure))
+        self.enable.update(proposal_hash=self.plan.proposal_hash, approval_id=self.approval.approval_id,
+                           authorization_hash=digest(self.auth))
 
     def authorize(self):
         return self.bridge.authorize_agent_dispatch(self.plan, self.approval, self.auth, self.enable)
@@ -477,7 +506,7 @@ class AgentAssistedBridgeTests(unittest.TestCase):
 
     def completed(self, envelope, error=False):
         from uqmc_recovery.action_bridge import AGENT_TOOL
-        raw = {"structuredContent": {"id": self.before["id"]}}
+        raw = {"structuredContent": {"id": envelope["file_id"]}}
         if error:
             raw["isError"] = True
         ref = self.bridge.ingest_result(envelope["envelope_hash"], envelope["attempt_key"], raw)
@@ -486,6 +515,18 @@ class AgentAssistedBridgeTests(unittest.TestCase):
             "raw_response_hash": digest(raw), "completed_at": datetime.now(timezone.utc).isoformat()})
         return {"kind": "AGENT_TOOL_COMPLETED", "mode": "AGENT_ASSISTED", "terminal": True,
             "attempt_key": envelope["attempt_key"], "envelope_hash": envelope["envelope_hash"], "response_ref": ref, "provenance_ref": proof}
+
+    def refused(self, envelope, definitive=True):
+        from uqmc_recovery.action_bridge import AGENT_TOOL
+        raw = {"isError": True, "error": {"code": "SYNTHETIC_REFUSAL" if definitive else "SYNTHETIC_TIMEOUT"}}
+        ref = self.bridge.ingest_result(envelope["envelope_hash"], envelope["attempt_key"], raw)
+        proof = {"kind": "TRUSTED_TOOL_NONDISPATCH", "tool": AGENT_TOOL,
+            "tool_call_id": "synthetic-refusal", "outcome": "not_dispatched", "args_hash": digest(envelope["args"]),
+            "raw_response_hash": digest(raw), "completed_at": datetime.now(timezone.utc).isoformat(),
+            "rejection_stage": "before_external_tool", "dispatcher_attested": definitive, "external_request_sent": False}
+        return {"kind": "AGENT_TOOL_NOT_DISPATCHED", "mode": "AGENT_ASSISTED", "terminal": True,
+            "attempt_key": envelope["attempt_key"], "envelope_hash": envelope["envelope_hash"],
+            "response_ref": ref, "provenance_ref": self.journal.evidence(proof)}
 
     def after(self):
         observed, parents = self.snapshot(self.plan.operations[0].intended(self.before)), copy.deepcopy(self.parents)
@@ -593,6 +634,288 @@ class AgentAssistedBridgeTests(unittest.TestCase):
         self.bridge = ActionBridge(Journal(self.journal.root), "AGENT_ASSISTED", controller_id="synthetic-controller")
         with self.assertRaisesRegex(SafetyError, "CONSUMED"):
             self.mark(envelope)
+
+    def test_known_raw_fields_cannot_be_hidden_as_unknown(self):
+        proof = self.read_proof(self.before)
+        for changed in ({k: v for k, v in self.before.items() if k != "permissions"}, self.before | {"permissions": None}):
+            with self.subTest(changed=changed), self.assertRaisesRegex(SafetyError, "FIELD_DROPPED"):
+                self.bridge._agent_read(changed, proof | {"snapshot_ref": self.journal.evidence(self.snapshot(changed))})
+
+    def test_approved_access_baseline_blocks_new_audience_before_prepare_and_mark(self):
+        self.authorize()
+        parents = copy.deepcopy(self.parents)
+        parents["agent-fixture-target"]["permissions"].append({"id": "unreviewed", "role": "reader"})
+        with self.assertRaisesRegex(SafetyError, "APPROVED_ACCESS_BASELINE_DRIFT"):
+            self.bridge.prepare_action(self.plan, self.plan.operations[0].operation_id, self.approval, self.before, self.check(parents=parents))
+        envelope = self.prepare()
+        with self.assertRaisesRegex(SafetyError, "APPROVED_ACCESS_BASELINE_DRIFT"):
+            self.bridge.mark_attempt(envelope["envelope_hash"], self.before, self.check(parents=parents))
+        self.assertFalse(any(r["kind"] == "ATTEMPTED" for r in self.journal.records()))
+
+    def test_access_baselines_are_required_and_unknown_cannot_hide_new_known_grants(self):
+        exposure = self.journal.read_evidence(self.auth["exposure_review_ref"])
+        exposure.pop("access_baselines")
+        auth = self.auth | {"exposure_review_ref": self.journal.evidence(exposure)}
+        with self.assertRaisesRegex(SafetyError, "ACCESS_BASELINES_REQUIRED"):
+            self.bridge.authorize_agent_dispatch(self.plan, self.approval, auth, self.enable | {"authorization_hash": digest(auth)})
+        self.authorize()
+        parents = copy.deepcopy(self.parents)
+        parents["agent-fixture-target"]["access"] = {"complete": False, "principals": ["new-known-audience"]}
+        with self.assertRaisesRegex(SafetyError, "ACCESS_BASELINE_DRIFT"):
+            self.bridge.prepare_action(self.plan, self.plan.operations[0].operation_id, self.approval, self.before, self.check(parents=parents))
+
+    def test_completed_success_with_preimage_remains_conflict_and_fenced(self):
+        envelope = self.prepare()
+        self.mark(envelope)
+        terminal = self.completed(envelope)
+        result = self.bridge.reconcile_action(envelope["envelope_hash"], self.before, self.check(), terminal)
+        self.assertEqual(result["kind"], "BLOCKED_CONFLICT")
+        with self.assertRaisesRegex(SafetyError, "CONSUMED"):
+            self.mark(envelope)
+
+    def test_direct_grant_change_after_move_is_conflict(self):
+        envelope = self.prepare()
+        self.mark(envelope)
+        terminal = self.completed(envelope)
+        observed, parents = self.after()
+        observed["permissions"] = []
+        result = self.bridge.reconcile_action(envelope["envelope_hash"], observed, self.check(observed, parents), terminal)
+        self.assertEqual(result["kind"], "BLOCKED_CONFLICT")
+
+    def test_reprepare_fresh_receipts_is_idempotent_and_pause_blocks_mark(self):
+        envelope = self.prepare()
+        again = self.bridge.prepare_action(self.plan, self.plan.operations[0].operation_id, self.approval, self.before, self.check())
+        self.assertEqual(envelope, again)
+        self.bridge.disable_agent_dispatch()
+        with self.assertRaisesRegex(SafetyError, "NOT_ENABLED"):
+            self.mark(envelope)
+
+    def test_agent_rename_then_move_refreshes_only_verified_version(self):
+        rename = Operation("agent-two:rename", self.before["id"], "RENAME", self.before, {"name": "Approved.pdf"})
+        renamed = self.snapshot(rename.intended(self.before))
+        move = Operation("agent-two:move", self.before["id"], "MOVE", renamed,
+                         {"parents": ["agent-fixture-target"]}, (rename.operation_id,))
+        self.configure([rename, move])
+        self.authorize()
+        envelope = self.bridge.prepare_action(self.plan, rename.operation_id, self.approval, self.before, self.check(op=rename))
+        ticket = self.bridge.mark_attempt(envelope["envelope_hash"], self.before, self.check(op=rename))
+        self.assertEqual(ticket["args"], {"fileId": self.before["id"], "name": "Approved.pdf"})
+        terminal = self.completed(envelope)
+        renamed = copy.deepcopy(renamed)
+        renamed["version"] = "provider-version-after-rename"
+        result = self.bridge.reconcile_action(envelope["envelope_hash"], renamed, self.check(renamed, op=rename), terminal)
+        self.assertEqual(result["kind"], "RECONCILED_AT_TARGET")
+        envelope = self.bridge.prepare_action(self.plan, move.operation_id, self.approval, renamed, self.check(before=renamed, op=move))
+        ticket = self.bridge.mark_attempt(envelope["envelope_hash"], renamed, self.check(before=renamed, op=move))
+        self.assertEqual(set(ticket["args"]), {"fileId", "addParents", "removeParents"})
+
+    def test_folder_move_uses_explicit_direct_parent_membership(self):
+        folder = self.snapshot(self.before | {"mime_type": FOLDER, "name": "Folder",
+            "subtree": {"complete": True, "membership_scope": "DESCENDANTS", "members": [{"id": "agent-fixture-child", "name": "Child.pdf"}]}})
+        move = Operation("agent-folder:move", folder["id"], "MOVE", folder, {"parents": ["agent-fixture-target"]})
+        self.configure([move])
+        self.authorize()
+        envelope = self.bridge.prepare_action(self.plan, move.operation_id, self.approval, folder, self.check(before=folder))
+        self.bridge.mark_attempt(envelope["envelope_hash"], folder, self.check(before=folder))
+        terminal = self.completed(envelope)
+        observed = self.snapshot(move.intended(folder))
+        parents = copy.deepcopy(self.parents)
+        parents["agent-fixture-origin"]["subtree"]["members"] = []
+        parents["agent-fixture-target"]["subtree"]["members"] = [{"id": folder["id"]}]
+        result = self.bridge.reconcile_action(envelope["envelope_hash"], observed, self.check(observed, parents, folder), terminal)
+        self.assertEqual(result["kind"], "RECONCILED_AT_TARGET")
+
+    def test_parent_membership_scope_cannot_be_assumed(self):
+        self.authorize()
+        parents = copy.deepcopy(self.parents)
+        parents["agent-fixture-target"]["subtree"].pop("membership_scope")
+        with self.assertRaisesRegex(SafetyError, "MEMBERSHIP_SCOPE_REQUIRED"):
+            self.bridge.prepare_action(self.plan, self.plan.operations[0].operation_id, self.approval, self.before, self.check(parents=parents))
+
+    def test_proven_nondispatch_releases_fence_but_never_reissues_ticket(self):
+        envelope = self.prepare()
+        self.mark(envelope)
+        terminal = self.refused(envelope)
+        result = self.bridge.reconcile_action(envelope["envelope_hash"], self.before, self.check(), terminal)
+        self.assertEqual(result["kind"], "FAILED_NOT_APPLIED")
+        self.assertEqual(result["payload"]["reason_code"], "TRUSTED_NONDISPATCH_AND_EXACT_PREIMAGE")
+        with self.assertRaisesRegex(SafetyError, "CONSUMED"):
+            self.mark(envelope)
+
+    def test_generic_error_cannot_be_relabelled_as_nondispatch(self):
+        envelope = self.prepare()
+        self.mark(envelope)
+        terminal = self.refused(envelope, definitive=False)
+        with self.assertRaisesRegex(SafetyError, "NONDISPATCH_UNPROVEN"):
+            self.bridge.reconcile_action(envelope["envelope_hash"], self.before, self.check(), terminal)
+        self.assertEqual(self.journal.records()[-1]["kind"], "UNCERTAIN")
+
+    def test_independent_second_ticket_waits_for_first_reconciliation(self):
+        other = self.snapshot(self.before | {"id": "agent-fixture-other", "parents": ["agent-fixture-origin-two"]})
+        parents = copy.deepcopy(self.parents)
+        for name, members in (("agent-fixture-origin-two", [{"id": other["id"]}]), ("agent-fixture-target-two", [])):
+            parents[name] = self.snapshot(self.parents["agent-fixture-origin"] | {"id": name, "name": name,
+                "subtree": {"complete": True, "membership_scope": "DIRECT_CHILDREN", "members": members}})
+        first = replace(self.plan.operations[0], operation_id="agent-two:first")
+        second = Operation("agent-two:second", other["id"], "MOVE", other, {"parents": ["agent-fixture-target-two"]})
+        self.configure([first, second], parents)
+        self.authorize()
+        a = self.bridge.prepare_action(self.plan, first.operation_id, self.approval, self.before, self.check(op=first))
+        b = self.bridge.prepare_action(self.plan, second.operation_id, self.approval, other, self.check(before=other, op=second))
+        self.bridge.mark_attempt(a["envelope_hash"], self.before, self.check(op=first))
+        with self.assertRaisesRegex(SafetyError, "OTHER_DISPATCH_UNRESOLVED"):
+            self.bridge.mark_attempt(b["envelope_hash"], other, self.check(before=other, op=second))
+
+    def test_named_descendants_refresh_before_same_folder_dependency_compare(self):
+        root = self.snapshot(self.before | {"mime_type": FOLDER, "name": "Root",
+            "subtree": {"complete": True, "membership_scope": "DESCENDANTS", "members": [{"id": "agent-fixture-child", "name": "Original.pdf"}]}})
+        root_rename = Operation("agent-tree:root-rename", root["id"], "RENAME", root, {"name": "Approved Root"})
+        renamed_root = self.snapshot(root_rename.intended(root))
+        child = self.snapshot(self.before | {"id": "agent-fixture-child", "parents": [root["id"]]})
+        child_rename = Operation("agent-tree:child-rename", child["id"], "RENAME", child, {"name": "Approved.pdf"}, (root_rename.operation_id,))
+        final_root = copy.deepcopy(renamed_root)
+        final_root["subtree"]["members"][0]["name"] = "Approved.pdf"
+        root_move = Operation("agent-tree:move", root["id"], "MOVE", final_root, {"parents": ["agent-fixture-target"]}, (child_rename.operation_id,))
+        parents = self.parents | {root["id"]: root}
+        self.configure([root_rename, child_rename, root_move], parents)
+        self.authorize()
+        # These are synthetic verified dependency receipts, with complete frozen
+        # identities and exact images, not a live connector result.
+        for op, observed in ((root_rename, renamed_root | {"version": "root-after-rename"}),
+                             (child_rename, child_rename.intended(child))):
+            self.journal.append("RECONCILED_AT_TARGET", op.operation_id, payload={"file_id": op.file_id,
+                "action": op.action, "direction": "FORWARD", "depends_on": list(op.depends_on),
+                "before_ref": self.journal.evidence(op.before), "observed_ref": self.journal.evidence(observed)})
+        final_root = copy.deepcopy(final_root)
+        final_root["version"] = "root-after-rename"
+        envelope = self.bridge.prepare_action(self.plan, root_move.operation_id, self.approval, final_root,
+                                              self.check(before=final_root, op=root_move))
+        self.assertEqual(envelope["action"], "MOVE")
+
+    def test_named_unrelated_members_cannot_drift_during_action(self):
+        parents = copy.deepcopy(self.parents)
+        parents["agent-fixture-origin"]["subtree"]["members"].append({"id": "agent-fixture-sibling", "name": "Keep.pdf"})
+        self.parents = parents
+        envelope = self.prepare()
+        self.mark(envelope)
+        terminal = self.completed(envelope)
+        observed, after = self.after()
+        after["agent-fixture-origin"]["subtree"]["members"] = [{"id": "agent-fixture-sibling", "name": "Manual.pdf"}]
+        result = self.bridge.reconcile_action(envelope["envelope_hash"], observed, self.check(observed, after), terminal)
+        self.assertEqual(result["kind"], "BLOCKED_CONFLICT")
+
+    def test_named_child_manual_rename_after_folder_move_is_conflict(self):
+        folder = self.snapshot(self.before | {"mime_type": FOLDER, "name": "Folder",
+            "subtree": {"complete": True, "membership_scope": "DESCENDANTS",
+                        "members": [{"id": "agent-fixture-child", "name": "Keep.pdf", "mime_type": "application/pdf"}]}})
+        move = Operation("agent-folder:move", folder["id"], "MOVE", folder, {"parents": ["agent-fixture-target"]})
+        self.configure([move])
+        self.authorize()
+        envelope = self.bridge.prepare_action(self.plan, move.operation_id, self.approval, folder, self.check(before=folder))
+        self.bridge.mark_attempt(envelope["envelope_hash"], folder, self.check(before=folder))
+        terminal = self.completed(envelope)
+        observed = self.snapshot(move.intended(folder))
+        observed["subtree"]["members"][0]["name"] = "Manual.pdf"
+        parents = copy.deepcopy(self.parents)
+        parents["agent-fixture-origin"]["subtree"]["members"] = []
+        parents["agent-fixture-target"]["subtree"]["members"] = [{"id": folder["id"]}]
+        result = self.bridge.reconcile_action(envelope["envelope_hash"], observed, self.check(observed, parents, folder), terminal)
+        self.assertEqual(result["kind"], "BLOCKED_CONFLICT")
+
+    def test_approved_parent_access_refresh_requires_verified_dependency(self):
+        root = self.snapshot(self.before | {"mime_type": FOLDER, "name": "Root",
+            "subtree": {"complete": True, "membership_scope": "DESCENDANTS", "members": []}})
+        incoming = self.snapshot(self.before | {"id": "agent-fixture-incoming"})
+        root_move = Operation("agent-root:move", root["id"], "MOVE", root, {"parents": ["agent-fixture-target"]})
+        incoming_move = Operation("agent-root:incoming", incoming["id"], "MOVE", incoming,
+                                 {"parents": [root["id"]]}, (root_move.operation_id,))
+        parents = copy.deepcopy(self.parents) | {root["id"]: root}
+        parents["agent-fixture-origin"]["subtree"]["members"].append({"id": incoming["id"]})
+        self.configure([root_move, incoming_move], parents)
+        self.authorize()
+        envelope = self.bridge.prepare_action(self.plan, root_move.operation_id, self.approval, root, self.check(before=root, op=root_move))
+        self.bridge.mark_attempt(envelope["envelope_hash"], root, self.check(before=root, op=root_move))
+        terminal = self.completed(envelope)
+        moved_root = self.snapshot(root_move.intended(root))
+        moved_root["permissions"].append({"id": "known-user", "role": "writer", "permissionDetails": [{"inherited": True}]})
+        after_parents = copy.deepcopy(parents)
+        after_parents["agent-fixture-origin"]["subtree"]["members"] = [{"id": incoming["id"]}]
+        after_parents["agent-fixture-target"]["subtree"]["members"] = [{"id": root["id"]}]
+        result = self.bridge.reconcile_action(envelope["envelope_hash"], moved_root,
+            self.check(moved_root, after_parents, root, root_move), terminal)
+        self.assertEqual(result["kind"], "RECONCILED_AT_TARGET")
+        after_parents[root["id"]] = moved_root
+        following = self.bridge.prepare_action(self.plan, incoming_move.operation_id, self.approval, incoming,
+            self.check(before=incoming, parents=after_parents, op=incoming_move))
+        self.assertEqual(following["file_id"], incoming["id"])
+        after_parents = copy.deepcopy(after_parents)
+        after_parents[root["id"]]["permissions"].append({"id": "unreviewed", "role": "reader"})
+        with self.assertRaisesRegex(SafetyError, "ACCESS_BASELINE_DRIFT"):
+            self.bridge.mark_attempt(following["envelope_hash"], incoming,
+                self.check(before=incoming, parents=after_parents, op=incoming_move))
+
+    def test_agent_authority_transition_crash_matrix(self):
+        for kind in ("APPROVED", "HANDOFF_AUTHORIZED", "HANDOFF_DISPATCH_ENABLED"):
+            for side in ("before_", "after_"):
+                with self.subTest(point=side + kind):
+                    self.tearDown()
+                    self.setUp()
+                    def crash(point):
+                        if point == side + kind:
+                            raise ProcessDeath()
+                    self.bridge.fault = crash
+                    with self.assertRaises(ProcessDeath):
+                        self.authorize()
+                    self.bridge = ActionBridge(Journal(self.journal.root), "AGENT_ASSISTED", controller_id="synthetic-controller")
+                    self.authorize()
+                    for event in ("APPROVED", "HANDOFF_AUTHORIZED", "HANDOFF_DISPATCH_ENABLED"):
+                        self.assertEqual(sum(r["kind"] == event for r in self.journal.records()), 1)
+                    envelope = self.prepare()
+                    self.mark(envelope)
+                    self.assertEqual(sum(r["kind"] == "ATTEMPTED" for r in self.journal.records()), 1)
+
+    def test_agent_action_transition_crash_matrix(self):
+        for kind in ("PREPARED", "ATTEMPTED", "HANDOFF_RESULT_RECEIVED", "UNCERTAIN",
+                     "RECONCILED_AT_TARGET", "FAILED_NOT_APPLIED", "BLOCKED_CONFLICT"):
+            for side in ("before_", "after_"):
+                with self.subTest(point=side + kind):
+                    self.tearDown()
+                    self.setUp()
+                    self.authorize()
+                    envelope = None if kind == "PREPARED" else self.prepare()
+                    if kind not in {"PREPARED", "ATTEMPTED"}:
+                        self.mark(envelope)
+                    terminal = None
+                    if kind in {"RECONCILED_AT_TARGET", "BLOCKED_CONFLICT", "FAILED_NOT_APPLIED"}:
+                        terminal = self.refused(envelope) if kind == "FAILED_NOT_APPLIED" else self.completed(envelope)
+                    def crash(point):
+                        if point == side + kind:
+                            raise ProcessDeath()
+                    self.bridge.fault = crash
+                    def transition():
+                        if kind == "PREPARED":
+                            return self.prepare()
+                        if kind == "ATTEMPTED":
+                            return self.mark(envelope)
+                        if kind in {"HANDOFF_RESULT_RECEIVED", "UNCERTAIN"}:
+                            return self.bridge.ingest_result(envelope["envelope_hash"], envelope["attempt_key"], {"structuredContent": {"id": envelope["file_id"]}})
+                        observed, parents = self.after() if kind == "RECONCILED_AT_TARGET" else (self.before, self.parents)
+                        return self.bridge.reconcile_action(envelope["envelope_hash"], observed, self.check(observed, parents), terminal)
+                    with self.assertRaises(ProcessDeath):
+                        transition()
+                    self.bridge = ActionBridge(Journal(self.journal.root), "AGENT_ASSISTED", controller_id="synthetic-controller")
+                    if kind == "ATTEMPTED" and side == "after_":
+                        with self.assertRaisesRegex(SafetyError, "CONSUMED"):
+                            transition()
+                    else:
+                        result = transition()
+                        if kind == "PREPARED":
+                            envelope = result
+                            self.mark(envelope)
+                    self.assertEqual(sum(r["kind"] == "ATTEMPTED" for r in self.journal.records()), 1)
+                    if kind not in {"PREPARED", "ATTEMPTED"}:
+                        with self.assertRaisesRegex(SafetyError, "CONSUMED"):
+                            self.mark(envelope)
 
 
 if __name__ == "__main__":
