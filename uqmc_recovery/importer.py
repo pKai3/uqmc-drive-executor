@@ -319,6 +319,7 @@ def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
         excluded = set(source["excluded_ids"]) | recorded_exclusions
         excluded_refs = set(source["excluded_refs"]) | recorded_refs
         rows, candidates = [], {}
+        mutation_ids = {source["records"][ref]["source_id"] for ref in selected if ref in source["records"]}
         stale = expected_input_sha256 is not None and expected_input_sha256 != input_hash
         for ref in selected:
             record = source["records"].get(ref)
@@ -379,7 +380,13 @@ def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
                         raise SafetyError("EXCLUDED_DESTINATION")
                     target = {"parents": sorted(targets)}
                     for parent_id in set(before["parents"]) | set(targets):
-                        parent = normalize(metadata_by_id[parent_id])
+                        evidence = metadata_by_id[parent_id]
+                        if (metadata_profile == "AGENT_ASSISTED" and parent_id not in mutation_ids
+                                and evidence.get("observation_profile") == "READ_ONLY_PARENT_CONTEXT"):
+                            from .agent_profile import agent_parent_context
+                            parent = agent_parent_context(evidence)
+                        else:
+                            parent = normalize(evidence)
                         if parent["id"] != parent_id or parent["mime_type"] != FOLDER:
                             raise SafetyError("DESTINATION_OR_ORIGINAL_PARENT_INVALID")
                 else:

@@ -36,6 +36,24 @@ def _members(value):
 
 
 def agent_snapshot(value):
+    """Strict mutation snapshot: exact own parents are always required."""
+    return _validated_snapshot(value)
+
+
+def agent_parent_context(value, *, require_subtree=True):
+    """Read-only boundary folder; absent own ancestry stays unknown.
+
+    Callers must never use this profile for a mutation source or as evidence of
+    a destination's placement. Complete immediate membership is still required
+    for stored planning evidence. Live runtime parent reads validate membership
+    separately through the transport's complete child listing.
+    """
+    if not isinstance(value, dict) or value.get("mime_type") != FOLDER:
+        raise SafetyError("PARENT_CONTEXT_NOT_FOLDER")
+    return _validated_snapshot(value, parent_context=True, require_subtree=require_subtree)
+
+
+def _validated_snapshot(value, *, parent_context=False, require_subtree=True):
     """Validate known essentials; leave absent optional values absent, null as null."""
     if not isinstance(value, dict):
         raise SafetyError("INVALID_AGENT_METADATA")
@@ -44,12 +62,15 @@ def agent_snapshot(value):
         raise SafetyError("AGENT_EXACT_ID_AND_NAME_REQUIRED")
     if not isinstance(out.get("mime_type"), str) or not out["mime_type"]:
         raise SafetyError("AGENT_EXACT_MIME_REQUIRED")
-    if out.get("parents_complete") is not True or not isinstance(out.get("parents"), list):
-        raise SafetyError("AGENT_COMPLETE_PARENT_IDS_REQUIRED")
-    _ids(out["parents"], "INVALID_PARENTS")
-    if out["id"] in out["parents"]:
-        raise SafetyError("SELF_PARENT")
-    out["parents"] = sorted(out["parents"])
+    unknown_parents = (parent_context and out.get("parents") is None
+                       and out.get("parents_complete") is False)
+    if not unknown_parents:
+        if out.get("parents_complete") is not True or not isinstance(out.get("parents"), list):
+            raise SafetyError("AGENT_COMPLETE_PARENT_IDS_REQUIRED")
+        _ids(out["parents"], "INVALID_PARENTS")
+        if out["id"] in out["parents"]:
+            raise SafetyError("SELF_PARENT")
+        out["parents"] = sorted(out["parents"])
     if out.get("trashed") is True:
         raise SafetyError("TRASHED_SOURCE")
     if out.get("trashed") is not None and not isinstance(out["trashed"], bool):
@@ -60,7 +81,7 @@ def agent_snapshot(value):
     for field in ("capabilities", "access"):
         if out.get(field) is not None and not isinstance(out[field], dict):
             raise SafetyError("INVALID_AGENT_" + field.upper())
-    if out["mime_type"] == FOLDER:
+    if out["mime_type"] == FOLDER and require_subtree:
         subtree = out.get("subtree")
         if not isinstance(subtree, dict) or subtree.get("complete") is not True or not isinstance(subtree.get("members"), list):
             raise SafetyError("INCOMPLETE_DESCENDANTS")
@@ -71,15 +92,17 @@ def agent_snapshot(value):
             member_ids.append(member["id"])
         if len(member_ids) != len(set(member_ids)) or out["id"] in member_ids:
             raise SafetyError("INVALID_DESCENDANT_SCOPE")
-    elif out.get("subtree") is not None:
+    elif out["mime_type"] != FOLDER and out.get("subtree") is not None:
         subtree = out["subtree"]
         if not isinstance(subtree, dict) or subtree.get("members", []) != []:
             raise SafetyError("NONFOLDER_DESCENDANTS")
     unavailable = {field for field in _OPTIONAL if field not in out or out[field] is None}
     if not isinstance(out.get("access"), dict) or out["access"].get("complete") is not True:
         unavailable.add("effective_access")
+    if unknown_parents:
+        unavailable.add("parents")
     out["metadata_unavailable"] = sorted(unavailable)
-    out["observation_profile"] = PROFILE
+    out["observation_profile"] = "READ_ONLY_PARENT_CONTEXT" if unknown_parents else PROFILE
     return out
 
 

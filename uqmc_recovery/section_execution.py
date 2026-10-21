@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 
-from .agent_profile import agent_snapshot, register_agent_plan
+from .agent_profile import agent_snapshot, agent_parent_context, register_agent_plan
 from .direct_transport import GoogleDriveTransport
 from .model import FOLDER, Approval, SafetyError, digest
 
@@ -64,6 +64,8 @@ def collect_metadata(source_ids, transport_factory, *, excluded_ids=(), workers=
         for s,value in pool.map(get, sorted(selected)):
             raw[s]=value
             if progress: progress({'stage':'source_metadata','checked':len(raw),'total':len(selected)})
+    if any(not isinstance(v.get('parents'),list) for v in raw.values()):
+        raise SafetyError('AGENT_COMPLETE_PARENT_IDS_REQUIRED')
     parents={p for v in raw.values() for p in v['parents']}
     if parents & excluded: raise SafetyError('EXCLUDED_SOURCE_PARENT')
     folders={s for s,v in raw.items() if v['mimeType']==FOLDER}
@@ -74,6 +76,13 @@ def collect_metadata(source_ids, transport_factory, *, excluded_ids=(), workers=
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for s,value,children in pool.map(folder,sorted(parents|folders)):
             raw[s]=value;listings[s]=children
+    # The child's exact parent IDs and this complete direct listing establish
+    # the boundary relationship; the parent's own ancestor may be unavailable.
+    for s in selected:
+        for pid in raw[s]['parents']:
+            child=next((v for v in listings[pid] if v['id']==s),None)
+            if child is None or any(child.get(k)!=raw[s].get(k) for k in ('name','mimeType')) or sorted(child['parents'])!=sorted(raw[s]['parents']):
+                raise SafetyError('SOURCE_PARENT_MEMBERSHIP_CONFLICT:'+s+':'+pid)
     def descendants(s,trail=()):
         if s in trail: raise SafetyError('SOURCE_FOLDER_CYCLE')
         members=[]
@@ -86,17 +95,17 @@ def collect_metadata(source_ids, transport_factory, *, excluded_ids=(), workers=
     snapshots={}
     for s,value in raw.items():
         members=descendants(s) if recursive_sources and s in folders else listings.get(s,[])
-        snapshots[s]=normalize(value,members,recursive=recursive_sources and s in folders)
+        snapshots[s]=normalize(value,members,recursive=recursive_sources and s in folders,parent_context=s not in selected)
     return {'raw':raw,'listings':listings,'metadata':snapshots,'source_ids':sorted(selected)}
 
 
-def normalize(raw,members=None,*,recursive=False):
+def normalize(raw,members=None,*,recursive=False,parent_context=False):
     aliases={'mimeType':'mime_type','modifiedTime':'modified_time','md5Checksum':'md5_checksum','driveId':'drive_id'}
     value={aliases.get(k,k):copy.deepcopy(v) for k,v in raw.items() if k!='_http_etag'}
-    value['parents_complete']=True
+    value['parents_complete']=isinstance(value.get('parents'),list) if parent_context else True
     if value['mime_type']==FOLDER:
         value['subtree']={'complete':True,'membership_scope':'RECURSIVE' if recursive else 'DIRECT_CHILDREN','members':copy.deepcopy(members or [])}
-    return agent_snapshot(value)
+    return agent_parent_context(value) if parent_context else agent_snapshot(value)
 
 
 def authorize(journal,plan,metadata,instruction_ref,*,section_id):

@@ -322,8 +322,9 @@ class ActionBridge:
         return {key: copy.deepcopy(value.get(key)) for key in ("permissions", "owners", "access")}
 
     def _agent_exposure_baselines(self, plan, exposure):
-        from .agent_profile import agent_snapshot
-        required = {op.file_id for op in plan.operations}
+        from .agent_profile import agent_snapshot, agent_parent_context
+        source_ids = {op.file_id for op in plan.operations}
+        required = set(source_ids)
         for op in plan.operations:
             required |= set(op.before["parents"]) | set(op.target.get("parents", []))
         references = exposure.get("access_baselines")
@@ -331,7 +332,12 @@ class ActionBridge:
             raise SafetyError("AGENT_APPROVED_ACCESS_BASELINES_REQUIRED")
         baselines = {}
         for file_id, reference in references.items():
-            value = agent_snapshot(self.journal.read_evidence(reference))
+            evidence = self.journal.read_evidence(reference)
+            if (self.execution_transport == "DIRECT_GOOGLE_API" and file_id not in source_ids
+                    and evidence.get("observation_profile") == "READ_ONLY_PARENT_CONTEXT"):
+                value = agent_parent_context(evidence)
+            else:
+                value = agent_snapshot(evidence)
             if value["id"] != file_id:
                 raise SafetyError("AGENT_ACCESS_BASELINE_ID_MISMATCH")
             baselines[file_id] = self._agent_access(value)

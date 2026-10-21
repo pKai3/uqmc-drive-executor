@@ -224,6 +224,19 @@ class DesiredRunner:
             raw["_permissions"] = sorted(self.read_retry(lambda: self.transport.list_permissions(source_id)), key=digest)
         return raw
 
+    def read_parent_context(self, source_id):
+        """Read an unmutated boundary folder without inventing its ancestry."""
+        from .agent_profile import agent_parent_context
+        raw = self.read_retry(lambda: self.transport.get_file(source_id))
+        if raw.get("id") != source_id:
+            raise SafetyError("SOURCE_ID_OR_TRASH_CONFLICT")
+        value = {**raw, "mime_type": raw.get("mimeType"),
+                 "parents_complete": isinstance(raw.get("parents"), list)}
+        agent_parent_context(value, require_subtree=False)
+        if self.audit_permissions:
+            raw["_permissions"] = sorted(self.read_retry(lambda: self.transport.list_permissions(source_id)), key=digest)
+        return raw
+
     @contextmanager
     def authority_session(self):
         """Full immutable approval validation once inside the controller lock."""
@@ -538,7 +551,8 @@ class DesiredRunner:
         if before["name"] != target["name"] and before.get("capabilities", {}).get("canRename") is False:
             raise SafetyError("SOURCE_CANNOT_RENAME")
         for pid in sorted(set(before["parents"]) | set(target["parents"])):
-            parent = self.preview_read(preview_cache, "parent", pid, self.read)
+            read_parent = self.read if pid in self.by_id else self.read_parent_context
+            parent = self.preview_read(preview_cache, "parent", pid, read_parent)
             if parent.get("mimeType") != FOLDER:
                 raise SafetyError("DESTINATION_NOT_FOLDER")
             if pid in self.by_id:

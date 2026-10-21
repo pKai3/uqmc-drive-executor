@@ -225,13 +225,14 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
         value=getattr(read({sid}),method)(sid)
         if preview:cache[key]=copy.deepcopy(value);on_read(method,sid,value)
         return value
-    def folder(sid):
+    def folder(sid, *, parent_context=False):
         if sid in excluded:raise SafetyError('EXCLUDED_DESTINATION')
         if sid not in raw or sid not in listings:report({'stage':'destination_metadata','source_id':sid})
         if sid not in raw:raw[sid]=folder_read('get_file',sid)
         if raw[sid]['mimeType']!=FOLDER or raw[sid].get('trashed'):raise SafetyError('DESTINATION_NOT_ACTIVE_FOLDER:'+sid)
         if sid not in listings:listings[sid]=folder_read('list_children',sid)
-        if sid not in metadata:metadata[sid]=normalize(raw[sid],listings[sid])
+        if sid not in metadata or (not parent_context and metadata[sid].get('observation_profile')=='READ_ONLY_PARENT_CONTEXT'):
+            metadata[sid]=normalize(raw[sid],listings[sid],parent_context=parent_context)
     # Project anchors are verified once per invocation. Deep anchors may only
     # come from a previous command's saved exact destination mapping.
     known=dict(config['anchor_paths'])
@@ -239,7 +240,11 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
     anchor=logical_parent(section)
     ancestors=[p for p in known if anchor==p or anchor.startswith(p+'/')]
     if not ancestors and not config.get('root_id'):raise SafetyError('CONFIGURE_PROJECT_ROOT_ANCHOR_FOR:'+anchor)
-    start=max(ancestors,key=len) if ancestors else '';sid=known[start] if start else config['root_id'];folder(sid)
+    start=max(ancestors,key=len) if ancestors else '';sid=known[start] if start else config['root_id']
+    # An explicitly configured boundary anchor needs no guessed grandparent.
+    # A top-level anchor with a configured project root still proves placement.
+    anchor_requires_parent=bool(start and '/' not in start and config.get('root_id'))
+    folder(sid,parent_context=sid not in ids and not anchor_requires_parent)
     if start and raw[sid]['name'].strip()!=start.rsplit('/',1)[-1].strip():raise SafetyError('PROJECT_ANCHOR_NAME_DRIFT:'+start)
     if start and '/' not in start and config.get('root_id') and raw[sid]['parents']!=[config['root_id']]:
         raise SafetyError('PROJECT_ANCHOR_PARENT_DRIFT:'+start)
@@ -262,7 +267,7 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
         if spec['logical_key'] in allocated and spec['logical_path'] not in paths:continue
         parent=layout['destination_paths'].get(spec['parent_path'])
         if parent is None:continue
-        folder(parent)
+        folder(parent,parent_context=parent==paths[anchor] and parent not in ids)
         matches=[c for c in listings[parent] if c['name']==spec['folder_name']]
         if len(matches)>1 or any(c['mimeType']!=FOLDER for c in matches):raise SafetyError('AMBIGUOUS_EXISTING_DESTINATION:'+spec['logical_path'])
         if matches:
@@ -486,7 +491,8 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
         if resume or rollback:
             with journal.locked():
                 saved=journal.read_evidence(prepared['source_metadata_ref'])['metadata']
-                authorize(journal,plan,{s:normalize(v) for s,v in saved.items() if s in prepared['allowed_ids']},
+                mutation_ids={op.file_id for op in plan.operations}
+                authorize(journal,plan,{s:normalize(v,parent_context=s not in mutation_ids) for s,v in saved.items() if s in prepared['allowed_ids']},
                     prepared['instruction_ref'],section_id=prepared['section_id'])
         def client():return factory(set(prepared['allowed_ids']),set(prepared['selected_source_ids']),set(prepared['excluded_ids']),True)
         guard=RevisionGuard(capture_client,capture['source_revision'],report,config.get('revision_check_seconds',30))

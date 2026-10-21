@@ -55,6 +55,14 @@ saved history rather than a new live verification. Transient collection reads
 have at most two attempts; a permanent permission-denied 403 is not retried.
 Failures include the method/item context and do not authorize another write.
 
+Every mutation source still requires exact own parent IDs. An unmutated boundary
+folder may omit its own ancestors in Drive's response; that stays explicitly
+unknown in private evidence, never an invented empty parent list. The command
+resolves the required relationship from the selected child's exact parent ID
+and the parent's complete direct listing. Wrong identity, name/MIME disagreement,
+missing membership, invalid capabilities or a trashed parent still block. Known
+destination placement and every folder being moved retain strict parent checks.
+
 To execute that destination section and publish its verified status:
 
 ```sh

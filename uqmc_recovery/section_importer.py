@@ -772,7 +772,14 @@ def _hybrid_profile(journal, projection, members, operations, boundary, metadata
             or proof.get("destination_paths") != paths or not proof.get("provenance_ref")):
         raise SafetyError("HYBRID_DESTINATION_PATH_EVIDENCE_MISMATCH")
     journal.read_evidence(proof["provenance_ref"])
-    normalized = {sid: normalize(state) for sid, state in metadata_by_id.items()}
+    strict_ids = set(members) | {op["source_id"] for op in operations.values()}
+    strict_ids |= {sid for path, sid in paths.items() if path != logical_parent(section_path)}
+    def normalize_entry(sid, state):
+        if sid not in strict_ids and state.get("observation_profile") == "READ_ONLY_PARENT_CONTEXT":
+            from .agent_profile import agent_parent_context
+            return agent_parent_context(state)
+        return normalize(state)
+    normalized = {sid: normalize_entry(sid, state) for sid, state in metadata_by_id.items()}
     rebuilt = build_hybrid_preparation(original, section_path=section_path,
         section_id=projection["section_id"], workbook_id=projection["workbook_id"],
         metadata_by_id=normalized, destination_paths=paths,
