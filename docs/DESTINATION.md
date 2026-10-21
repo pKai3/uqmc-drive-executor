@@ -11,6 +11,12 @@ a file's parent using its stable ID, exact title/MIME and structured destination
 fields; it never creates folders from slash fragments inside a title. Missing or
 conflicting title-boundary evidence stops with an explicit error.
 
+A type suffix in a current-name display column is not always part of the actual
+Drive title. Uploaded-file display suffixes are accepted only when the same-ID
+Move Manifest title and both recorded source paths exactly corroborate the live
+name, and the suffix matches the live MIME type. Targets remain exactly as
+approved; missing evidence or a different live title remains a conflict.
+
 ```sh
 cd /Users/bcsinger/Documents/GitHub/uqmc-drive-executor
 .venv/bin/python -m uqmc_recovery.destination '06 Trip Leaders'

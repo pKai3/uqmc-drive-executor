@@ -20,7 +20,7 @@ import time
 import uuid
 
 from .__main__ import save_new, plan_from_json
-from .model import FOLDER, NATIVE, SafetyError, digest, uploaded_extension
+from .model import FOLDER, NATIVE, MIME_EXTENSIONS, SafetyError, digest, uploaded_extension
 from .section_prepare import _path, exact_rename
 from .section_execution import collect_metadata, normalize, authorize
 from .destination_planner import plan_destination, build_hybrid_preparation, logical_parent, file_parent_path, select_destination_records as select_records
@@ -126,17 +126,26 @@ def normalize_history(value):
 
 
 def proposal_original_name(rename_record, move_record, state):
-    """Resolve a native display label without discarding a literal title suffix.
+    """Resolve a display label only with corroborated original-title evidence.
 
-    Whitespace variation is accepted only when exact manifest title and source
-    path independently preserve that original, and the native display label
-    explains the difference. Unmatched names retain the proposal baseline and
-    are rejected by normal live-state reconciliation.
+    Uploaded display suffixes require a same-ID manifest title, both source
+    paths, and exact MIME/suffix agreement. Native whitespace handling retains
+    its existing independent manifest proof. Neither branch changes the target
+    title, invents an original name or accepts unrelated live drift.
     """
     old=rename_record['row']['Current name + type suffix']
     suffix=NATIVE.get(state['mime_type']);current=state['name']
-    if not suffix:return old
     if current==old:return old
+    if not suffix:
+        if (move_record and rename_record.get('source_id')==move_record.get('source_id')==state.get('id')
+                and isinstance(state.get('id'),str) and state['id']):
+            row=move_record['row'];exact=row.get('Current item')
+            paths=(row.get('Source path'),rename_record['row'].get('Current source path'))
+            if (isinstance(exact,str) and exact and current==exact
+                    and all(isinstance(path,str) and path.endswith('/'+exact) for path in paths)
+                    and any(old==exact+ext for ext in MIME_EXTENSIONS.get(state['mime_type'],set()))):
+                return exact
+        return old
     stripped=old[:-len(suffix)] if old.endswith(suffix) else old
     if current==stripped:return stripped
     if move_record:
