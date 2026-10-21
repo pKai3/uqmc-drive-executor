@@ -1,6 +1,6 @@
 # Desired-state Drive runner
 
-`uqmc_recovery.desired` runs the approved plan through the Google Drive API in a normal Python loop. It does not need an assistant tool call for each file. Focused fake Drive tests cover recovery and rollback; the parallel runner has not been live-tested. Installing or authorizing it does not start execution.
+`uqmc_recovery.desired` runs the approved plan through the Google Drive API in a normal Python loop. It does not need an assistant tool call for each file. Focused fake Drive tests cover recovery and rollback. An earlier bounded parallel trial verified 30 moves; the new caching revision is tested offline only. Installing or authorizing it does not start execution.
 
 ## What one item does
 
@@ -111,7 +111,7 @@ Run this login manually from the checkout, then complete Google consent yourself
 
 The existing `secrets/token.json` is preserved. Login refuses to overwrite any token path and saves the new token as mode `0600` under the ignored `secrets/` directory. `--full-drive` and `--readonly` are mutually exclusive; omitting both keeps metadata-only login. Only the exact requested scope is accepted. The transport accepts the explicitly supplied full-Drive token while retaining its exact source-ID, mutation-ID and action guards; it still exposes only metadata operations. It does not start a run or expand the frozen plan. No Sheets scope is requested.
 
-After successful consent, a separate authorized command must explicitly select `--token secrets/token-drive.json`. The currently authorized execution remains the receiving-folder move and the already saved 30-certificate set. Do not run an unrestricted full-plan command merely because a broader token exists. Full scope has not yet been live-tested as a fix for the refused move.
+After successful consent, a separate authorized command must explicitly select `--token secrets/token-drive.json`. The currently authorized execution remains the receiving-folder move and the already saved 30-certificate set. Do not run an unrestricted full-plan command merely because a broader token exists. The separately authorized full-scope token subsequently completed the approved folder move and bounded certificate trial.
 
 ## Offline validation
 
@@ -122,4 +122,37 @@ PYTHONPATH=.:tests python3 -m unittest \
   test_desired test_desired_parallel test_journal test_desired_transport test_direct_transport -q
 ```
 
-Tests use fake Drive and temporary evidence. The official Google client serialization test uses a fake HTTP transport. The parallel implementation was tested offline. The existing token and earlier live changes are separate from those tests; a bounded parallel live trial is still required before calling this version live-tested.
+Tests use fake Drive and temporary evidence. The official Google client serialization test uses a fake HTTP transport. An earlier parallel implementation completed a bounded live trial. The performance-caching changes below are offline-tested only; benchmark speedups are not claims about end-to-end live throughput.
+
+
+## Per-run validation cache
+
+The desired-state runner owns a deep copy of the frozen plan and calculates its
+hash once. CLI scope compilation is performed once. Workers share one validated
+section authority for the run, while checking expiry, revocation, new authority
+or exclusion events, and evidence-file fingerprints before each dispatch. A
+changed binding requires a new validation session; it cannot silently enlarge the
+approved scope. Caller changes to the original plan object do not modify the
+owned snapshot. The runner never modifies that snapshot.
+
+Journal caching exists only while the existing process writer lock is held. The
+initial chain is fully validated, new records are individually validated against
+the current sequence/hash, and every append is still fsynced and read back before
+its cache entry is installed. Returned records are defensive copies. Unexpected
+file replacement, truncation, or modification fails closed. Releasing the writer
+lock drops the cache; restart/reacquisition revalidates the chain. Backups retain
+full journal and evidence verification. These checks detect accidental or external
+changes; the local account owner can still modify files and code.
+
+Source pre-write reads, parent/dependency checks, write-ahead records, readback,
+reconciliation, cancellation, and explicit rollback remain in place. Metadata is
+not cached across mutation attempts. Journal disk writes remain serialized and
+10 workers still have independent HTTP transports. No performance change starts
+Drive activity or publishes tracking data.
+
+A bounded synthetic benchmark uses 423 operations, approximately 2.1 MB of plan
+JSON and 209 journal records, with no real source inventory or API calls:
+
+```sh
+PYTHONPATH=.:tests .venv/bin/python benchmarks/desired_cache.py
+```

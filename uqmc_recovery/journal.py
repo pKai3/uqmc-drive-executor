@@ -8,6 +8,7 @@ off-device backup policy remain deployment concerns.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import copy
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -77,7 +78,9 @@ def _open(path: Path, flags: int) -> int:
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise JournalCorrupt(f"Expected a regular file: {path}")
-        os.fchmod(fd, 0o600)
+        # Repeating fchmod can change ctime even when mode is unchanged.
+        if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
+            os.fchmod(fd, 0o600)
         return fd
     except BaseException:
         os.close(fd)
@@ -115,43 +118,52 @@ def _new_file(path: Path, data: bytes) -> None:
         raise JournalCorrupt(f"Durable file readback failed: {path}")
 
 
+def _validate_record(line: bytes, index: int, previous: str) -> dict[str, Any]:
+    """Validate one canonical entry against the already verified chain tip."""
+    try:
+        record = json.loads(line)
+        if not isinstance(record, dict) or set(record) != _FIELDS:
+            raise ValueError("Unexpected fields")
+        if canonical(record) != line:
+            raise ValueError("Non-canonical record")
+        if record["schema_version"] != 1 or type(record["seq"]) is not int or record["seq"] != index:
+            raise ValueError("Version or sequence mismatch")
+        if record["prev_hash"] != previous:
+            raise ValueError("Broken chain")
+        if not isinstance(record["kind"], str) or not record["kind"]:
+            raise ValueError("Missing event kind")
+        if record["operation_id"] is not None and not isinstance(record["operation_id"], str):
+            raise ValueError("Invalid operation ID")
+        if type(record["attempt"]) is not int or record["attempt"] < 0:
+            raise ValueError("Invalid attempt")
+        if not isinstance(record["payload"], dict):
+            raise ValueError("Invalid payload")
+        uuid.UUID(record["event_id"])
+        if not record["at"].endswith("Z"):
+            raise ValueError("Timestamp must be UTC")
+        datetime.fromisoformat(record["at"].replace("Z", "+00:00"))
+        body = {key: value for key, value in record.items() if key != "hash"}
+        if record["hash"] != digest(canonical(body)):
+            raise ValueError("Record hash mismatch")
+        return record
+    except (ValueError, TypeError, AttributeError, UnicodeDecodeError, KeyError) as exc:
+        raise JournalCorrupt(f"Invalid record {index}: {exc}") from exc
+
+
 def _validate(raw: bytes) -> list[dict[str, Any]]:
     if raw and not raw.endswith(b"\n"):
         raise JournalCorrupt("Incomplete terminal record; recover to a NEW store")
     result: list[dict[str, Any]] = []
     previous = GENESIS
     for index, line in enumerate(raw.splitlines(), 1):
-        try:
-            record = json.loads(line)
-            if not isinstance(record, dict) or set(record) != _FIELDS:
-                raise ValueError("Unexpected fields")
-            if canonical(record) != line:
-                raise ValueError("Non-canonical record")
-            if record["schema_version"] != 1 or type(record["seq"]) is not int or record["seq"] != index:
-                raise ValueError("Version or sequence mismatch")
-            if record["prev_hash"] != previous:
-                raise ValueError("Broken chain")
-            if not isinstance(record["kind"], str) or not record["kind"]:
-                raise ValueError("Missing event kind")
-            if record["operation_id"] is not None and not isinstance(record["operation_id"], str):
-                raise ValueError("Invalid operation ID")
-            if type(record["attempt"]) is not int or record["attempt"] < 0:
-                raise ValueError("Invalid attempt")
-            if not isinstance(record["payload"], dict):
-                raise ValueError("Invalid payload")
-            uuid.UUID(record["event_id"])
-            if not record["at"].endswith("Z"):
-                raise ValueError("Timestamp must be UTC")
-            datetime.fromisoformat(record["at"].replace("Z", "+00:00"))
-            body = {key: value for key, value in record.items() if key != "hash"}
-            expected = digest(canonical(body))
-            if record["hash"] != expected:
-                raise ValueError("Record hash mismatch")
-            previous = record["hash"]
-            result.append(record)
-        except (ValueError, TypeError, AttributeError, UnicodeDecodeError, KeyError) as exc:
-            raise JournalCorrupt(f"Invalid record {index}: {exc}") from exc
+        record = _validate_record(line, index, previous)
+        result.append(record)
+        previous = record["hash"]
     return result
+
+
+def _fingerprint(info: os.stat_result) -> tuple[int, ...]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
 class Journal:
@@ -177,6 +189,10 @@ class Journal:
         self._gate = threading.RLock()
         self._depth = 0
         self._shared = False
+        self._cached_records: list[dict[str, Any]] | None = None
+        self._cached_stat: tuple[int, ...] | None = None
+        self._cache_poisoned = False
+        self._lock_epoch = 0
         self._fd: int | None = None
         self._creator_pid = os.getpid()
         for path in (self.path, self.lock_path):
@@ -196,6 +212,7 @@ class Journal:
             raise JournalBusy("Store is locked by another thread")
         try:
             if self._depth == 0:
+                self._invalidate_cache()
                 fd = _open(self.lock_path, os.O_RDWR)
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -206,12 +223,14 @@ class Journal:
                     os.close(fd)
                     raise
                 self._fd = fd
+                self._lock_epoch += 1
             self._depth += 1
             try:
                 yield
             finally:
                 self._depth -= 1
                 if self._depth == 0 and self._fd is not None:
+                    self._invalidate_cache()
                     fd, self._fd = self._fd, None
                     try:
                         fcntl.flock(fd, fcntl.LOCK_UN)
@@ -247,41 +266,104 @@ class Journal:
         if (self.root / ".snapshot-incomplete").exists():
             raise JournalCorrupt("Snapshot was interrupted; do not use it to resume")
 
+    def _invalidate_cache(self, *, poisoned: bool = False) -> None:
+        self._cached_records = None
+        self._cached_stat = None
+        self._cache_poisoned = poisoned
+
+    def _journal_stat(self) -> tuple[int, ...]:
+        try:
+            info = self.path.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise JournalCorrupt("Journal file is unavailable during lock epoch") from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise JournalCorrupt("Journal path is no longer a regular file")
+        return _fingerprint(info)
+
+    def _check_cache_stat(self) -> None:
+        if self._cache_poisoned:
+            raise JournalCorrupt("Journal cache invalidated; release and revalidate before continuing")
+        if self._cached_stat is not None and self._journal_stat() != self._cached_stat:
+            self._invalidate_cache(poisoned=True)
+            raise JournalCorrupt("Journal changed unexpectedly during lock epoch")
+
+    def _records_cached(self) -> list[dict[str, Any]]:
+        """Internal values must never escape without a deep copy."""
+        self._complete()
+        try:
+            self._check_cache_stat()
+            if self._cached_records is None:
+                before = self._journal_stat()
+                raw = _read(self.path)
+                records = _validate(raw)
+                after = self._journal_stat()
+                if before != after or len(raw) != after[2]:
+                    raise JournalCorrupt("Journal changed during full validation")
+                self._cached_records, self._cached_stat = records, after
+            return self._cached_records
+        except BaseException:
+            self._invalidate_cache(poisoned=True)
+            raise
+
     def records(self) -> list[dict[str, Any]]:
         with self.locked():
-            self._complete()
-            return _validate(_read(self.path))
+            return copy.deepcopy(self._records_cached())
+
+    def records_after(self, sequence: int) -> list[dict[str, Any]]:
+        """Return an isolated ordered tail with seq greater than sequence."""
+        if type(sequence) is not int or sequence < 0:
+            raise ValueError("Sequence must be a nonnegative integer")
+        with self.locked():
+            records = self._records_cached()
+            if sequence > len(records):
+                raise JournalCorrupt("Journal cursor is ahead of the verified chain")
+            return copy.deepcopy(records[sequence:])
 
     def append(self, kind: str, operation_id: str | None = None, attempt: int = 0,
                payload: dict[str, Any] | None = None) -> dict[str, Any]:
         with self.locked():
-            records = self.records()
-            record = {
-                "schema_version": 1,
-                "seq": len(records) + 1,
-                "event_id": str(uuid.uuid4()),
-                "at": _now(),
-                "kind": kind,
-                "operation_id": operation_id,
-                "attempt": attempt,
-                "payload": {} if payload is None else payload,
-                "prev_hash": records[-1]["hash"] if records else GENESIS,
-            }
-            record["hash"] = digest(canonical(record))
-            encoded = canonical(record) + b"\n"
-            # Validate a candidate before making any persistent change.
-            existing = _read(self.path)
-            _validate(existing + encoded)
-            fd = _open(self.path, os.O_WRONLY | os.O_APPEND)
             try:
-                _write_all(fd, encoded)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            saved = self.records()[-1]
-            if saved != record:
-                raise JournalCorrupt("Journal append readback did not match")
-            return saved
+                records = self._records_cached()
+                before = self._cached_stat
+                record = {
+                    "schema_version": 1,
+                    "seq": len(records) + 1,
+                    "event_id": str(uuid.uuid4()),
+                    "at": _now(),
+                    "kind": kind,
+                    "operation_id": operation_id,
+                    "attempt": attempt,
+                    "payload": {} if payload is None else payload,
+                    "prev_hash": records[-1]["hash"] if records else GENESIS,
+                }
+                record["hash"] = digest(canonical(record))
+                encoded = canonical(record) + b"\n"
+                # Only the new entry needs validation inside an unchanged lock
+                # epoch. The full existing chain was verified on first access.
+                saved = _validate_record(encoded[:-1], len(records) + 1, record["prev_hash"])
+                fd = _open(self.path, os.O_RDWR | os.O_APPEND)
+                try:
+                    if _fingerprint(os.fstat(fd)) != before or self._journal_stat() != before:
+                        raise JournalCorrupt("Journal changed before append")
+                    _write_all(fd, encoded)
+                    os.fsync(fd)
+                    after = _fingerprint(os.fstat(fd))
+                    if after[:2] != before[:2] or after[2] != before[2] + len(encoded):
+                        raise JournalCorrupt("Journal append size or identity mismatch")
+                    if os.pread(fd, len(encoded), before[2]) != encoded:
+                        raise JournalCorrupt("Journal append readback did not match")
+                    if _fingerprint(os.fstat(fd)) != after or self._journal_stat() != after:
+                        raise JournalCorrupt("Journal changed during append readback")
+                finally:
+                    os.close(fd)
+                records.append(saved)
+                self._cached_stat = after
+                return copy.deepcopy(saved)
+            except BaseException:
+                # A failed write/fsync/readback may already be on disk. Never
+                # advance the memory tip; reacquire and validate it afresh.
+                self._invalidate_cache(poisoned=True)
+                raise
 
     def evidence(self, data: Any) -> str:
         with self.locked():
@@ -347,6 +429,7 @@ class Journal:
             destination = Path(destination).absolute()
             if destination == self.root:
                 raise ValueError("Snapshot destination must be a NEW directory")
+            self._check_cache_stat()
             source = _read(self.path)
             tail = b""
             prefix = source

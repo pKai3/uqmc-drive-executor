@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import copy
 from collections import Counter
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime, timezone
 import json
@@ -23,6 +24,7 @@ from .journal import Journal
 from .model import FOLDER, SafetyError, digest, validate_extension_evidence, validate_rename_name
 from .projection import HEADERS
 from .section_importer import validate_section_authority
+from .run_authority import RunAuthority
 
 
 VERIFIED = {"VERIFIED_APPLIED", "RECONCILED_AT_TARGET"}
@@ -41,13 +43,29 @@ def core(raw):
             "mime_type": raw.get("mimeType", raw.get("mime_type"))}
 
 
-def compile_items(plan, journal):
+class _RunPlan:
+    """An owned plan copy with one retained digest, shared by this run's workers.
+
+    The caller's nested dictionaries must not remain aliases of the approved
+    snapshot. The owned copy is never modified by the runner.
+    """
+    def __init__(self, plan):
+        self._plan = copy.deepcopy(plan)
+        self.proposal_hash = self._plan.proposal_hash
+
+    def __getattr__(self, name):
+        return getattr(self._plan, name)
+
+
+def compile_items(plan, journal, *, validate_authority=True):
     """Keep exact approved effects; replace phase ordering with target-folder edges."""
+    plan_sha256 = plan.proposal_hash
     records = journal.records()
-    frozen = [r for r in records if r["kind"] == "DRAFTED" and r["payload"].get("proposal_hash") == plan.proposal_hash]
-    if not frozen or digest(journal.read_evidence(frozen[-1]["payload"]["plan_ref"])) != plan.proposal_hash:
+    frozen = [r for r in records if r["kind"] == "DRAFTED" and r["payload"].get("proposal_hash") == plan_sha256]
+    if not frozen or digest(journal.read_evidence(frozen[-1]["payload"]["plan_ref"])) != plan_sha256:
         raise SafetyError("EXISTING_FROZEN_PLAN_REQUIRED")
-    validate_section_authority(journal, plan)
+    if validate_authority:
+        validate_section_authority(journal, plan)
     excluded = set(plan.excluded_ids) | {r["payload"]["file_id"] for r in records if r["kind"] == "EXCLUDED"}
     groups = {}
     for op in plan.ordered():
@@ -96,7 +114,9 @@ class DesiredRunner:
     def __init__(self, journal, plan, transport, *, max_attempts=3, retry_delay=1, fault=None, progress=None, audit_permissions=True):
         if not 1 <= max_attempts <= 5:
             raise SafetyError("MAX_ATTEMPTS_MUST_BE_1_TO_5")
-        self.journal, self.plan, self.transport = journal, plan, transport
+        self.journal, self.plan, self.transport = journal, _RunPlan(plan), transport
+        self.plan_sha256 = self.plan.proposal_hash
+        self._run_authority = None
         if type(audit_permissions) is not bool:
             raise SafetyError("EXPLICIT_PERMISSION_AUDIT_BOOLEAN_REQUIRED")
         self.audit_permissions = audit_permissions
@@ -106,7 +126,7 @@ class DesiredRunner:
         self._progress_gate = threading.RLock()
         self.progress = progress or (lambda event: None)
         self.progress_output_failed = False
-        self.items = compile_items(plan, journal)
+        self.items = compile_items(self.plan, journal, validate_authority=False)
         self.by_id = {i["source_id"]: i for i in self.items}
 
     @property
@@ -148,13 +168,13 @@ class DesiredRunner:
 
     def events(self, source_id=None):
         return [r for r in self.journal.records() if r["kind"].startswith("DESIRED_")
-                and r["payload"].get("plan_sha256") == self.plan.proposal_hash
+                and r["payload"].get("plan_sha256") == self.plan_sha256
                 and (source_id is None or r["payload"].get("source_id") == source_id)]
 
     def record(self, kind, item, *, direction="FORWARD", attempt=0, **payload):
         return self.journal.append("DESIRED_" + kind,
-            operation_id="desired:" + self.plan.proposal_hash[:12] + ":" + item["source_id"] + ":" + direction,
-            attempt=attempt, payload={"plan_sha256": self.plan.proposal_hash, "run_id": self.plan.run_id,
+            operation_id="desired:" + self.plan_sha256[:12] + ":" + item["source_id"] + ":" + direction,
+            attempt=attempt, payload={"plan_sha256": self.plan_sha256, "run_id": self.plan.run_id,
                 "source_id": item["source_id"], "direction": direction,
                 "operation_order": item["operation_order"], "dependencies": item["dependencies"],
                 "original_operation_ids": [o.operation_id for o in item["operations"]],
@@ -170,18 +190,26 @@ class DesiredRunner:
             raw["_permissions"] = sorted(self.read_retry(lambda: self.transport.list_permissions(source_id)), key=digest)
         return raw
 
+    @contextmanager
+    def authority_session(self):
+        """Full immutable approval validation once inside the controller lock."""
+        if self._run_authority is not None:
+            raise SafetyError("AUTHORITY_SESSION_ALREADY_ACTIVE")
+        self._run_authority = RunAuthority(self.journal, self.plan, self.plan_sha256,
+                                          audit_permissions=self.audit_permissions)
+        try:
+            yield
+        finally:
+            self._run_authority = None
+
     def authority(self):
-        validate_section_authority(self.journal, self.plan)
-        auths = [r for r in self.journal.records() if r["kind"] == "HANDOFF_AUTHORIZED"
-                 and r["payload"].get("proposal_hash") == self.plan.proposal_hash]
-        if not auths:
-            raise SafetyError("EXISTING_SECTION_AUTHORIZATION_REQUIRED")
-        auth = self.journal.read_evidence(auths[-1]["payload"]["authorization_ref"])
-        if auth.get("authorized") is not True or auth.get("proposal_hash") != self.plan.proposal_hash:
-            raise SafetyError("AUTHORIZATION_MISMATCH")
-        if not self.audit_permissions and auth.get("access_policy") != "SCOPED_EXPOSURE_ACCEPTED":
-            raise SafetyError("SKIP_PERMISSION_AUDIT_REQUIRES_ACCEPTED_SECTION_EXPOSURE")
-        return auth
+        # Direct transition callers retain validation without a persistent cache.
+        # Normal preview/apply/resume/rollback share one locked run session.
+        if self._run_authority is not None:
+            return self._run_authority.check()
+        with self.journal.locked():
+            return RunAuthority(self.journal, self.plan, self.plan_sha256,
+                                audit_permissions=self.audit_permissions).check()
 
     def latest_change(self, item):
         changes = [r for r in self.events(item["source_id"]) if r["kind"] == "DESIRED_APPLIED"]
@@ -333,7 +361,7 @@ class DesiredRunner:
         return raw, current, "TARGET" if current == item["target"] else "PARTIAL" if partial else "NOT_APPLIED"
 
     def preview(self, *, limit=None):
-        with self.journal.locked():
+        with self.journal.locked(), self.authority_session():
             self.authority()
             output = []
             # Local to this invocation: apply/resume/rollback never receive it.
@@ -410,6 +438,7 @@ class DesiredRunner:
             self.unchanged(before, fresh, strict=True)
             if self.stop_requested:
                 return {"source_id": item["source_id"], "state": "NOT_APPLIED", "reason": "PAUSED_BEFORE_DISPATCH"}
+            self.authority()  # Cheap live revocation/expiry check immediately before dispatch.
             self.record("ATTEMPTED", item, direction=direction, attempt=attempt, **payload)
             self.fault("before_dispatch", item)
             error = None
@@ -499,7 +528,7 @@ class DesiredRunner:
 
     def run(self, *, apply=False, confirm_plan_sha256=None, limit=999, rollback=False,
             workers=1, transport_factory=None, source_ids=None):
-        if not apply or not self.transport.apply_enabled or confirm_plan_sha256 != self.plan.proposal_hash:
+        if not apply or not self.transport.apply_enabled or confirm_plan_sha256 != self.plan_sha256:
             raise SafetyError("EXPLICIT_APPLY_AND_EXACT_PLAN_HASH_REQUIRED")
         if type(workers) is not int or not 1 <= workers <= 32 or type(limit) is not int or limit < 1:
             raise SafetyError("BOUNDED_WORKERS_AND_LIMIT_REQUIRED")
@@ -513,12 +542,12 @@ class DesiredRunner:
             selected = [i for i in selected if i["source_id"] in set(source_ids)]
         if len({i["source_id"] for i in selected}) != len(selected):
             raise SafetyError("DUPLICATE_CONCURRENT_SOURCE_ID")
-        with self.journal.shared_locked():
+        with self.journal.shared_locked(), self.authority_session():
             self.authority()
             backup = self.journal.root.parent / "backups"
             backup.mkdir(mode=0o700, parents=True, exist_ok=True)
             self.journal.backup(backup / ("desired-before-" + str(uuid.uuid4())))
-            self.journal.append("DESIRED_POLICY_BOUND", payload={"plan_sha256": self.plan.proposal_hash,
+            self.journal.append("DESIRED_POLICY_BOUND", payload={"plan_sha256": self.plan_sha256,
                 "run_id": self.plan.run_id, "policy": "exact-desired-state-v1", "direction": "ROLLBACK" if rollback else "FORWARD",
                 "dependencies": {i["source_id"]: i["dependencies"] for i in selected}, "global_phases_removed": True,
                 "audit_permissions": self.audit_permissions, "workers": workers,
@@ -621,7 +650,7 @@ class DesiredRunner:
                 self.journal.backup(backup / ("desired-after-" + str(uuid.uuid4())))
 
     def summary(self, items, **extra):
-        return {"schema_version": "uqmc.desired.status.v1", "plan_sha256": self.plan.proposal_hash,
+        return {"schema_version": "uqmc.desired.status.v1", "plan_sha256": self.plan_sha256,
             "generated_at_utc": utcnow(), "journal_sequence": len(self.journal.records()),
             "coverage": "items_observed_this_invocation", "total_plan_items": len(self.items),
             "processed_items": len(items), "unprocessed_items": len(self.items) - len(items),
@@ -680,11 +709,15 @@ def main(argv=None):
     mutating = args.command != "preview"
     summary = None
     try:
-        if mutating and (not args.apply or args.confirm_plan_sha256 != plan.proposal_hash):
+        runner = DesiredRunner(journal, plan, None, max_attempts=args.max_attempts,
+            progress=lambda event: print(json.dumps(event), flush=True),
+            audit_permissions=not args.skip_permission_audit)
+        plan = runner.plan
+        if mutating and (not args.apply or args.confirm_plan_sha256 != runner.plan_sha256):
             raise SafetyError("EXPLICIT_APPLY_AND_EXACT_PLAN_HASH_REQUIRED")
         if not mutating and args.apply:
             raise SafetyError("PREVIEW_CANNOT_APPLY")
-        items = compile_items(plan, journal)
+        items = runner.items
         allowed = {i["source_id"] for i in items}
         for i in items:
             allowed.update(i["original"]["parents"] + i["target"]["parents"])
@@ -711,9 +744,7 @@ def main(argv=None):
         if args.expect_account and account["emailAddress"].casefold() != args.expect_account.casefold():
             raise SafetyError("AUTHENTICATED_ACCOUNT_MISMATCH")
         print(json.dumps({"authenticated_account": account, "source_mutation_allowlist_count": len(items)}), flush=True)
-        runner = DesiredRunner(journal, plan, transport, max_attempts=args.max_attempts,
-            progress=lambda event: print(json.dumps(event), flush=True),
-            audit_permissions=not args.skip_permission_audit)
+        runner.transport = transport
         def worker_transport():
             client = make_transport()
             if client.get_account()["emailAddress"].casefold() != account["emailAddress"].casefold():
