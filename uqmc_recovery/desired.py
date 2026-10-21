@@ -216,6 +216,76 @@ class DesiredRunner:
         rolled = {r["payload"].get("forward_event_id") for r in self.events(item["source_id"]) if r["kind"] == "DESIRED_ROLLED_BACK"}
         return next((r for r in reversed(changes) if r["event_id"] not in rolled), None)
 
+    def _version_only_match(self, item, before, observed):
+        """Accept only an explicit historical counter advance, never live drift."""
+        if (core(before) != core(observed) or
+                core(observed)["name"] != item["target"]["name"] or
+                core(observed)["parents"] != item["original"]["parents"] or
+                core(observed)["parents"] == item["target"]["parents"] or
+                core(observed)["mime_type"] != item["original"]["mime_type"]):
+            raise SafetyError("VERSION_REBASELINE_REQUIRES_RECORDED_RENAME_PENDING_MOVE")
+        self.unchanged(before, observed)
+        for key in ("modifiedTime", "_http_etag"):
+            if key in before and before[key] != observed.get(key):
+                raise SafetyError("VERSION_REBASELINE_SUBSTANTIVE_DRIFT")
+        for key in ("canRename", "canAddChildren", "canMoveItemWithinDrive", "canMoveItemOutOfDrive"):
+            if (key in before.get("capabilities", {}) and
+                    before["capabilities"][key] != observed.get("capabilities", {}).get(key)):
+                raise SafetyError("VERSION_REBASELINE_CAPABILITY_DRIFT")
+        old, new = before.get("version"), observed.get("version")
+        if (not isinstance(old, str) or not old.isdecimal() or
+                not isinstance(new, str) or not new.isdecimal() or int(new) <= int(old)):
+            raise SafetyError("VERSION_REBASELINE_REQUIRES_VERSION_ADVANCE")
+
+    def _applied_baseline(self, item, active):
+        historical = self.journal.read_evidence(active["payload"]["applied_ref"])
+        accepted = [r for r in self.events(item["source_id"])
+                    if r["kind"] == "DESIRED_REBASELINED" and
+                    r["seq"] > active["seq"] and
+                    r["payload"].get("forward_event_id") == active["event_id"]]
+        if not accepted:
+            return historical
+        event = accepted[-1]["payload"]
+        if event.get("historical_applied_ref") != active["payload"]["applied_ref"]:
+            raise SafetyError("VERSION_REBASELINE_HISTORY_MISMATCH")
+        observed = self.journal.read_evidence(event["observed_ref"])
+        self._version_only_match(item, historical, observed)
+        return observed
+
+    def rebaseline_version_only(self, item, *, authorization_ref):
+        """Explicit operator reconciliation, not an automatic exception to CAS.
+
+        The authority reference records the human instruction and exact scope;
+        its hash is not itself permission. Original before/applied evidence stays
+        intact. Subsequent observe and pre-dispatch reads use the accepted version
+        strictly, so another change after this observation still blocks the move.
+        """
+        with self.journal.locked():
+            self.authority()
+            authorization = self.journal.read_evidence(authorization_ref)
+            if (authorization.get("schema_version") != "uqmc.version-rebaseline.authorization.v1" or
+                    authorization.get("plan_sha256") != self.plan_sha256 or
+                    item["source_id"] not in authorization.get("source_ids", []) or
+                    not isinstance(authorization.get("instruction"), str) or
+                    not authorization["instruction"].strip()):
+                raise SafetyError("EXPLICIT_VERSION_REBASELINE_AUTHORITY_REQUIRED")
+            if self.pending(item, "FORWARD") or self.pending(item, "ROLLBACK"):
+                raise SafetyError("VERSION_REBASELINE_PENDING_ATTEMPT")
+            active = self.latest_change(item)
+            if not active:
+                raise SafetyError("VERSION_REBASELINE_RECORDED_APPLIED_REQUIRED")
+            historical = self.journal.read_evidence(active["payload"]["applied_ref"])
+            observed = self.read(item["source_id"])
+            self._version_only_match(item, historical, observed)
+            return self.record("REBASELINED", item,
+                forward_event_id=active["event_id"],
+                historical_applied_ref=active["payload"]["applied_ref"],
+                historical_before_ref=active["payload"].get("before_ref"),
+                observed_ref=self.journal.evidence(observed), authorization_ref=authorization_ref,
+                old_version=historical["version"], accepted_version=observed["version"],
+                reason="EXPLICIT_HISTORICAL_VERSION_ONLY_RECONCILIATION",
+                comparison="Known identity/name/parents/content/owners/capabilities unchanged; version causation unknown")
+
     def approved(self, item, raw, *, dependency=False):
         current = core(raw)
         if current["id"] != item["source_id"] or current["mime_type"] != item["original"]["mime_type"]:
@@ -229,7 +299,7 @@ class DesiredRunner:
         active = self.latest_change(item)
         baseline = item["baseline"]
         if active:
-            applied = self.journal.read_evidence(active["payload"]["applied_ref"])
+            applied = self._applied_baseline(item, active)
             pending = self.pending(item, "FORWARD")
             intended = self.journal.read_evidence(pending["payload"]["target_ref"]) if pending else None
             if pending and core(raw) == intended:
