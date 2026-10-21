@@ -184,11 +184,17 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
     live=recursive_selected(live)
     report({'stage':'verified_history_skipped','identities':len(cached),'remaining_live_identities':len(read_ids),'preview_cached_reads_available':reused_cache})
     raw,listings,metadata=live['raw'],live['listings'],live['metadata']
+    def folder_read(method,sid):
+        key=method+':'+sid
+        if preview and key in cache:return copy.deepcopy(cache[key])
+        value=getattr(read({sid}),method)(sid)
+        if preview:cache[key]=copy.deepcopy(value);on_read(method,sid,value)
+        return value
     def folder(sid):
         if sid in excluded:raise SafetyError('EXCLUDED_DESTINATION')
-        if sid not in raw:raw[sid]=read({sid}).get_file(sid)
+        if sid not in raw:raw[sid]=folder_read('get_file',sid)
         if raw[sid]['mimeType']!=FOLDER or raw[sid].get('trashed'):raise SafetyError('DESTINATION_NOT_ACTIVE_FOLDER:'+sid)
-        if sid not in listings:listings[sid]=read({sid}).list_children(sid)
+        if sid not in listings:listings[sid]=folder_read('list_children',sid)
         if sid not in metadata:metadata[sid]=normalize(raw[sid],listings[sid])
     # Project anchors are verified once per invocation. Deep anchors may only
     # come from a previous command's saved exact destination mapping.

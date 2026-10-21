@@ -23,6 +23,8 @@ class DestinationPreviewCacheTests(unittest.TestCase):
         self.assertGreater(result['preview_cached_reads_available'],0)
         self.assertNotIn(('get','leaf'),self.server.reads)
         self.assertNotIn(('get','source-root'),self.server.reads)
+        self.assertNotIn(('get','club'),self.server.reads)
+        self.assertNotIn(('list','club'),self.server.reads)
         self.server.reads.clear()
         with patch('uqmc_recovery.destination.time.time',return_value=1301):
             result=self.run_command()

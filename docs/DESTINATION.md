@@ -7,7 +7,7 @@ write per-file mappings.
 
 ```sh
 cd /Users/bcsinger/Documents/GitHub/uqmc-drive-executor
-.venv/bin/python -m uqmc_recovery.destination '06 Trip Leaders/Skills and Assessment'
+.venv/bin/python -m uqmc_recovery.destination '06 Trip Leaders'
 ```
 
 The default is a read-only preview. It reads the fresh spreadsheet and relevant

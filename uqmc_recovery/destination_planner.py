@@ -232,8 +232,13 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths):
             cursor = logical_parent(cursor)
     names = {p: names.get(p, p.rsplit('/', 1)[-1]) for p in required}
     paths = dict(anchor_paths)
-    if anchor not in paths or set(paths) - (required | {anchor}):
+    unused = set(paths) - (required | {anchor})
+    if anchor not in paths or any(not _inside(path, section) for path in unused):
         raise SafetyError('DESTINATION_ANCHOR_OUTSIDE_SECTION_OR_MISSING')
+    # Previous completed runs may retain empty destination folders whose routes
+    # are no longer referenced. Keep their registry/history untouched, but do
+    # not turn them into targets or require their metadata for this batch.
+    paths = {path: sid for path, sid in paths.items() if path not in unused}
     if len(set(paths.values())) != len(paths):
         raise SafetyError('FOLDER_ID_HAS_MULTIPLE_TARGET_PATHS')
     for path, sid in paths.items():

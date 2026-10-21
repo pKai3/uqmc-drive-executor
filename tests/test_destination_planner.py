@@ -240,6 +240,24 @@ class HybridPlannerTests(unittest.TestCase):
                                                       'Current item':'Certificate 9/1/26.pdf'})
         self.assertEqual(self.plan()['item_routes']['other']['parent_path'],SECTION+'/Year')
 
+    def test_unused_registered_destination_inside_section_is_not_a_target(self):
+        expected=self.plan()
+        anchors={'Parent':'anchor',SECTION+'/Old empty archive':'unused-folder'}
+        # No metadata is needed: this registered identity is neither a source nor a destination of this batch.
+        actual=self.plan(anchors)
+        self.assertEqual(actual,expected)
+        self.assertNotIn('unused-folder',actual['destination_paths'].values())
+        self.assertEqual(anchors[SECTION+'/Old empty archive'],'unused-folder')
+        paths=self.resolve();paths[SECTION+'/Old empty archive']='unused-folder'
+        built=build_hybrid_preparation(self.source,section_path=SECTION,section_id='skills',workbook_id='fixture',
+            metadata_by_id=self.states,destination_paths=paths,destination_path_evidence_ref='proof')
+        self.assertNotIn('unused-folder',built['projection']['destination_paths'].values())
+        self.assertNotIn('unused-folder',{o['source_id'] for o in built['projection']['operations']})
+
+    def test_unused_external_registered_path_is_still_rejected(self):
+        with self.assertRaisesRegex(SafetyError,'DESTINATION_ANCHOR_OUTSIDE_SECTION_OR_MISSING'):
+            self.plan({'Parent':'anchor','Parent/Unrelated':'unrelated-folder'})
+
     def test_native_suffix_conversion_requires_bound_proof(self):
         self.states['child']['mime_type'] = 'application/vnd.google-apps.document'
         self.states['root']['subtree']['members'][0]['mime_type'] = self.states['child']['mime_type']
