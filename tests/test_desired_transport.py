@@ -8,7 +8,7 @@ import unittest
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import patch
 
-from uqmc_recovery.direct_transport import GoogleDriveTransport, TransportError, FILE_FIELDS, METADATA_SCOPE
+from uqmc_recovery.direct_transport import GoogleDriveTransport, TransportError, FILE_FIELDS, CHILD_FIELDS, METADATA_SCOPE
 
 
 class Request:
@@ -43,6 +43,10 @@ class Service:
         self.requests.append(("get", kwargs))
         return Request(self, self.values.pop(0))
 
+    def list(self, **kwargs):
+        self.requests.append(("list", kwargs))
+        return Request(self, self.values.pop(0))
+
     def update(self, **kwargs):
         self.requests.append(("update", kwargs))
         return Request(self, self.values.pop(0))
@@ -56,6 +60,22 @@ def transport(*values, apply=True, headers=None):
 
 
 class DesiredTransportTests(unittest.TestCase):
+    def test_membership_fields_are_narrow_and_all_pages_are_read(self):
+        rows = [
+            {"id": "child-a", "name": "First.pdf", "mimeType": "application/pdf", "parents": ["parent-a"]},
+            {"id": "child-b", "name": "Second", "mimeType": "application/vnd.google-apps.folder", "parents": ["parent-a"]},
+        ]
+        t, service = transport({"files": rows[:1], "nextPageToken": "page2"}, {"files": rows[1:]})
+        self.assertEqual(t.list_children("parent-a"), rows)
+        self.assertEqual(CHILD_FIELDS, "id,name,mimeType,parents")
+        self.assertEqual(len(service.requests), 2)
+        self.assertEqual([args["pageToken"] for _, args in service.requests], [None, "page2"])
+        for method, args in service.requests:
+            self.assertEqual(method, "list")
+            self.assertEqual(args["fields"], "nextPageToken,incompleteSearch,files(id,name,mimeType,parents)")
+            self.assertEqual(args["q"], "'parent-a' in parents and trashed = false")
+        self.assertEqual([call["retries"] for call in service.executions], [0, 0])
+
     def test_real_client_loader_wires_15_seconds_and_surfaces_timeout_without_replay(self):
         try:
             from google.oauth2.credentials import Credentials

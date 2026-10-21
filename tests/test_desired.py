@@ -28,6 +28,8 @@ class FakeDrive:
         self.before_update = None
         self.after_update = None
         self.reads = {}
+        self.permission_reads = {}
+        self.children_reads = {}
         for item in self.files.values():
             item.setdefault("version", "1")
             item.setdefault("_http_etag", '"fixture-v1"')
@@ -39,9 +41,11 @@ class FakeDrive:
         return copy.deepcopy(self.files[file_id])
 
     def list_permissions(self, file_id):
+        self.permission_reads[file_id] = self.permission_reads.get(file_id, 0) + 1
         return copy.deepcopy(self.files[file_id]["permissions"])
 
     def list_children(self, parent_id):
+        self.children_reads[parent_id] = self.children_reads.get(parent_id, 0) + 1
         return [copy.deepcopy(item) for item in self.files.values()
                 if parent_id in item.get("parents", []) and not item.get("trashed", False)]
 
@@ -66,6 +70,71 @@ class FakeDrive:
 
 
 class DesiredStateTests(unittest.TestCase):
+    def test_preview_shared_parent_request_count_and_run_scope(self):
+        for number in range(9):
+            self.add_file("fixture-extra-" + str(number), "Extra " + str(number) + ".pdf")
+        operations = list(self.operations())
+        for number in range(9):
+            operations.extend(self.operations("fixture-extra-" + str(number),
+                target_name="Approved " + str(number) + ".pdf"))
+        runner = self.freeze(operations)
+        before = self.journal.path.read_bytes()
+        # Uncached preflight is the original seven-read/item behavior.
+        for item in runner.items:
+            raw, _, _ = runner.observe(item)
+            runner.preflight(item, raw, item["target"])
+        def count():
+            return sum(self.transport.reads.values()) + sum(self.transport.permission_reads.values()) + sum(self.transport.children_reads.values())
+        self.assertEqual(count(), 70)
+        self.transport.reads.clear()
+        self.transport.permission_reads.clear()
+        self.transport.children_reads.clear()
+        self.assertEqual(runner.preview()["counts"], {"NOT_APPLIED": 10})
+        self.assertEqual(count(), 25)  # 20 source + four parent + one listing.
+        self.assertEqual(self.transport.children_reads, {"fixture-destination": 1})
+        self.assertEqual(self.transport.reads["fixture-parent"], 1)
+        self.assertEqual(self.transport.permission_reads["fixture-destination"], 1)
+        runner.preview()
+        self.assertEqual(count(), 50)  # No values survive a second invocation.
+        self.assertEqual(self.journal.path.read_bytes(), before)
+        self.assertEqual(self.transport.calls, [])
+
+    def test_preview_cache_never_authorizes_apply_after_drift(self):
+        runner = self.freeze()
+        self.assertEqual(runner.preview()["counts"], {"NOT_APPLIED": 1})
+        self.transport.files["fixture-destination"]["capabilities"] = {"canAddChildren": False}
+        result = self.run_plan(runner)
+        self.assertEqual(result["items"][0]["reason"], "DESTINATION_CANNOT_ADD_CHILDREN")
+        self.transport.files["fixture-destination"]["capabilities"] = {}
+        intruder = copy.deepcopy(self.transport.files["fixture-source"])
+        intruder.update(id="fixture-intruder", name="Renamed.pdf", parents=["fixture-destination"])
+        self.transport.files["fixture-intruder"] = intruder
+        result = self.run_plan(runner)
+        self.assertEqual(result["items"][0]["reason"], "UNAPPROVED_SIBLING_COLLISION")
+        self.transport.files.pop("fixture-intruder")
+        self.transport.files["fixture-source"]["name"] = "Human edit.pdf"
+        result = self.run_plan(runner)
+        self.assertEqual(result["items"][0]["reason"], "UNAPPROVED_NAME_DRIFT")
+        self.assertEqual(self.transport.calls, [])
+
+    def test_apply_after_success_refreshes_parent_and_membership(self):
+        self.add_file()
+        runner = self.freeze((*self.operations(), *self.operations("fixture-other", target_name="Other approved.pdf")))
+        runner.preview()
+        self.transport.children_reads.clear()
+        def changed_after_first(event):
+            if event["event"] == "item_finished" and event["state"] == "APPLIED":
+                intruder = copy.deepcopy(self.transport.files["fixture-source"])
+                intruder.update(id="fixture-intruder", name="Other approved.pdf")
+                self.transport.files["fixture-intruder"] = intruder
+        runner.progress = changed_after_first
+        result = self.run_plan(runner)
+        self.assertEqual(self.states(result), {"fixture-source": "APPLIED", "fixture-other": "CONFLICT"})
+        self.assertEqual(result["items"][1]["reason"], "UNAPPROVED_SIBLING_COLLISION")
+        self.assertEqual(self.transport.children_reads, {"fixture-destination": 2})
+        self.assertEqual(self.transport.reads["fixture-destination"], 3)  # Preview + two apply checks.
+        self.assertEqual(len(self.transport.calls), 1)
+
     def test_preview_limit_and_stop_keep_completed_progress_and_journal(self):
         self.add_file()
         self.freeze(self.operations() + self.operations("fixture-other", target_name="Other approved.pdf"))

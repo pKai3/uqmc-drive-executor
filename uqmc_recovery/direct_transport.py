@@ -28,6 +28,9 @@ FILE_FIELDS = (
     "owners,driveId,capabilities,permissions,shortcutDetails,"
     "inheritedPermissionsDisabled,shared,hasAugmentedPermissions"
 )
+# Membership and collision checks use only these fields. Full source and
+# parent reads retain FILE_FIELDS and separate paginated permission reads.
+CHILD_FIELDS = "id,name,mimeType,parents"
 _ID = re.compile(r"[A-Za-z0-9_-]+\Z")
 
 
@@ -240,7 +243,7 @@ class GoogleDriveTransport:
         return self._pages(lambda token: self.service.files().list(
             q=f"'{parent_id}' in parents and trashed = false",
             pageSize=1000, pageToken=token, spaces="drive",
-            fields=f"nextPageToken,incompleteSearch,files({FILE_FIELDS})",
+            fields=f"nextPageToken,incompleteSearch,files({CHILD_FIELDS})",
             supportsAllDrives=True, includeItemsFromAllDrives=True), "files", request="files.list", item_id=parent_id)
 
     def list_permissions(self, file_id):

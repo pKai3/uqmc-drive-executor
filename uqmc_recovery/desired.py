@@ -211,12 +211,22 @@ class DesiredRunner:
             args["removeParents"] = ",".join(sorted(removed))
         return args
 
-    def preflight(self, item, before, target, *, rollback=False):
+    @staticmethod
+    def preview_read(cache, kind, identity, fetch):
+        """Cache successful auxiliary reads only in one read-only preview."""
+        if cache is None:
+            return fetch(identity)
+        key = (kind, identity)
+        if key not in cache:
+            cache[key] = copy.deepcopy(fetch(identity))
+        return copy.deepcopy(cache[key])
+
+    def preflight(self, item, before, target, *, rollback=False, preview_cache=None):
         parents = {}
         if before["name"] != target["name"] and before.get("capabilities", {}).get("canRename") is False:
             raise SafetyError("SOURCE_CANNOT_RENAME")
         for pid in sorted(set(before["parents"]) | set(target["parents"])):
-            parent = self.read(pid)
+            parent = self.preview_read(preview_cache, "parent", pid, self.read)
             if parent.get("mimeType") != FOLDER:
                 raise SafetyError("DESTINATION_NOT_FOLDER")
             if pid in self.by_id:
@@ -230,7 +240,7 @@ class DesiredRunner:
                 capability = "canMoveItemWithinDrive" if before.get("driveId") == destination.get("driveId") else "canMoveItemOutOfDrive"
                 if before.get("capabilities", {}).get(capability) is False:
                     raise SafetyError("SOURCE_CANNOT_MOVE_" + capability)
-            siblings = self.transport.list_children(pid)
+            siblings = self.preview_read(preview_cache, "children", pid, self.transport.list_children)
             collision = {s["id"] for s in siblings if s["id"] != item["source_id"] and s["name"].casefold() == target["name"].casefold()}
             if collision - item["allowed_collision_ids"]:
                 raise SafetyError("UNAPPROVED_SIBLING_COLLISION")
@@ -247,7 +257,7 @@ class DesiredRunner:
                     if pid in seen:
                         raise SafetyError("FOLDER_CYCLE")
                     seen.add(pid)
-                    children = self.transport.list_children(pid)
+                    children = self.preview_read(preview_cache, "children", pid, self.transport.list_children)
                     members.extend(children)
                     pending.extend(c["id"] for c in children if c["mimeType"] == FOLDER)
                 if set(target["parents"]) & ({item["source_id"]} | {m["id"] for m in members}):
@@ -272,6 +282,9 @@ class DesiredRunner:
         with self.journal.locked():
             self.authority()
             output = []
+            # Local to this invocation: apply/resume/rollback never receive it.
+            # Source observations always bypass this advisory preview cache.
+            preview_cache = {}
             for item in self.items:
                 if self.stop_requested or (limit is not None and len(output) >= limit):
                     break
@@ -279,7 +292,9 @@ class DesiredRunner:
                     completed_items=len(output), total_items=len(self.items))
                 try:
                     raw, current, state = self.observe(item)
-                    parents = self.preflight(item, raw, item["target"])
+                    if raw.get("mimeType") == FOLDER:
+                        preview_cache[("parent", item["source_id"])] = copy.deepcopy(raw)
+                    parents = self.preflight(item, raw, item["target"], preview_cache=preview_cache)
                     output.append({"source_id": item["source_id"], "state": state, "observed": current,
                         "access": {"source_capabilities": raw.get("capabilities"),
                             "parent_capabilities": {pid: value.get("capabilities") for pid, value in parents.items()},
