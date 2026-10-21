@@ -188,7 +188,7 @@ class DesiredRunner:
         rolled = {r["payload"].get("forward_event_id") for r in self.events(item["source_id"]) if r["kind"] == "DESIRED_ROLLED_BACK"}
         return next((r for r in reversed(changes) if r["event_id"] not in rolled), None)
 
-    def approved(self, item, raw):
+    def approved(self, item, raw, *, dependency=False):
         current = core(raw)
         if current["id"] != item["source_id"] or current["mime_type"] != item["original"]["mime_type"]:
             raise SafetyError("IDENTITY_OR_MIME_DRIFT")
@@ -210,7 +210,14 @@ class DesiredRunner:
             else:
                 if core(raw) != core(applied):
                     raise SafetyError("RECORDED_APPLIED_STATE_WAS_CHANGED")
-                self.unchanged(applied, raw, strict=True)
+                # Parent observations authorize use of the current location;
+                # siblings/provider propagation may advance its version without
+                # changing that location. Actual mutation targets stay strict.
+                self.unchanged(applied, raw, strict=not dependency)
+            if dependency:
+                known = applied.get("capabilities", {}).get("canAddChildren")
+                if known is not None and raw.get("capabilities", {}).get("canAddChildren") != known:
+                    raise SafetyError("DEPENDENCY_CAPABILITY_DRIFT")
         else:
             for old, native in IMMUTABLE.items():
                 if baseline.get(old) is not None and raw.get(native) != baseline[old]:
@@ -275,7 +282,9 @@ class DesiredRunner:
             if parent.get("mimeType") != FOLDER:
                 raise SafetyError("DESTINATION_NOT_FOLDER")
             if pid in self.by_id:
-                self.approved(self.by_id[pid], parent)
+                self.approved(self.by_id[pid], parent, dependency=True)
+                if not rollback and pid in item["dependencies"] and core(parent) != self.by_id[pid]["target"]:
+                    raise SafetyError("PARENT_DEPENDENCY_LOCATION_CONFLICT")
             parents[pid] = parent
         for pid in target["parents"]:
             if pid not in before["parents"]:
@@ -317,9 +326,9 @@ class DesiredRunner:
                         raise SafetyError("FOLDER_MEMBER_METADATA_DRIFT")
         return parents
 
-    def observe(self, item):
+    def observe(self, item, *, dependency=False):
         raw = self.read(item["source_id"])
-        current = self.approved(item, raw)
+        current = self.approved(item, raw, dependency=dependency)
         partial = any(current[f] == item["target"][f] != item["original"][f] for f in ("name", "parents"))
         return raw, current, "TARGET" if current == item["target"] else "PARTIAL" if partial else "NOT_APPLIED"
 
@@ -547,7 +556,7 @@ class DesiredRunner:
                 if not rollback:
                     for source_id in sorted(external):
                         try:
-                            _, _, state = self.observe(self.by_id[source_id])
+                            _, _, state = self.observe(self.by_id[source_id], dependency=True)
                             if state == "TARGET":
                                 satisfied.add(source_id)
                         except Exception:
