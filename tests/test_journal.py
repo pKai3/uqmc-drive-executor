@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -101,6 +102,70 @@ class JournalTests(unittest.TestCase):
         self.journal.append("PREPARED", payload={"evidence_ref": "sha256:" + "a" * 64})
         with self.assertRaises(JournalCorrupt):
             self.journal.backup(self.base / "backup")
+
+    def test_shared_controller_serializes_worker_appends_and_evidence(self):
+        barrier = threading.Barrier(8)
+        def write(index):
+            if index < 8:
+                barrier.wait(timeout=5)
+            ref = self.journal.evidence({"worker": index})
+            saved = self.journal.append("ATTEMPTED", "item-" + str(index), 1, {"evidence_ref": ref})
+            self.assertEqual(self.journal.read_evidence(ref), {"worker": index})
+            return saved
+        with self.journal.shared_locked():
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                results = list(executor.map(write, range(24)))
+            records = self.journal.records()
+            self.assertEqual(len(records), 24)
+            self.assertEqual({r["seq"] for r in results}, set(range(1, 25)))
+            self.assertEqual({r["operation_id"] for r in records}, {"item-" + str(i) for i in range(24)})
+        self.assertEqual(self.journal.records(), records)
+
+    def test_shared_controller_excludes_other_instances_and_nested_controllers(self):
+        other = Journal(self.journal.root)
+        with self.journal.shared_locked():
+            with self.assertRaises(JournalBusy):
+                other.append("ATTEMPTED")
+            with self.assertRaises(JournalBusy):
+                with self.journal.shared_locked():
+                    pass
+            script = (
+                "from uqmc_recovery.journal import Journal,JournalBusy\n"
+                "import sys\n"
+                "try: Journal(sys.argv[1]).append('ATTEMPTED')\n"
+                "except JournalBusy: sys.exit(23)\n"
+            )
+            outcome = subprocess.run([sys.executable, "-c", script, str(self.journal.root)],
+                                     capture_output=True, text=True)
+            self.assertEqual(outcome.returncode, 23, outcome.stderr)
+        with self.journal.locked():
+            with self.assertRaises(JournalBusy):
+                with self.journal.shared_locked():
+                    pass
+        other.append("PREPARED")
+
+    def test_shared_controller_waits_for_nested_pool_on_exception_and_releases_lock(self):
+        other = Journal(self.journal.root)
+        ready, finish = threading.Event(), threading.Event()
+        def worker():
+            ready.set()
+            finish.wait(timeout=5)
+            with self.assertRaises(JournalBusy):
+                other.append("ATTEMPTED")
+            self.journal.append("VERIFIED_APPLIED", "fixture-item", 1)
+        with self.assertRaisesRegex(RuntimeError, "controller interruption"):
+            with self.journal.shared_locked():
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(worker)
+                    self.assertTrue(ready.wait(timeout=5))
+                    finish.set()
+                    raise RuntimeError("controller interruption")
+        future.result()
+        self.assertEqual(self.journal.records()[0]["kind"], "VERIFIED_APPLIED")
+        other.append("PREPARED")
+        with self.journal.locked(), ThreadPoolExecutor(max_workers=1) as executor:
+            with self.assertRaises(JournalBusy):
+                executor.submit(self.journal.append, "ATTEMPTED").result()
 
     def test_same_object_other_thread_excluded(self):
         with self.journal.locked(), ThreadPoolExecutor(max_workers=1) as executor:

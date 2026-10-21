@@ -8,11 +8,13 @@ from __future__ import annotations
 import argparse
 import copy
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime, timezone
 import json
 from pathlib import Path
 import signal
-import time
+import random
+import threading
 import uuid
 
 from .__main__ import plan_from_json, save_new
@@ -100,18 +102,49 @@ class DesiredRunner:
         self.audit_permissions = audit_permissions
         self.max_attempts, self.retry_delay = max_attempts, retry_delay
         self.fault = fault or (lambda *args: None)
-        self.stop_requested = False
+        self._stop_event = threading.Event()
+        self._progress_gate = threading.RLock()
         self.progress = progress or (lambda event: None)
         self.progress_output_failed = False
         self.items = compile_items(plan, journal)
         self.by_id = {i["source_id"]: i for i in self.items}
 
+    @property
+    def stop_requested(self):
+        return self._stop_event.is_set()
+
+    @stop_requested.setter
+    def stop_requested(self, value):
+        self._stop_event.set() if value else self._stop_event.clear()
+
     def report_progress(self, event, **value):
-        try:
-            self.progress({"event": event, **value})
-        except Exception:
-            # An output failure must not turn a verified action into a retry.
-            self.progress_output_failed = True
+        with self._progress_gate:
+            try:
+                self.progress({"event": event, **value})
+            except Exception:
+                # An output failure must not turn a verified action into a retry.
+                self.progress_output_failed = True
+
+    @staticmethod
+    def transient(error):
+        return isinstance(error, (TimeoutError, ConnectionError)) or getattr(error, "transient", False)
+
+    def backoff(self, attempt):
+        cap = min(30.0, self.retry_delay * (2 ** (attempt - 1)))
+        self._stop_event.wait(random.uniform(cap / 2, cap))
+
+    def read_retry(self, fetch):
+        # Reads can be retried even after cancellation to reconcile in-flight work.
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                return fetch()
+            except Exception as exc:
+                if not self.transient(exc) or attempt == self.max_attempts:
+                    raise
+                self.backoff(attempt)
+
+    def children(self, parent_id):
+        return self.read_retry(lambda: self.transport.list_children(parent_id))
 
     def events(self, source_id=None):
         return [r for r in self.journal.records() if r["kind"].startswith("DESIRED_")
@@ -129,12 +162,12 @@ class DesiredRunner:
                 "audit_permissions": self.audit_permissions})
 
     def read(self, source_id):
-        raw = self.transport.get_file(source_id)
+        raw = self.read_retry(lambda: self.transport.get_file(source_id))
         if raw.get("id") != source_id or raw.get("trashed") is True:
             raise SafetyError("SOURCE_ID_OR_TRASH_CONFLICT")
         core(raw)
         if self.audit_permissions:
-            raw["_permissions"] = sorted(self.transport.list_permissions(source_id), key=digest)
+            raw["_permissions"] = sorted(self.read_retry(lambda: self.transport.list_permissions(source_id)), key=digest)
         return raw
 
     def authority(self):
@@ -169,9 +202,15 @@ class DesiredRunner:
         baseline = item["baseline"]
         if active:
             applied = self.journal.read_evidence(active["payload"]["applied_ref"])
-            if core(raw) != core(applied):
-                raise SafetyError("RECORDED_APPLIED_STATE_WAS_CHANGED")
-            self.unchanged(applied, raw, strict=True)
+            pending = self.pending(item, "FORWARD")
+            intended = self.journal.read_evidence(pending["payload"]["target_ref"]) if pending else None
+            if pending and core(raw) == intended:
+                prior = self.journal.read_evidence(pending["payload"]["before_ref"])
+                self.unchanged(prior, raw, moving=core(prior)["parents"] != intended["parents"])
+            else:
+                if core(raw) != core(applied):
+                    raise SafetyError("RECORDED_APPLIED_STATE_WAS_CHANGED")
+                self.unchanged(applied, raw, strict=True)
         else:
             for old, native in IMMUTABLE.items():
                 if baseline.get(old) is not None and raw.get(native) != baseline[old]:
@@ -246,7 +285,7 @@ class DesiredRunner:
                 capability = "canMoveItemWithinDrive" if before.get("driveId") == destination.get("driveId") else "canMoveItemOutOfDrive"
                 if before.get("capabilities", {}).get(capability) is False:
                     raise SafetyError("SOURCE_CANNOT_MOVE_" + capability)
-            siblings = self.preview_read(preview_cache, "children", pid, self.transport.list_children)
+            siblings = self.preview_read(preview_cache, "children", pid, self.children)
             collision = {s["id"] for s in siblings if s["id"] != item["source_id"] and s["name"].casefold() == target["name"].casefold()}
             if collision - item["allowed_collision_ids"]:
                 raise SafetyError("UNAPPROVED_SIBLING_COLLISION")
@@ -263,7 +302,7 @@ class DesiredRunner:
                     if pid in seen:
                         raise SafetyError("FOLDER_CYCLE")
                     seen.add(pid)
-                    children = self.preview_read(preview_cache, "children", pid, self.transport.list_children)
+                    children = self.preview_read(preview_cache, "children", pid, self.children)
                     members.extend(children)
                     pending.extend(c["id"] for c in children if c["mimeType"] == FOLDER)
                 if set(target["parents"]) & ({item["source_id"]} | {m["id"] for m in members}):
@@ -387,10 +426,12 @@ class DesiredRunner:
             self.unchanged(before, observed, strict=True)
             self.record("OBSERVED", item, direction=direction, attempt=attempt, observed_ref=self.journal.evidence(observed),
                 state="NOT_APPLIED", request_outcome="UNKNOWN" if error else "RETURNED_SUCCESS", **payload)
-            transient = isinstance(error, (TimeoutError, ConnectionError)) or getattr(error, "transient", False) or getattr(error, "status", None) in {408, 429, 500, 502, 503, 504}
+            transient = self.transient(error)
             if not transient or attempt == self.max_attempts:
                 return {"source_id": item["source_id"], "state": "NOT_APPLIED", "reason": "RETRY_BUDGET_EXHAUSTED" if transient else "REQUEST_REFUSED_OR_UNEXPECTED_READBACK"}
-            time.sleep(min(self.retry_delay * attempt, 5))
+            self.backoff(attempt)
+            if self.stop_requested:
+                return {"source_id": item["source_id"], "state": "NOT_APPLIED", "reason": "PAUSED_AFTER_RECONCILIATION"}
             before = self.read(item["source_id"])
             if core(before) == target:
                 return self.applied(item, recovery_before, before, payload, rollback_event, recovered=True)
@@ -412,65 +453,160 @@ class DesiredRunner:
         return {"source_id": item["source_id"], "state": kind, "observed": core(after),
             "effects": self.effects(item, core(after)), "historical_request_uncertainty_retained": bool(recovered or item["historical_uncertain_operation_ids"])}
 
-    def run(self, *, apply=False, confirm_plan_sha256=None, limit=999, rollback=False):
+    def execute_item(self, item, *, rollback=False):
+        """One file at a time per worker; existing transition owns WAL/readback."""
+        try:
+            if rollback:
+                event = self.latest_change(item)
+                if not event:
+                    return {"source_id": item["source_id"], "state": "NOTHING_TO_ROLL_BACK"}
+                raw = self.read(item["source_id"])
+                applied = self.journal.read_evidence(event["payload"]["applied_ref"])
+                target = core(self.journal.read_evidence(event["payload"]["before_ref"]))
+                pending = self.pending(item, "ROLLBACK")
+                if pending and core(raw) == target:
+                    return self.transition(item, raw, target, rollback_event=event)
+                if core(raw) != core(applied):
+                    raise SafetyError("ROLLBACK_CURRENT_STATE_CONFLICT")
+                self.unchanged(applied, raw, strict=True)
+                return self.transition(item, raw, target, rollback_event=event)
+            raw, current, state = self.observe(item)
+            if state == "TARGET" and self.pending(item, "FORWARD"):
+                return self.transition(item, raw, item["target"])
+            if state == "TARGET":
+                self.record("OBSERVED", item, observed_ref=self.journal.evidence(raw), state="TARGET")
+                return {"source_id": item["source_id"], "state": "TARGET", "observed": current,
+                        "effects": self.effects(item, current)}
+            return self.transition(item, raw, item["target"])
+        except Exception as exc:
+            result = self.error_item(item, exc)
+            pending = self.pending(item, "ROLLBACK" if rollback else "FORWARD")
+            if pending and result["state"] == "UNAVAILABLE":
+                result["state"] = "UNCERTAIN"
+            self.record("STOPPED", item, direction="ROLLBACK" if rollback else "FORWARD",
+                        **{k: v for k, v in result.items() if k != "source_id"})
+            return result
+
+    def run(self, *, apply=False, confirm_plan_sha256=None, limit=999, rollback=False,
+            workers=1, transport_factory=None, source_ids=None):
         if not apply or not self.transport.apply_enabled or confirm_plan_sha256 != self.plan.proposal_hash:
             raise SafetyError("EXPLICIT_APPLY_AND_EXACT_PLAN_HASH_REQUIRED")
-        with self.journal.locked():
+        if type(workers) is not int or not 1 <= workers <= 32 or type(limit) is not int or limit < 1:
+            raise SafetyError("BOUNDED_WORKERS_AND_LIMIT_REQUIRED")
+        if workers > 1 and transport_factory is None:
+            raise SafetyError("INDEPENDENT_WORKER_TRANSPORT_FACTORY_REQUIRED")
+        selected = list(self.items)
+        if source_ids is not None:
+            source_ids = list(source_ids)
+            if not source_ids or len(source_ids) != len(set(source_ids)) or not set(source_ids) <= set(self.by_id):
+                raise SafetyError("UNIQUE_APPROVED_SOURCE_IDS_REQUIRED")
+            selected = [i for i in selected if i["source_id"] in set(source_ids)]
+        if len({i["source_id"] for i in selected}) != len(selected):
+            raise SafetyError("DUPLICATE_CONCURRENT_SOURCE_ID")
+        with self.journal.shared_locked():
             self.authority()
             backup = self.journal.root.parent / "backups"
             backup.mkdir(mode=0o700, parents=True, exist_ok=True)
             self.journal.backup(backup / ("desired-before-" + str(uuid.uuid4())))
             self.journal.append("DESIRED_POLICY_BOUND", payload={"plan_sha256": self.plan.proposal_hash,
                 "run_id": self.plan.run_id, "policy": "exact-desired-state-v1", "direction": "ROLLBACK" if rollback else "FORWARD",
-                "dependencies": {i["source_id"]: i["dependencies"] for i in self.items}, "global_phases_removed": True,
-                "audit_permissions": self.audit_permissions})
+                "dependencies": {i["source_id"]: i["dependencies"] for i in selected}, "global_phases_removed": True,
+                "audit_permissions": self.audit_permissions, "workers": workers,
+                "selected_source_ids": [i["source_id"] for i in selected], "maximum_new_changes": limit})
             output, satisfied, changed = [], set(), 0
+            selected_ids = {i["source_id"] for i in selected}
+            dependencies = {i["source_id"]: set(i["dependencies"]) for i in selected}
+            if rollback:
+                selected = [i for i in reversed(selected) if self.latest_change(i)]
+                dependencies = {i["source_id"]: {other["source_id"] for other in self.items
+                    if i["source_id"] in other["dependencies"] and self.latest_change(other)} for i in selected}
+            local, factory_gate, clients = threading.local(), threading.Lock(), []
+            def worker(item):
+                if not hasattr(local, "runner"):
+                    transport = transport_factory() if transport_factory else self.transport
+                    with factory_gate:
+                        if workers > 1 and (transport is self.transport or any(transport is old for old in clients)):
+                            raise SafetyError("NON_INDEPENDENT_WORKER_TRANSPORT")
+                        clients.append(transport)
+                    local.runner = copy.copy(self)
+                    local.runner.transport = transport
+                    local.runner.report_progress = self.report_progress
+                return local.runner.execute_item(item, rollback=rollback)
+            def finished(item, result):
+                nonlocal changed
+                output.append(result)
+                if result["state"] in ({"ROLLED_BACK", "NOTHING_TO_ROLL_BACK"} if rollback else {"APPLIED", "TARGET"}):
+                    satisfied.add(item["source_id"])
+                if result["state"] in {"APPLIED", "ROLLED_BACK"}:
+                    changed += 1
+                self.report_progress("item_finished", completed_items=len(output), total_items=len(selected), **result)
             try:
-                for item in reversed(self.items) if rollback else self.items:
-                    if self.stop_requested or changed >= limit:
-                        break
-                    self.report_progress("item_started", source_id=item["source_id"], mode="ROLLBACK" if rollback else "APPLY",
-                        completed_items=len(output), total_items=len(self.items))
-                    try:
-                        if rollback:
-                            event = self.latest_change(item)
-                            if not event:
+                # Subset runs observe outside dependencies; never add them to mutation scope.
+                external = set().union(*dependencies.values()) - selected_ids if dependencies else set()
+                if not rollback:
+                    for source_id in sorted(external):
+                        try:
+                            _, _, state = self.observe(self.by_id[source_id])
+                            if state == "TARGET":
+                                satisfied.add(source_id)
+                        except Exception:
+                            pass  # Descendants receive an explicit blocked result below.
+                pending = list(selected)
+                in_flight = {}
+                fatal = None
+                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="uqmc-drive") as pool:
+                    while pending or in_flight:
+                        # Reserve one possible new effect for every outstanding item.
+                        capacity = min(workers - len(in_flight), limit - changed - len(in_flight))
+                        if not self.stop_requested and capacity > 0:
+                            occupied_names = {(pid, i["target"]["name"].casefold())
+                                for i in in_flight.values() for pid in i["target"]["parents"]}
+                            ready = []
+                            for item in pending:
+                                keys = {(pid, item["target"]["name"].casefold()) for pid in item["target"]["parents"]}
+                                if dependencies[item["source_id"]] <= satisfied and not keys & occupied_names:
+                                    ready.append(item)
+                                    occupied_names.update(keys)
+                                    if len(ready) >= capacity:
+                                        break
+                            for item in ready:
+                                if self.stop_requested:
+                                    break
+                                pending.remove(item)
+                                self.report_progress("item_started", source_id=item["source_id"],
+                                    mode="ROLLBACK" if rollback else "APPLY", completed_items=len(output), total_items=len(selected))
+                                in_flight[pool.submit(worker, item)] = item
+                        if not in_flight:
+                            if self.stop_requested or changed >= limit:
+                                break
+                            # Anything remaining is blocked by failed/out-of-scope dependencies.
+                            for item in pending:
+                                result = {"source_id": item["source_id"], "state": "DEPENDENCY_BLOCKED",
+                                    "dependency_ids": sorted(dependencies[item["source_id"]] - satisfied)}
+                                self.record("STOPPED", item, direction="ROLLBACK" if rollback else "FORWARD",
+                                    state=result["state"], dependency_ids=result["dependency_ids"])
+                                finished(item, result)
+                            break
+                        done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                        for future in done:
+                            item = in_flight.pop(future)
+                            try:
+                                result = future.result()
+                            except Exception as exc:
+                                result = self.error_item(item, exc)
+                                self.record("STOPPED", item, direction="ROLLBACK" if rollback else "FORWARD",
+                                    **{k:v for k,v in result.items() if k != "source_id"})
+                            except BaseException as exc:
+                                # Simulated/process-level interruption: join already dispatched
+                                # work and preserve unresolved intents for restart reconciliation.
+                                self.stop_requested = True
+                                fatal = fatal or exc
                                 continue
-                            if any(item["source_id"] in other["dependencies"] and self.latest_change(other) for other in self.items):
-                                result = {"source_id": item["source_id"], "state": "DEPENDENCY_BLOCKED"}
-                            else:
-                                raw = self.read(item["source_id"])
-                                applied = self.journal.read_evidence(event["payload"]["applied_ref"])
-                                target = core(self.journal.read_evidence(event["payload"]["before_ref"]))
-                                pending = self.pending(item, "ROLLBACK")
-                                if pending and core(raw) == target:
-                                    result = self.transition(item, raw, target, rollback_event=event)
-                                else:
-                                    if core(raw) != core(applied):
-                                        raise SafetyError("ROLLBACK_CURRENT_STATE_CONFLICT")
-                                    self.unchanged(applied, raw, strict=True)
-                                    result = self.transition(item, raw, target, rollback_event=event)
-                        elif not set(item["dependencies"]) <= satisfied:
-                            result = {"source_id": item["source_id"], "state": "DEPENDENCY_BLOCKED"}
-                        else:
-                            raw, current, state = self.observe(item)
-                            if state == "TARGET" and self.pending(item, "FORWARD"):
-                                result = self.transition(item, raw, item["target"])
-                            elif state == "TARGET":
-                                self.record("OBSERVED", item, observed_ref=self.journal.evidence(raw), state="TARGET")
-                                result = {"source_id": item["source_id"], "state": "TARGET", "observed": current, "effects": self.effects(item, current)}
-                            else:
-                                result = self.transition(item, raw, item["target"])
-                            if result["state"] in {"APPLIED", "TARGET"}:
-                                satisfied.add(item["source_id"])
-                        if result["state"] in {"APPLIED", "ROLLED_BACK"}:
-                            changed += 1
-                    except Exception as exc:
-                        result = self.error_item(item, exc)
-                        self.record("STOPPED", item, direction="ROLLBACK" if rollback else "FORWARD", **{k:v for k,v in result.items() if k != "source_id"})
-                    output.append(result)
-                    self.report_progress("item_finished", completed_items=len(output), total_items=len(self.items), **result)
-                return self.summary(output, rollback=rollback)
+                            finished(item, result)
+                    if fatal:
+                        raise fatal
+                return self.summary(output, rollback=rollback, workers=workers,
+                    selected_items=len(selected), new_changes=changed)
             finally:
                 self.journal.backup(backup / ("desired-after-" + str(uuid.uuid4())))
 
@@ -504,7 +640,7 @@ def export_status(journal, summary, directory):
         args = p.get("args", {})
         action = "MOVE_AND_RENAME" if "name" in args and ("addParents" in args or "removeParents" in args) else "RENAME" if "name" in args else "MOVE"
         rows.append([event["event_id"], event["at"], p["run_id"], event["operation_id"], event["attempt"], p["operation_order"], json.dumps(p.get("dependencies", [])), p["direction"], action,
-            json.dumps(p.get("original_operation_ids", [])), p["source_id"], core(before)["mime_type"], before["name"], json.dumps(before["parents"]), intended["name"], json.dumps(intended["parents"]), states[event["kind"]],
+            json.dumps(p.get("original_operation_ids", [])), p["source_id"], core(before)["mime_type"], before["name"], json.dumps(before["parents"]), intended["name"], json.dumps(intended["parents"]), "UNCERTAIN" if p.get("state") == "UNCERTAIN" else states[event["kind"]],
             observed["name"] if observed else None, json.dumps(observed["parents"]) if observed else None, p["before_ref"], p.get("observed_ref"), p["before_ref"], p.get("forward_event_id"), "explicit local CLI", p.get("request_outcome"), event["hash"]])
     log_path = save_new(target / (token + "-operation-log.json"), {"headers": HEADERS, "rows": rows, "idempotency_column": "Event ID", "private": True})
     return {"status": status_path, "operation_log": log_path, "published": False}
@@ -521,12 +657,14 @@ def main(argv=None):
     p.add_argument("--confirm-plan-sha256")
     p.add_argument("--limit", type=int, default=999)
     p.add_argument("--max-attempts", type=int, default=3)
+    p.add_argument("--workers", type=int, default=10, help="Independent mutation workers, 1..32 (default: 10)")
+    p.add_argument("--source-ids-file", help="Private JSON array selecting an exact approved subset; no added dependencies")
     p.add_argument("--export-dir")
     p.add_argument("--skip-permission-audit", action="store_true",
         help="Skip permission reads/comparisons only with existing accepted section exposure; never edits sharing")
     args = p.parse_args(argv)
-    if args.limit < 1:
-        p.error("--limit must be positive")
+    if args.limit < 1 or not 1 <= args.workers <= 32:
+        p.error("--limit must be positive and --workers must be 1..32")
     journal = Journal(args.store)
     plan = plan_from_json(json.loads(Path(args.plan).read_text()))
     mutating = args.command != "preview"
@@ -549,9 +687,16 @@ def main(argv=None):
                 if auth.get("exposure_review_ref"):
                     allowed.update(journal.read_evidence(auth["exposure_review_ref"]).get("access_baselines", {}))
         excluded = set(plan.excluded_ids) | {r["payload"]["file_id"] for r in journal.records() if r["kind"] == "EXCLUDED"}
-        transport = GoogleDriveTransport.from_authorized_user_file(args.token, apply=mutating, allowed_ids=allowed,
-            mutation_ids={i["source_id"] for i in items}, excluded_ids=excluded,
-            audit_permissions=not args.skip_permission_audit)
+        selected_ids = json.loads(Path(args.source_ids_file).read_text()) if args.source_ids_file else None
+        if selected_ids is not None and (not isinstance(selected_ids, list) or not selected_ids or
+                any(not isinstance(value, str) for value in selected_ids) or
+                len(selected_ids) != len(set(selected_ids)) or not set(selected_ids) <= {i["source_id"] for i in items}):
+            raise SafetyError("UNIQUE_APPROVED_SOURCE_IDS_REQUIRED")
+        mutation_ids = set(selected_ids) if selected_ids is not None else {i["source_id"] for i in items}
+        def make_transport():
+            return GoogleDriveTransport.from_authorized_user_file(args.token, apply=mutating, allowed_ids=allowed,
+                mutation_ids=mutation_ids, excluded_ids=excluded, audit_permissions=not args.skip_permission_audit)
+        transport = make_transport()
         account = transport.get_account()
         if args.expect_account and account["emailAddress"].casefold() != args.expect_account.casefold():
             raise SafetyError("AUTHENTICATED_ACCOUNT_MISMATCH")
@@ -559,14 +704,22 @@ def main(argv=None):
         runner = DesiredRunner(journal, plan, transport, max_attempts=args.max_attempts,
             progress=lambda event: print(json.dumps(event), flush=True),
             audit_permissions=not args.skip_permission_audit)
+        def worker_transport():
+            client = make_transport()
+            if client.get_account()["emailAddress"].casefold() != account["emailAddress"].casefold():
+                raise SafetyError("WORKER_AUTHENTICATED_ACCOUNT_MISMATCH")
+            return client
+        if selected_ids is not None and not mutating:
+            runner.items = [i for i in runner.items if i["source_id"] in mutation_ids]
         def stop(signum, frame):
             runner.stop_requested = True
         signal.signal(signal.SIGINT, stop)
         signal.signal(signal.SIGTERM, stop)
-        summary = runner.run(apply=args.apply, confirm_plan_sha256=args.confirm_plan_sha256, limit=args.limit, rollback=args.command == "rollback") if mutating else runner.preview(limit=args.limit)
+        summary = runner.run(apply=args.apply, confirm_plan_sha256=args.confirm_plan_sha256, limit=args.limit, rollback=args.command == "rollback",
+            workers=args.workers, transport_factory=worker_transport, source_ids=selected_ids) if mutating else runner.preview(limit=args.limit)
         summary["authenticated_account"] = account
         print(json.dumps(summary))
-        bad = {"CONFLICT", "UNAVAILABLE", "DEPENDENCY_BLOCKED"} | ({"NOT_APPLIED", "PARTIAL"} if mutating else set())
+        bad = {"CONFLICT", "UNAVAILABLE", "UNCERTAIN", "DEPENDENCY_BLOCKED"} | ({"NOT_APPLIED", "PARTIAL"} if mutating else set())
         return 0 if not any(i["state"] in bad for i in summary["items"]) else 2
     except Exception as exc:
         print(json.dumps({"error": str(exc) if isinstance(exc, SafetyError) else type(exc).__name__,

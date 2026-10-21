@@ -9,11 +9,13 @@ Official references:
 https://developers.google.com/workspace/drive/api/reference/rest/v3/files/update
 https://developers.google.com/workspace/drive/api/reference/rest/v3/files/list
 https://developers.google.com/workspace/drive/api/reference/rest/v3/permissions/list
+https://developers.google.com/workspace/drive/api/guides/handle-errors
 https://googleapis.dev/python/google-auth-httplib2/latest/google_auth_httplib2.html
 """
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 import re
 import stat
@@ -103,7 +105,7 @@ class TransportError(SafetyError):
     def transient(self):
         # Classification is advice for a fresh-read recovery loop, never a
         # transport-level instruction to replay a mutation.
-        return self.status in {408, 429, 500, 502, 503, 504} or (
+        return (self.status == 403 and self.code == "DRIVE_RATE_LIMIT") or self.status in {408, 429, 500, 502, 503, 504} or (
             self.status is None and self.code in {"DRIVE_TRANSPORT_ERROR", "DRIVE_REQUEST_TIMEOUT"})
 
 
@@ -123,6 +125,27 @@ def _is_timeout(error):
     return False
 
 
+def _is_rate_limit_403(error, status):
+    """Allow only documented structured rate-limit reasons, never message text."""
+    if status != 403:
+        return False
+    content = getattr(error, "content", None)
+    if not isinstance(content, (bytes, str)) or len(content) > 65536:
+        return False
+    try:
+        body = json.loads(content)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return False
+    details = body.get("error") if isinstance(body, dict) else None
+    errors = details.get("errors") if isinstance(details, dict) else None
+    # Mixed or unknown reasons can include permission failures; fail closed.
+    return isinstance(errors, list) and bool(errors) and all(
+        isinstance(entry, dict) and isinstance(entry.get("reason"), str)
+        and entry["reason"] in {"rateLimitExceeded", "userRateLimitExceeded"}
+        for entry in errors
+    )
+
+
 def _failure(error, *, dispatched, request=None, item_id=None):
     status = getattr(getattr(error, "resp", None), "status", None)
     if not isinstance(status, int) or isinstance(status, bool) or not 100 <= status <= 599:
@@ -131,6 +154,7 @@ def _failure(error, *, dispatched, request=None, item_id=None):
     return TransportError(
         "AUTOMATIC_HTTP_REPLAY_BLOCKED" if isinstance(error, _ReplayBlocked)
         else "DRIVE_REQUEST_TIMEOUT" if _is_timeout(error)
+        else "DRIVE_RATE_LIMIT" if _is_rate_limit_403(error, status)
         else "DRIVE_HTTP_ERROR" if status else "DRIVE_TRANSPORT_ERROR",
         status=status, outcome="UNKNOWN" if dispatched else "READ_FAILED",
         request=request, item_id=item_id

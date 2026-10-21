@@ -231,6 +231,57 @@ class DesiredTransportTests(unittest.TestCase):
         self.assertNotIn("_http_etag", t.get_file("file-a"))
         self.assertEqual([call["retries"] for call in service.executions], [0, 0])
 
+    def test_structured_rate_limit_403_is_retryable_but_permission_denial_is_not(self):
+        try:
+            import httplib2
+            from googleapiclient.errors import HttpError
+        except ImportError:
+            self.skipTest("Optional direct dependencies are not installed")
+        for reasons, transient in (
+            (["rateLimitExceeded"], True),
+            (["userRateLimitExceeded"], True),
+            (["rateLimitExceeded", "userRateLimitExceeded"], True),
+            (["insufficientFilePermissions"], False),
+            (["forbidden"], False),
+            (["rateLimitExceeded", "insufficientFilePermissions"], False),
+            (["dailyLimitExceeded"], False),
+        ):
+            for write in (False, True):
+                with self.subTest(reasons=reasons, write=write):
+                    body = {"error": {"code": 403, "message": "provider secret",
+                        "errors": [{"reason": reason, "message": "provider secret"} for reason in reasons]}}
+                    error = HttpError(httplib2.Response({"status": "403"}), json.dumps(body).encode(), uri="https://secret.invalid")
+                    t, service = transport(error)
+                    with self.assertRaises(TransportError) as caught:
+                        if write:
+                            t.update_metadata({"fileId": "file-a", "name": "approved.pdf"})
+                        else:
+                            t.get_file("file-a")
+                    actual = caught.exception
+                    self.assertEqual(actual.status, 403)
+                    self.assertEqual(actual.transient, transient)
+                    self.assertEqual(actual.code, "DRIVE_RATE_LIMIT" if transient else "DRIVE_HTTP_ERROR")
+                    self.assertEqual(actual.outcome, "UNKNOWN" if write else "READ_FAILED")
+                    self.assertNotIn("secret", str(actual))
+                    self.assertNotIn("secret", json.dumps(actual.as_dict()))
+                    self.assertEqual(len(service.executions), 1)
+                    self.assertEqual(service.executions[0]["retries"], 0)
+
+    def test_rate_limit_classification_does_not_guess_from_text_or_malformed_body(self):
+        bodies = (b"rateLimitExceeded", b"not-json", b"[]", b'{"error": []}',
+            b'{"error":{"errors":[]}}', b'{"error":{"errors":[{}]}}',
+            b'{"error":{"errors":[{"reason":[]}]}}',
+            b'{"error":{"message":"userRateLimitExceeded"}}', b"x" * 65537)
+        for body in bodies:
+            error = RuntimeError("rateLimitExceeded")
+            error.resp = types.SimpleNamespace(status=403)
+            error.content = body
+            t, _ = transport(error)
+            with self.subTest(body=body[:60]), self.assertRaises(TransportError) as caught:
+                t.get_file("file-a")
+            self.assertFalse(caught.exception.transient)
+            self.assertEqual(caught.exception.code, "DRIVE_HTTP_ERROR")
+
     def test_conflict_and_transient_errors_are_classified_without_replay(self):
         for status, conflict, transient in ((412, True, False), (429, False, True),
                 (503, False, True), (403, False, False), (400, False, False)):

@@ -176,6 +176,7 @@ class Journal:
         self.lock_path = self.root / ".lock"
         self._gate = threading.RLock()
         self._depth = 0
+        self._shared = False
         self._fd: int | None = None
         self._creator_pid = os.getpid()
         for path in (self.path, self.lock_path):
@@ -191,7 +192,7 @@ class Journal:
     def locked(self) -> Iterator[None]:
         if self._creator_pid != os.getpid():
             raise JournalBusy("Open a new Journal instance after a process fork")
-        if not self._gate.acquire(blocking=False):
+        if not self._gate.acquire(blocking=self._shared):
             raise JournalBusy("Store is locked by another thread")
         try:
             if self._depth == 0:
@@ -218,6 +219,29 @@ class Journal:
                         os.close(fd)
         finally:
             self._gate.release()
+
+    @contextmanager
+    def shared_locked(self) -> Iterator[None]:
+        """One process controller, with serialized same-instance worker access.
+
+        Nest the worker executor *inside* this context, so all in-flight work
+        joins before the process lock is released. Each ordinary journal method
+        still takes the gate; only remote work may overlap. Other Journal
+        instances/processes remain excluded by the same existing flock.
+        """
+        with self.locked():
+            if self._shared or self._depth != 1:
+                raise JournalBusy("A controller already holds this journal")
+            self._shared = True
+            # Keep locked()'s depth-one process lock while letting worker
+            # methods acquire the gate one at a time. Restore its gate ownership
+            # before leaving the outer context, including exceptional exits.
+            self._gate.release()
+            try:
+                yield
+            finally:
+                self._gate.acquire()
+                self._shared = False
 
     def _complete(self) -> None:
         if (self.root / ".snapshot-incomplete").exists():
