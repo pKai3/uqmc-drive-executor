@@ -55,10 +55,8 @@ def section_key(path):return 'destination-'+digest({'canonical_path':_path(path)
 
 def effective_blocked_sources(source):
     """An identity's withdrawn/No action cannot be bypassed by another row."""
-    excluded_refs=set(source.get('excluded_refs',[]))
-    return set(source.get('excluded_ids',[])) | {r['source_id'] for r in source['records'].values()
-        if r.get('withdrawn') or r.get('decision')=='No' or r['reference'] in excluded_refs
-        or set(r.get('proposal_refs',[])) & excluded_refs}
+    from .destination_planner import _blocked_ids
+    return _blocked_ids(source)
 
 
 def semantic_selection(source, section):
@@ -139,7 +137,7 @@ def proposal_original_name(rename_record, move_record, state):
 
 def read_and_plan(config, section, journal, capture, factory, registry, report, *, preview=False):
     from .importer import catalog
-    source=catalog(capture,expected_workbook_id=config['workbook_id'])
+    source=catalog(capture,expected_workbook_id=config['workbook_id'],include_subtree_coverage=True,subtree_section_path=section)
     history=journal.records()
     # A later blank cell does not reopen a durably excluded source/proposal.
     # Preserve the capture hash; these exclusions are separate journal authority.
@@ -370,7 +368,8 @@ def freeze(config, section, journal, state, factory, run_dir, report):
         'selected_source_ids':pending,'allowed_ids':sorted(allowed),'excluded_ids':sorted(state['excluded']),
         'destination_paths':paths,'semantic_selection':state['semantic_selection'],'source_revision':state['capture']['source_revision'],
         'source_ids':files,'created_folder_keys':keys,'source_container_ids':layout['source_container_ids'],'instruction_ref':instruction_ref,
-        'source_metadata_ref':evidence_ref,'new_folder_count':len(missing)}
+        'source_metadata_ref':evidence_ref,'new_folder_count':len(missing),
+        'subtree_coverage_version':state['source'].get('subtree_coverage_version')}
     save_new(run_dir/'prepared.json',output);return output
 
 
@@ -414,7 +413,7 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
             if not apply:raise SafetyError('PUBLICATION_RETRY_REQUIRES_APPLY')
             drive=GooglePublicationDrive(factory({config['viewer_file_id']},{config['viewer_file_id']},set(),True),config['viewer_file_id'],apply=True)
             return resume_publication(publish_only,sheet_capture=capture_client,drive=drive,apply=True)
-        capture=capture_client.capture();source=catalog(capture,expected_workbook_id=config['workbook_id'])
+        capture=capture_client.capture();source=catalog(capture,expected_workbook_id=config['workbook_id'],include_subtree_coverage=True,subtree_section_path=section)
         if not apply:atomic_json(Path(config['run_directory'])/(section_key(section)+'-preview-workbook.json'),capture)
         if verify_completed is not None:
             if apply or resume or rollback:raise SafetyError('COMPLETED_SAMPLE_IS_READ_ONLY')
@@ -425,6 +424,8 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
             matches=[r for r in old if not rollback or r['run_id']==rollback]
             if not matches:raise SafetyError('NO_SAVED_DESTINATION_RUN_FOR_RECOVERY')
             prepared=matches[-1]
+            if prepared.get('subtree_coverage_version') != 1:
+                source=catalog(capture,expected_workbook_id=config['workbook_id'])
             if not rollback:validate_resume_scope(source,section,prepared,journal)
         def publish_current():
             try:

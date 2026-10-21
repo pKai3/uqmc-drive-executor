@@ -40,6 +40,8 @@ def file_parent_path(move, rename, state):
     if move is None:
         return _record_path(rename)
     path = _record_path(move)
+    if move.get('whole_subtree_origin_reference'):
+        return _path(move['coverage_target_parent_path'])
     expected = _record_path(rename) if rename else None
     def strip_title(title):
         if not isinstance(title, str) or not title or not path.endswith('/' + title):
@@ -74,12 +76,21 @@ def select_destination_records(source, section_path):
     exact top-level MOVE row before the configured root can give it meaning.
     """
     section = _path(section_path)
-    if '/' in section:
-        return nested_select_records(source, section)
     blocked = _blocked_ids(source)
     roots = {r['source_id'] for r in source['records'].values()
              if r['action'] == 'MOVE' and r['row'].get('Exact target path') == section
              and r['source_id'] not in blocked}
+    if '/' in section:
+        records = nested_select_records(source, section)
+        refs = {r['reference'] for r in records}
+        # A canonical root alias can retain its old collection label while its
+        # separately approved folder name changes. Include that same-ID pair.
+        for r in source['records'].values():
+            if r['action'] == 'RENAME' and r['source_id'] in roots and r['reference'] not in refs:
+                if _record_path(r) != logical_parent(section):
+                    raise SafetyError('FOLDER_MOVE_RENAME_PARENT_DISAGREEMENT:' + r['source_id'])
+                records.append(copy.deepcopy(r))
+        return sorted(records, key=lambda r: r['reference'])
     additions = []
     for r in source['records'].values():
         if (r['action'] != 'RENAME' or r['row'].get('Proposed destination folder') != ''
@@ -104,6 +115,10 @@ def _blocked_ids(source):
     for record in source['records'].values():
         if (record.get('withdrawn') or record.get('decision') == 'No'
                 or record['reference'] in refs or set(record.get('proposal_refs', [])) & refs):
+            blocked.add(record['source_id'])
+    # Durable root exclusion also withdraws inherited child authority.
+    for record in source['records'].values():
+        if record.get('whole_subtree_origin_source_id') in blocked:
             blocked.add(record['source_id'])
     return blocked
 
@@ -197,6 +212,18 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths):
         if states[sid].get('id') != sid:
             raise SafetyError('SOURCE_ID_MISMATCH:' + sid)
         groups.setdefault(sid, {})[record['action']] = record
+    if source.get('subtree_coverage_version') == 1:
+        # Known explicit routes elsewhere and exclusions stay outside this scope.
+        # A truly new live identity needs a refreshed inventory mapping, never a
+        # silent partial-success claim or a guessed destination.
+        known = {r['source_id'] for r in source['records'].values()} | blocked | set(source.get('coverage_source_ids', []))
+        for sid, actions in groups.items():
+            move = actions.get('MOVE')
+            if (states[sid]['mime_type'] == FOLDER and move
+                    and str(move['row'].get('Scope', '')).lower().startswith('whole subtree')):
+                unknown = {m['id'] for m in states[sid].get('subtree', {}).get('members', [])} - known
+                if unknown:
+                    raise SafetyError('WHOLE_SUBTREE_CHILD_MISSING_PROPOSAL_COVERAGE:' + sid + ':' + ','.join(sorted(unknown)))
     required = {section}
     for sid, actions in groups.items():
         if states[sid]['mime_type'] != FOLDER:
@@ -381,5 +408,7 @@ def build_hybrid_preparation(source, *, section_path, section_id, workbook_id, m
                   'members': [{'source_id': sid, 'direct_operation_refs': sorted(o['reference'] for o in operations if o['source_id'] == sid),
                                'ancestor_move_operation_refs': sorted(inherited[sid])} for sid in sorted(groups)],
                   'operations': operations}
+    if source.get('subtree_coverage_version') == 1:
+        projection['subtree_coverage_version'] = 1
     return {'projection': projection, 'resolutions': resolutions, 'selected_refs': [o['reference'] for o in operations],
             'source_ids': sorted(groups)}

@@ -52,6 +52,20 @@ To execute that destination section and publish its verified status:
 command does not widen its scope to other items sharing a source folder. Existing
 completed sections and proposal/approval cells are preserved.
 
+## Whole-subtree coverage
+
+New batches include eligible `Keep name` entries from Rename Coverage when their
+stable IDs and exact destination paths bind uniquely to an enclosing whole-subtree
+Move Manifest row. They become move-only operations; no rename is synthesized.
+Explicit per-item routes, exclusions, and verified completion history take
+precedence. Only the requested destination subtree is expanded. Historical saved
+plans retain their original importer version and are not silently enlarged.
+
+A live child absent from both the proposal inventory and explicit routes stops
+with `WHOLE_SUBTREE_CHILD_MISSING_PROPOSAL_COVERAGE`; refresh its inventory mapping
+before starting a new batch. The command never guesses where a newly discovered
+identity belongs or silently counts an omitted child as completed.
+
 ## One-time local configuration
 
 Keep project settings in ignored `private/destination-config.json`: the canonical

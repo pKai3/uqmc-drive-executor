@@ -258,7 +258,7 @@ def validate_section_authority(journal, plan):
         raise SafetyError("SECTION_PLAN_ORIGIN_MISMATCH")
     workbook_evidence = journal.read_evidence(evidence["workbook_import_ref"])
     workbook_manifest = workbook_evidence["manifest"]
-    source = _destination_catalog(catalog(workbook_evidence["workbook_export"], expected_workbook_id=manifest["workbook_id"]), projection)
+    source = _destination_catalog(catalog(workbook_evidence["workbook_export"], expected_workbook_id=manifest["workbook_id"], include_subtree_coverage=projection.get("subtree_coverage_version") == 1, subtree_section_path=projection.get("section_path")), projection)
     members, operations, boundary = _projection(projection, source, binding.get("section_id"), manifest["workbook_id"])
     approval = _approval(journal, owner_ref, projection, members, operations, boundary)
     expected_revision = "section:" + digest({"scope": binding, "workbook_revision": workbook_manifest["proposal_revision"]})
@@ -830,7 +830,7 @@ def import_section(journal, export, *, projection, owner_approval_ref, expected_
             normalize, plan_validator = agent_snapshot, validate_agent_plan
         elif metadata_profile != "STRICT":
             raise SafetyError("UNKNOWN_METADATA_PROFILE")
-        source = _destination_catalog(catalog(export, expected_workbook_id=expected_workbook_id), projection)
+        source = _destination_catalog(catalog(export, expected_workbook_id=expected_workbook_id, include_subtree_coverage=projection.get("subtree_coverage_version") == 1, subtree_section_path=projection.get("section_path")), projection)
         if projection.get("method_profile") != expected_method_profile:
             raise SafetyError("SECTION_METHOD_PROFILE_NOT_AUTHORIZED")
         members, operations, boundary = _projection(projection, source, expected_section_id, expected_workbook_id)
@@ -905,7 +905,7 @@ def import_section(journal, export, *, projection, owner_approval_ref, expected_
                 return _blocked(journal, projection, owner_approval_ref, approval, batch_id, reason, review_context_ref)
         token = _Eligibility(_SEAL, source["input_sha256"], frozenset(operations), owner_approval_ref,
                              digest(approval), approval["approval_id"],
-                             tuple(r for r in source["records"].values() if r.get("derived_from_reference")))
+                             tuple(r for r in source["records"].values() if r.get("derived_from_reference") or r.get("whole_subtree_origin_reference")))
         for old_id in _strings(approval.get("supersedes_approval_ids", []), "SECTION_SUPERSESSION_INVALID", empty=True):
             if old_id == approval["approval_id"]:
                 raise SafetyError("SECTION_SELF_SUPERSESSION")

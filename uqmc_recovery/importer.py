@@ -10,7 +10,7 @@ import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from .model import FOLDER, Operation, Plan, SafetyError, WITHDRAWN_ID, digest, snapshot, validate_extension_evidence
+from .model import FOLDER, NATIVE, Operation, Plan, SafetyError, WITHDRAWN_ID, digest, snapshot, validate_extension_evidence
 
 # Live identity is supplied from ignored private configuration, never from a repo.
 WORKBOOK_ID = "fixture-workbook"
@@ -130,7 +130,67 @@ def _catalog_rows(export, tab, tombstones, quarantined):
     return active
 
 
-def catalog(export, *, expected_workbook_id=WORKBOOK_ID):
+def _subtree_coverage_records(records, coverage, section_path=None):
+    """Bind unlisted Keep-name identities to an explicit whole-subtree row.
+
+    Coverage is an inventory, not independent approval. A unique enclosing
+    manifest row supplies move authority. Explicit item routes always win.
+    """
+    explicit_ids = {r['source_id'] for r in records.values()}
+    roots = [r for r in records.values() if r['action'] == 'MOVE'
+             and _text(r['row'].get('Scope')).strip().lower().startswith('whole subtree')]
+    additions = {}
+    for row in coverage:
+        sid = _text(row.get('Source ID')).strip()
+        if not sid or sid in explicit_ids or _text(row.get('Assessment')).strip().lower() != 'keep name':
+            continue
+        pid = _text(row.get('Move proposal')).strip()
+        target = _text(row.get('Existing proposed target'))
+        if section_path and not target.startswith(section_path + '/'):
+            continue
+        matches = [r for r in roots if r['row']['Proposal ID'] == pid
+                   and target.startswith(_text(r['row'].get('Exact target path')) + '/')]
+        if not matches:
+            continue
+        longest = max(len(r['row']['Exact target path']) for r in matches)
+        matches = [r for r in matches if len(r['row']['Exact target path']) == longest]
+        if len(matches) != 1:
+            raise SafetyError('AMBIGUOUS_WHOLE_SUBTREE_COVERAGE:' + sid)
+        parent = matches[0]
+        name = _text(row.get('Current name + type suffix'))
+        retained = row.get('Proposed name / retained name')
+        # Sheets stores year-only retained folder names as numeric cell values.
+        if type(retained) in (int, float):
+            retained = format(retained, 'g')
+        if (not name or retained != name or row.get('Rename proposal') not in (None, '')):
+            raise SafetyError('KEEP_NAME_COVERAGE_CONFLICT:' + sid)
+        labels = [name]
+        suffix = {**NATIVE, 'application/vnd.google-apps.shortcut': '.shortcut'}.get(row.get('Verified MIME type'))
+        if suffix and name.endswith(suffix):
+            labels.append(name[:-len(suffix)])
+        parents = {target[:-(len(label) + 1)] for label in labels if label and target.endswith('/' + label)}
+        if len(parents) != 1:
+            raise SafetyError('KEEP_NAME_COVERAGE_PATH_CONFLICT:' + sid)
+        parent_path = parents.pop()
+        from .section_prepare import _path
+        _path(parent_path)
+        ref = 'SUBTREE/' + parent['reference'] + '/' + sid
+        if ref in additions:
+            raise SafetyError('DUPLICATE_WHOLE_SUBTREE_COVERAGE:' + sid)
+        additions[ref] = {'reference': ref, 'proposal_refs': [parent['reference'], *parent['proposal_refs']],
+            'action': 'MOVE', 'source_id': sid, 'decision': parent['decision'],
+            'withdrawn': parent['withdrawn'], 'proposal': parent.get('proposal'),
+            'whole_subtree_origin_reference': parent['reference'],
+            'whole_subtree_origin_source_id': parent['source_id'],
+            'coverage_target_parent_path': parent_path,
+            'row': {'Exact target path': target, 'Current item': name, 'Source ID': sid,
+                    'Scope': 'Whole-subtree covered descendant', 'Origin coverage row': copy.deepcopy(row)},
+            'row_sha256': digest({'derivation': 'WHOLE_SUBTREE_COVERAGE_V1',
+                                  'root_row_sha256': parent['row_sha256'], 'coverage_row': row})}
+    return additions
+
+
+def catalog(export, *, expected_workbook_id=WORKBOOK_ID, include_subtree_coverage=False, subtree_section_path=None):
     """Find explicit source-ID proposal records without retrieving source metadata."""
     input_hash = workbook_fingerprint(export, expected_workbook_id=expected_workbook_id)
     tombstones, quarantined = [], []
@@ -173,7 +233,11 @@ def catalog(export, *, expected_workbook_id=WORKBOOK_ID):
             source_id = _text(row["Source ID"]).strip()
             if source_id:
                 excluded.add(source_id)
-    return {"input_sha256": input_hash, "records": result, "excluded_ids": sorted(excluded),
+    if include_subtree_coverage:
+        result.update(_subtree_coverage_records(result, rows_by_tab["Rename Coverage"], subtree_section_path))
+    return {**({'subtree_coverage_version': 1,
+                'coverage_source_ids': sorted({_text(r.get('Source ID')).strip() for r in rows_by_tab['Rename Coverage'] if _text(r.get('Source ID')).strip()})} if include_subtree_coverage else {}),
+            "input_sha256": input_hash, "records": result, "excluded_ids": sorted(excluded),
             "excluded_refs": sorted(excluded_refs), "redacted_tombstones": tombstones,
             "quarantined_tombstones": quarantined}
 

@@ -130,6 +130,9 @@ class DestinationCommandTests(unittest.TestCase):
                                publisher=kwargs.pop('publisher',self.publisher),report=self.progress.append,**kwargs)
     def mixed(self):
         self.server.drive.files['eoi']=raw('eoi','Unrelated EOI.pdf',['source-root'])
+        append_row(self.export,'Proposed Renames',{'Rename ID':'R-EOI','Source ID':'eoi',
+            'Current name + type suffix':'Unrelated EOI.pdf','Proposed name + type suffix':'Unrelated EOI.pdf',
+            'Proposed destination folder':'Club/Other'})
     def test_preview_mixed_source_requires_only_destination_and_is_nonmutating(self):
         self.mixed();before=copy.deepcopy(self.server.drive.files)
         result=self.run_command()
