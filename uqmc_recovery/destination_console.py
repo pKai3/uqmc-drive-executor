@@ -101,6 +101,11 @@ class ConsoleReporter:
                     self.line(f"Checking destination folders: {self.destination_reads}.")
             elif stage == "verified_history_skipped":
                 self.line(f"Preserving {value.get('identities', 0)} completed identities; {value.get('remaining_live_identities', 0)} checked live.")
+            elif stage == "starting_name_warning":
+                self.line("Warning: starting name differs for " + concise(value.get("source_id", "item"))
+                          + ": " + concise(value.get("observed_name", "")) + " → "
+                          + concise(value.get("approved_target_name", ""))
+                          + "; rollback will preserve the observed name.")
             elif stage == "folder_verified":
                 self.line("Folder verified: " + concise(value.get("path", "")))
             elif stage == "item_started":

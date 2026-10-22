@@ -107,11 +107,12 @@ class DestinationCommandGuardTests(unittest.TestCase):
             run_destination(config,'Club/Skills',capture_client=capture,factory=self.factory)
         self.assertEqual(capture.calls,0)
 
-    def test_missing_destination_does_not_accept_source_name_drift(self):
+    def test_missing_destination_retains_warning_and_remains_unresolved(self):
         self.files['file']['name']='Human edit.pdf'
         result=read_and_plan(self.config,'Club/Skills',self.journal,self.export,self.factory,{'sections':[]},lambda e:None)
-        self.assertEqual(result['checks'][0]['disposition'],'BLOCKED')
-        self.assertEqual(result['checks'][0]['reason'],'UNAPPROVED_CURRENT_STATE:name')
+        self.assertEqual(result['checks'][0]['disposition'],'READY')
+        self.assertTrue(result['checks'][0]['destination_unresolved'])
+        self.assertEqual(result['checks'][0]['warnings'][0]['observed_name'],'Human edit.pdf')
         self.assertFalse(any(c['enabled'] for c in self.clients))
 
 

@@ -4,6 +4,7 @@ import unittest
 import test_destination_command as fixtures
 from test_importer import append_row
 from uqmc_recovery.importer import HEADERS
+from uqmc_recovery.journal import Journal
 
 
 class NativeDisplayTitleTests(unittest.TestCase):
@@ -45,18 +46,23 @@ class NativeDisplayTitleTests(unittest.TestCase):
         self.assertEqual(self.f.server.drive.files['leaf']['name'],'Updated release')
         self.assertEqual(self.f.server.created,[])
 
-    def test_trailing_space_without_exact_source_path_remains_conflict(self):
+    def test_trailing_space_without_source_path_proof_is_explicit_warning(self):
         self.native('application/vnd.google-apps.form','Release form ','Release form.gform','Updated release.gform')
         self.move('Release form ','Old parent/Old folder/Release form')
         result=self.f.run_command(apply=True)
-        self.assertEqual(result['blockers'][0]['reason'],'UNAPPROVED_CURRENT_STATE:name')
-        self.assertEqual(self.f.server.requests,[])
+        self.assertEqual(result['counts'],{'APPLIED':2})
+        warning=next(e for e in Journal(self.f.config['store']).records() if e['kind']=='SOURCE_NAME_DRIFT_ACCEPTED')
+        self.assertEqual(warning['payload']['observed_name'],'Release form ')
+        self.assertEqual(self.f.server.drive.files['leaf']['name'],'Updated release')
 
-    def test_genuine_native_name_change_is_not_normalized_away(self):
+    def test_genuine_native_name_change_is_recorded_not_normalized_away(self):
         self.native('application/vnd.google-apps.form','Human changed form','Original form.gform','Approved form.gform')
         result=self.f.run_command(apply=True)
-        self.assertEqual(result['blockers'][0]['reason'],'UNAPPROVED_CURRENT_STATE:name')
-        self.assertEqual(self.f.server.requests,[])
+        self.assertEqual(result['counts'],{'APPLIED':2})
+        warning=next(e for e in Journal(self.f.config['store']).records() if e['kind']=='SOURCE_NAME_DRIFT_ACCEPTED')
+        self.assertEqual(warning['payload']['original_name'],'Original form')
+        self.assertEqual(warning['payload']['observed_name'],'Human changed form')
+        self.assertEqual(self.f.server.drive.files['leaf']['name'],'Approved form')
 
 
 if __name__=='__main__':unittest.main()

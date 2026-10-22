@@ -289,7 +289,11 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
         own_child=next((c for c in children if c['id']==reused_id),None)
         approved_self_rename=(reused_id in layout['reused_folder_ids'] and own_rename is not None
             and own_child is not None and own_child.get('mimeType')==FOLDER
-            and own_child['name']==raw[reused_id]['name']==own_rename['row'].get('Current name + type suffix')
+            and own_child['name']==raw[reused_id]['name']
+            and (own_child['name']==own_rename['row'].get('Current name + type suffix')
+                 or (not histories.get(reused_id,{}).get('pending_requests')
+                     and 'name' not in histories.get(reused_id,{}).get('completed_fields',{})
+                     and 'name' not in histories.get(reused_id,{}).get('rolled_back_fields',[])))
             and own_child['name']!=spec['folder_name']
             and own_child['name'].rstrip()==spec['folder_name']
             and exact_rename(own_rename,metadata[reused_id])==spec['folder_name'])
@@ -325,7 +329,8 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
         baseline=copy.deepcopy(metadata[sid]);r=records_by_id[sid].get('RENAME')
         if not histories.get(sid) and r:
             baseline['name']=proposal_original_name(r,records_by_id[sid].get('MOVE'),baseline)
-        check=reconcile_item(histories.get(sid),desired,raw[sid],baseline=baseline,logical_destination=route['parent_path'])
+        check=reconcile_item(histories.get(sid),desired,raw[sid],baseline=baseline,logical_destination=route['parent_path'],
+            explicit_rename=r is not None and exact_rename(r,metadata[sid])==desired['name'])
         check['destination_unresolved']=unresolved
         check['verification_basis']='SAVED_VERIFIED_HISTORY' if sid in cached else 'CURRENT_READ'
         caps=raw[sid].get('capabilities',{})
@@ -349,6 +354,10 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
                 # The runner orders actual occupancy conservatively; it will not overwrite.
                 continue
             check.update(disposition='BLOCKED',reason='LIVE_EXACT_NAME_COLLISION:'+child['id'])
+    for check in checks:
+        if check['disposition']=='READY':
+            for warning in check.get('warnings',[]):
+                report({'stage':'starting_name_warning','source_id':check['source_id'],**warning})
     return {'source':source,'capture':capture,'live':live,'layout':layout,'checks':checks,'excluded':excluded,
             'semantic_selection':semantic_selection(source,section)}
 
@@ -411,6 +420,17 @@ def freeze(config, section, journal, state, factory, run_dir, report):
         expected_method_profile='destination_hybrid',metadata_profile='AGENT_ASSISTED')
     if result.plan is None:raise SafetyError('SECTION_IMPORT_BLOCKED:'+str(result.manifest.get('section_reason_code',result.manifest.get('rows'))))
     plan=result.plan;register_agent_plan(journal,plan);bind_initial_section_source(journal,plan,state['capture'])
+    # Preserve original proposal/history; the new plan and mutation intent use
+    # the observed preimage so explicit rollback restores the actual starting name.
+    rename_records={r['source_id']:r for r in layout['records'] if r['action']=='RENAME'}
+    for check in state['checks']:
+        if check['disposition']!='READY':continue
+        for warning in check.get('warnings',[]):
+            record=rename_records[check['source_id']]
+            journal.append('SOURCE_NAME_DRIFT_ACCEPTED',payload={'source_id':check['source_id'],
+                'run_id':plan.run_id,'plan_sha256':plan.proposal_hash,'proposal_ref':record['reference'],
+                'proposal_row_sha256':record['row_sha256'],'workbook_input_sha256':state['source']['input_sha256'],
+                'observed_ref':journal.evidence(live['raw'][check['source_id']]),**warning})
     allowed={o.file_id for o in plan.operations}|{s for o in plan.operations for s in o.before['parents']+o.target.get('parents',[])}
     authorize(journal,plan,{s:metadata[s] for s in allowed},instruction_ref,section_id=sid)
     plan_path=save_new(run_dir/'plan.json',plan.body())
@@ -421,6 +441,7 @@ def freeze(config, section, journal, state, factory, run_dir, report):
         'destination_paths':paths,'semantic_selection':state['semantic_selection'],'source_revision':state['capture']['source_revision'],
         'source_ids':files,'created_folder_keys':keys,'source_container_ids':layout['source_container_ids'],'instruction_ref':instruction_ref,
         'source_metadata_ref':evidence_ref,'new_folder_count':len(missing),
+        'warnings':[{'source_id':x['source_id'],**w} for x in state['checks'] if x['disposition']=='READY' for w in x.get('warnings',[])],
         'subtree_coverage_version':state['source'].get('subtree_coverage_version')}
     save_new(run_dir/'prepared.json',output);return output
 
@@ -504,7 +525,8 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
                 'skipped_verified_history':len(state['live'].get('history_cached_source_ids',[])),
                 'preview_cached_reads_available':state['live'].get('preview_cached_read_count',0),
                 'required_rename_effects':sum('name' in x.get('pending_fields',[]) for x in pending),
-                'required_move_effects':sum('parents' in x.get('pending_fields',[]) for x in pending),'blockers':blocked}
+                'required_move_effects':sum('parents' in x.get('pending_fields',[]) for x in pending),'blockers':blocked,
+                'warnings':[{'source_id':x['source_id'],**w} for x in pending if x['disposition']=='READY' for w in x.get('warnings',[])]}
             if not apply or blocked:return summary|{'elapsed_seconds':round(time.monotonic()-started,3)}
             if not pending and not state['layout']['missing_folders']:
                 return summary|{'no_op':True,'elapsed_seconds':round(time.monotonic()-started,3),'publication':publish_current()}
@@ -552,7 +574,7 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
                 raise SafetyError('BACKUP_VERIFICATION_FAILED')
         finished={'section':section,'run_id':plan.run_id,'counts':result['counts'],'journal_sequence':tip['seq'],
             'backup':str(backup),'result_path':result_path,'exports':exports,'elapsed_seconds':round(time.monotonic()-started,3),
-            'revision_stop_reason':guard.reason}
+            'revision_stop_reason':guard.reason,'warnings':prepared.get('warnings',[])}
         report({'stage':'execution_finished',**finished})
         # Registry updates are private; failed publication never restarts actions.
         entry=next((x for x in registry['sections'] if x.get('proposal_path',x.get('publication_spec',{}).get('proposal_path'))==section),None)

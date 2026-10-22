@@ -109,11 +109,10 @@ class DestinationWhitespaceGuardTests(unittest.TestCase):
                 self.assertEqual(f.server.created,[])
                 self.assertEqual(Journal(f.config['store']).records(),[])
 
-    def test_self_rename_requires_exact_original_title_and_explicit_proposal(self):
-        for mode in ('drift','missing','declined'):
+    def test_self_rename_requires_explicit_nonwithdrawn_proposal(self):
+        for mode in ('missing','declined'):
             with self.subTest(mode=mode):
                 f,run=self.approved_self_fixture()
-                if mode=='drift':f.server.drive.files['source-root']['name']='Skills  '
                 if mode=='missing':del f.export['sheets']['Proposed Renames'][1]
                 if mode=='declined':set_cell(f.export,'Proposed Renames',1,'Decision (Yes/No)','No')
                 with self.assertRaises(SafetyError):run(apply=True)

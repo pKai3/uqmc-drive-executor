@@ -159,6 +159,14 @@ approved mapping within the selected section. Missing, withdrawn or ambiguous
 mappings stop affected work; an unavailable refresh is not permission to reuse a
 stale local plan.
 
+For a pending explicit rename, a different starting title is a warning: the
+approved target name wins for that stable file ID. The frozen batch and durable
+mutation intent retain the actual observed name for rollback; a separate audit
+event preserves the historical/proposal name and warning. Move-only records,
+completed effects and unresolved requests do not gain this exception. Parent,
+identity, content, capability and collision checks remain active. A change after
+the batch is frozen still blocks the write and requires a fresh reconciliation.
+
 Intact source folders can move where their complete assigned contents fit the
 destination structure. Mixed source folders stay in place while only assigned
 items are extracted. Missing required destinations are created with a durable

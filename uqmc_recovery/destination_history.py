@@ -204,9 +204,12 @@ def build_history_index(journal):
 
 
 def reconcile_item(history, desired, live, *, baseline=None, approved=True,
-                   excluded=False, logical_destination=None, prior_logical_destination=None):
+                   excluded=False, logical_destination=None, prior_logical_destination=None,
+                   explicit_rename=False):
     """Classify a fresh desired core against history and an exact live read.
 
+    An explicit pending rename may warn on starting-name drift; callers freeze
+    the actual live preimage. Completed effects and pending requests stay strict.
     READY contains only still-needed effects. COMPLETE means current read matches
     desired, not an attribution claim. RECOVER_AT_TARGET requires DesiredRunner
     to record the pending request's readback before finishing. All pending
@@ -254,6 +257,12 @@ def reconcile_item(history, desired, live, *, baseline=None, approved=True,
     states = h.get("states") or [original]
     for field in _FIELDS:
         if current[field] != desired[field] and not any(current[field] == state[field] for state in states):
+            if (field == "name" and explicit_rename and not requests
+                    and "name" not in completed and "name" not in h.get("rolled_back_fields", [])):
+                result.setdefault("warnings", []).append({"reason_code": "STARTING_NAME_DRIFT_ACCEPTED",
+                    "original_name": original["name"], "observed_name": current["name"],
+                    "approved_target_name": desired["name"], "rollback_before_name": current["name"]})
+                continue
             return blocked("UNAPPROVED_CURRENT_STATE:" + field)
     for request in requests:
         if request["direction"] == "ROLLBACK":

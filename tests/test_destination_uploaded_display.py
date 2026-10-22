@@ -110,8 +110,9 @@ class UploadedDisplayTitleTests(unittest.TestCase):
             'Source path': path, 'Exact target path': fixtures.SECTION + '/Original title',
             'Scope': 'Single item'})
         item['name'] = 'A human changed this title'
-        rejected = fixture.run_command()
-        self.assertEqual(rejected['blockers'][0]['reason'], 'UNAPPROVED_CURRENT_STATE:name')
+        warned = fixture.run_command()
+        self.assertEqual(warned['blockers'], [])
+        self.assertEqual(warned['warnings'][0]['observed_name'], 'A human changed this title')
         self.assertEqual(fixture.server.requests, [])
         item['name'] = 'Original title'
         result = fixture.run_command(apply=True)
