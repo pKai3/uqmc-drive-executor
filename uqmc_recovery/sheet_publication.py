@@ -65,6 +65,8 @@ def read_existing(capture):
 
 def item_status(item):
     if not item:return 'NOT_TRACKED — no executor record'
+    if {'RETIRED','USER_CONFIRMED_DELETED','NOT_APPLIED'} <= set(item.get('reason_codes',[])):
+        return 'RETIRED — user-confirmed deleted; not migrated'
     if {'EXCLUDED','MISSING_OR_INACCESSIBLE','NOT_APPLIED'} <= set(item.get('reason_codes',[])):
         return 'EXCLUDED — missing or inaccessible; not migrated'
     move,rename=item['move']['effect'],item['rename']['effect']
@@ -80,7 +82,7 @@ def build_sheet_plan(bundle,existing):
     if pad(matrices['Operation Log'][0],26)!=LOG_HEADERS:raise ValueError('LOG_HEADERS_CHANGED')
     items={i['source_id']:i for i in snapshot['items']}
     tracked={sid:i for sid,i in items.items() if i['observed']['read_state']!='NEVER_VERIFIED'
-             or any(i[field]['operation_ids'] for field in ('move','rename')) or 'EXCLUDED' in i.get('reason_codes',[])}
+             or any(i[field]['operation_ids'] for field in ('move','rename')) or {'EXCLUDED','RETIRED'} & set(i.get('reason_codes',[]))}
     operations={op['operation_id']:op for op in snapshot['operations']}
     requests=[];changes=[];sheet_sizes={n:dict(p['gridProperties']) for n,p in props.items()}
 
@@ -167,6 +169,8 @@ def build_sheet_plan(bundle,existing):
         if not item or item['observed']['read_state']!='VERIFIED':return ''
         parents=item['observed']['parent_ids']
         return 'https://drive.google.com/drive/folders/'+parents[0] if parents and len(parents)==1 else ''
+    retired = {sid for sid, item in items.items() if
+        {'RETIRED','USER_CONFIRMED_DELETED','NOT_APPLIED'} <= set(item.get('reason_codes',[]))}
     proposal_members=defaultdict(set)
     for row in matrices['Move Manifest'][1:]:
         row=pad(row,12)
@@ -184,12 +188,15 @@ def build_sheet_plan(bundle,existing):
             row=pad(row,base)
             if not any(row):rows.append(['','','']);continue
             if name=='Proposed Moves':
-                members=proposal_members.get(row[0],set());known=[items[s] for s in members if s in tracked]
+                all_members=proposal_members.get(row[0],set())
+                retired_count=len(all_members & retired)
+                members=all_members-retired;known=[items[s] for s in members if s in tracked]
                 applied=sum(i['move']['effect']=='APPLIED' or i['location']['effect'] in ('INHERITED','DIRECT_AND_INHERITED') for i in known)
                 kept=len(members&retained)
                 text=('NOT_TRACKED — no executor record' if not known else
                     f'{"COMPLETED" if applied+kept==len(members) else "PARTIAL"}: {applied}/{len(members)} assigned identities relocated')
                 if kept:text+=f'; {kept} source folders retained'
+                if retired_count:text+=f'; {retired_count} retired (not migrated)'
                 links=sorted({destination(i) for i in known if destination(i)})
                 link=links[0] if len(links)==1 else ''
             else:

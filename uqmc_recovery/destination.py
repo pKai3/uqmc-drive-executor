@@ -26,6 +26,7 @@ from .section_execution import collect_metadata, normalize, authorize
 from .destination_planner import plan_destination, build_hybrid_preparation, logical_parent, file_parent_path, select_destination_records as select_records
 from .destination_history import build_history_index, reconcile_item
 from .folder_creation import reject_trailing_whitespace_aliases
+from .importer import retired_source_ids, persist_retirements
 
 
 def utc(): return datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
@@ -85,7 +86,7 @@ def semantic_selection(source, section):
 def validate_resume_scope(source,section,prepared,journal):
     """Do not re-enable a stored batch after source authority was removed."""
     records=journal.records()
-    excluded=effective_blocked_sources(source)|{e['payload']['file_id'] for e in records if e['kind']=='EXCLUDED'}
+    excluded=effective_blocked_sources(source)|{e['payload']['file_id'] for e in records if e['kind']=='EXCLUDED'}|retired_source_ids(records)
     refs={e['payload']['proposal_ref'] for e in records if e['kind']=='PROPOSAL_EXCLUDED'}
     selected=set(prepared['selected_source_ids'])
     if selected & excluded:
@@ -161,10 +162,12 @@ def proposal_original_name(rename_record, move_record, state):
 def read_and_plan(config, section, journal, capture, factory, registry, report, *, preview=False):
     from .importer import catalog
     source=catalog(capture,expected_workbook_id=config['workbook_id'],include_subtree_coverage=True,subtree_section_path=section)
+    if not preview:
+        persist_retirements(journal,source)
     history=journal.records()
     # A later blank cell does not reopen a durably excluded source/proposal.
     # Preserve the capture hash; these exclusions are separate journal authority.
-    source['excluded_ids']=sorted(set(source['excluded_ids'])|{e['payload']['file_id'] for e in history if e['kind']=='EXCLUDED'})
+    source['excluded_ids']=sorted(set(source['excluded_ids'])|{e['payload']['file_id'] for e in history if e['kind']=='EXCLUDED'}|retired_source_ids(history))
     source['excluded_refs']=sorted(set(source['excluded_refs'])|{e['payload']['proposal_ref'] for e in history if e['kind']=='PROPOSAL_EXCLUDED'})
     records=select_records(source,section)
     excluded=set(config.get('excluded_ids',[]))|set(source['excluded_ids'])

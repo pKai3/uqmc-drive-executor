@@ -14,6 +14,7 @@ import re
 import stat
 import threading
 
+from .importer import retired_source_ids
 from .model import SafetyError
 from .section_importer import validate_section_authority
 
@@ -173,7 +174,7 @@ class RunAuthority:
             raise SafetyError("APPROVAL_REVOKED")
         if kind == "BATCH_REFRESH_REQUIRED" and payload.get("proposal_hash") == self.plan_sha256:
             raise SafetyError("PLAN_EDITS_REQUIRE_NEW_REFRESHED_BATCH")
-        if kind == "EXCLUDED" and payload.get("file_id") in self._source_ids:
+        if (kind == "EXCLUDED" or retired_source_ids([event])) and payload.get("file_id") in self._source_ids:
             raise SafetyError("EXCLUDED")
         if kind == "PROPOSAL_EXCLUDED" and payload.get("proposal_ref") in self._proposal_refs:
             raise SafetyError("PROPOSAL_EXCLUDED")

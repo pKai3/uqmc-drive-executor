@@ -335,3 +335,20 @@ A change after verified success is a conflict. Existing frozen plans stay intact
 current destination observations may be appended by stable ID after verification.
 Match any sheet corrections to exact destination references, preserving formulas,
 approvals, source filenames and literal slashes. Do not trim arbitrary path cells.
+
+
+## Retiring a user-confirmed deleted item
+
+When an item is explicitly confirmed deleted, keep its existing proposal row and
+ID for audit. Put `[RETIRED: USER_CONFIRMED_DELETED]` on the first line of its
+**Evidence / rationale** cell, retain the old rationale below it, and keep the
+Decision **No** and existing review formula. This is not a deletion request.
+The importer records a typed `RETIRED` disposition and excludes that ID from
+execution, including whole-subtree fallback. Later removal of the marker does
+not reopen a durable retirement.
+
+Publication keeps the allowlisted audit item labeled **Retired — user-confirmed
+deleted; not migrated**, while excluding it from active completion counts. It
+does not invent a verified name, location, rename or move. Ordinary **No**
+decisions and recoverable missing/inaccessible exclusions remain outstanding;
+private exclusions remain private. Existing journal history is preserved.

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import copy
 
-from .importer import catalog
+from .importer import catalog, retired_source_ids, persist_retirements
 from .model import NATIVE, Operation, SafetyError, digest, validate_rename_name
 from .section_importer import validate_section_authority
 
@@ -178,13 +178,14 @@ def refresh_batch(journal, existing_plan, capture_callable, policy, *, batch_id)
         if current_binding != binding:
             raise SafetyError("REFRESH_SECTION_AUTHORITY_CHANGED_DURING_CAPTURE")
         prior = _validate_policy(journal, existing_plan, policy, current_binding, groups)
+        persist_retirements(journal, fresh)
         records = journal.records()
         recorded_ids = {r["payload"]["file_id"] for r in records if r["kind"] == "EXCLUDED"}
         recorded_refs = {r["payload"]["proposal_ref"] for r in records if r["kind"] == "PROPOSAL_EXCLUDED"}
         relevant_refs = {ref for c in (fresh, prior) for record in c["records"].values()
                          if record["source_id"] in groups
                          for ref in [record["reference"], *record["proposal_refs"]]}
-        for source in sorted(set(fresh["excluded_ids"]) & set(groups) - recorded_ids):
+        for source in sorted(set(fresh["private_excluded_ids"]) & set(groups) - recorded_ids):
             journal.append("EXCLUDED", payload={"file_id": source, "reason_code": "FRESH_WORKBOOK_WITHDRAWN",
                 "input_sha256": fresh["input_sha256"]})
         for ref in sorted(set(fresh["excluded_refs"]) & relevant_refs - recorded_refs):
@@ -195,7 +196,7 @@ def refresh_batch(journal, existing_plan, capture_callable, policy, *, batch_id)
             raise SafetyError("REFRESH_BATCH_ID_ALREADY_FROZEN")
         known, unresolved = _history(journal, records, groups)
         latest, previous = _index_by_source(fresh), _index_by_source(prior)
-        exclusions = set(existing_plan.excluded_ids) | set(fresh["excluded_ids"]) | {r["payload"]["file_id"] for r in records if r["kind"] == "EXCLUDED"}
+        exclusions = set(existing_plan.excluded_ids) | set(fresh["excluded_ids"]) | {r["payload"]["file_id"] for r in records if r["kind"] == "EXCLUDED"} | retired_source_ids(records)
         excluded_refs = set(fresh["excluded_refs"]) | {r["payload"]["proposal_ref"] for r in records if r["kind"] == "PROPOSAL_EXCLUDED"}
         pending, complete, changed_complete, excluded, blocked = [], [], [], [], []
         for source, group in groups.items():

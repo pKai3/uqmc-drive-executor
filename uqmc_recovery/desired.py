@@ -26,6 +26,7 @@ from .model import FOLDER, SafetyError, digest, validate_extension_evidence, val
 from .projection import HEADERS
 from .section_importer import validate_section_authority
 from .run_authority import RunAuthority
+from .importer import retired_source_ids
 
 
 VERIFIED = {"VERIFIED_APPLIED", "RECONCILED_AT_TARGET"}
@@ -67,7 +68,7 @@ def compile_items(plan, journal, *, validate_authority=True):
         raise SafetyError("EXISTING_FROZEN_PLAN_REQUIRED")
     if validate_authority:
         validate_section_authority(journal, plan)
-    excluded = set(plan.excluded_ids) | {r["payload"]["file_id"] for r in records if r["kind"] == "EXCLUDED"}
+    excluded = set(plan.excluded_ids) | {r["payload"]["file_id"] for r in records if r["kind"] == "EXCLUDED"} | retired_source_ids(records)
     groups = {}
     for op in plan.ordered():
         if op.direction != "FORWARD" or op.action not in {"MOVE", "RENAME"}:
@@ -984,7 +985,7 @@ def main(argv=None):
                 auth = journal.read_evidence(r["payload"]["authorization_ref"])
                 if auth.get("exposure_review_ref"):
                     allowed.update(journal.read_evidence(auth["exposure_review_ref"]).get("access_baselines", {}))
-        excluded = set(plan.excluded_ids) | {r["payload"]["file_id"] for r in journal.records() if r["kind"] == "EXCLUDED"}
+        excluded = set(plan.excluded_ids) | {r["payload"]["file_id"] for r in journal.records() if r["kind"] == "EXCLUDED"} | retired_source_ids(journal.records())
         selected_ids = json.loads(Path(args.source_ids_file).read_text()) if args.source_ids_file else None
         if selected_ids is not None and (not isinstance(selected_ids, list) or not selected_ids or
                 any(not isinstance(value, str) for value in selected_ids) or

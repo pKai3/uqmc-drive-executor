@@ -21,6 +21,7 @@ HEADERS = {
     "Rename Coverage": ["Rename necessity", "Assessment", "Current name + type suffix", "Proposed name / retained name", "Necessity rationale (assistant)", "Rename proposal", "Source link", "Existing proposed target", "Evidence / rationale", "Remaining checks", "Item kind", "Assessment scope", "Move proposal", "Manifest item / root reference", "Source ID", "Verified MIME type", "Verified on", "Coverage basis"],
 }
 WITHDRAWN_VALUES = {"excluded", "withdrawn"}
+RETIRED_MARKER = "[RETIRED: USER_CONFIRMED_DELETED]"
 REDACTED_EXCLUSION_LABELS = {
     "Proposed Moves": "Current item",
     "Move Manifest": "Current item",
@@ -90,6 +91,38 @@ def _index(rows, key):
 
 def _withdrawn(row, fields):
     return any(_text(row.get(key)).strip().lower() in WITHDRAWN_VALUES for key in fields)
+
+
+def retired_source_ids(records):
+    """Only explicit confirmed-deletion dispositions retire an identity."""
+    return {event["payload"]["file_id"] for event in records
+            if event.get("kind") == "RETIRED"
+            and event.get("payload", {}).get("reason_code") == "USER_CONFIRMED_DELETED"
+            and event["payload"].get("effect") == "NOT_APPLIED"
+            and isinstance(event["payload"].get("file_id"), str)
+            and event["payload"]["file_id"]}
+
+
+def persist_retirements(journal, source):
+    """Preserve exact marked proposal rows without inventing a source observation.
+
+    The marker is an explicit disposition, not a permission to delete or rename.
+    This event survives later removal of the cell marker. Existing exclusions
+    remain unchanged and retain any independent privacy meaning.
+    """
+    with journal.locked():
+        recorded = retired_source_ids(journal.records())
+        for source_id, record in source.get("retired_records", {}).items():
+            if source_id in recorded:
+                continue
+            payload = {"file_id": source_id, "reason_code": "USER_CONFIRMED_DELETED",
+                       "effect": "NOT_APPLIED", "proposal_ref": record["proposal_ref"],
+                       "input_sha256": source["input_sha256"],
+                       "original_mapping": copy.deepcopy(record["original_mapping"])}
+            payload["evidence_ref"] = journal.evidence({"schema_version": "uqmc.proposal.retirement.v1", **payload})
+            journal.append("RETIRED", payload=payload)
+            recorded.add(source_id)
+        return recorded
 
 
 def _quarantined_refs(row, tab):
@@ -198,6 +231,7 @@ def catalog(export, *, expected_workbook_id=WORKBOOK_ID, include_subtree_coverag
     moves = _index(rows_by_tab["Proposed Moves"], "Proposal ID")
     quarantine_refs = {ref for item in quarantined for ref in item["refs"]}
     result, excluded, excluded_refs = {}, {WITHDRAWN_ID}, set(quarantine_refs)
+    retired_records = {}
     for row in rows_by_tab["Move Manifest"]:
         pid, item = _text(row["Proposal ID"]).strip(), _text(row["Manifest item"]).strip()
         ref = f"{pid}/{item}"
@@ -221,6 +255,17 @@ def catalog(export, *, expected_workbook_id=WORKBOOK_ID, include_subtree_coverag
         source_id = _text(row["Source ID"]).strip()
         decision = _text(row["Decision (Yes/No)"]).strip()
         is_excluded = _withdrawn(row, ("Review state", "Decision (Yes/No)"))
+        rationale = _text(row.get("Evidence / rationale")).splitlines()
+        is_retired = bool(rationale and rationale[0] == RETIRED_MARKER)
+        if is_retired:
+            if not source_id:
+                raise SafetyError("RETIRED_SOURCE_ID_REQUIRED")
+            if source_id in retired_records:
+                raise SafetyError("DUPLICATE_RETIRED_SOURCE")
+            retired_records[source_id] = {"proposal_ref": ref, "original_mapping": {
+                "rename_row": copy.deepcopy(row),
+                "move_rows": [copy.deepcopy(record["row"]) for record in result.values()
+                              if record["action"] == "MOVE" and record["source_id"] == source_id]}}
         if decision == "No":
             excluded_refs.add(ref)
         if is_excluded and source_id:
@@ -237,7 +282,8 @@ def catalog(export, *, expected_workbook_id=WORKBOOK_ID, include_subtree_coverag
         result.update(_subtree_coverage_records(result, rows_by_tab["Rename Coverage"], subtree_section_path))
     return {**({'subtree_coverage_version': 1,
                 'coverage_source_ids': sorted({_text(r.get('Source ID')).strip() for r in rows_by_tab['Rename Coverage'] if _text(r.get('Source ID')).strip()})} if include_subtree_coverage else {}),
-            "input_sha256": input_hash, "records": result, "excluded_ids": sorted(excluded),
+            "input_sha256": input_hash, "records": result, "excluded_ids": sorted(excluded | set(retired_records)),
+            "private_excluded_ids": sorted(excluded), "retired_ids": sorted(retired_records), "retired_records": retired_records,
             "excluded_refs": sorted(excluded_refs), "redacted_tombstones": tombstones,
             "quarantined_tombstones": quarantined}
 
@@ -306,9 +352,10 @@ def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
             from .section_importer import _eligibility_refs, _eligibility_records
             section_eligible_refs = _eligibility_refs(_section_eligibility, input_hash, selected, journal)
             source["records"].update(_eligibility_records(_section_eligibility))
+        retired = persist_retirements(journal, source)
         recorded_exclusions = {r["payload"]["file_id"] for r in journal.records() if r["kind"] == "EXCLUDED"}
         recorded_refs = {r["payload"]["proposal_ref"] for r in journal.records() if r["kind"] == "PROPOSAL_EXCLUDED"}
-        for source_id in source["excluded_ids"]:
+        for source_id in source["private_excluded_ids"]:
             if source_id not in recorded_exclusions:
                 journal.append("EXCLUDED", payload={"file_id": source_id, "reason_code": "WORKBOOK_WITHDRAWN_OR_EXCLUDED", "input_sha256": input_hash})
         quarantine_refs = {value for item in source["quarantined_tombstones"] for value in item["refs"]}
@@ -316,7 +363,7 @@ def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
             if ref not in recorded_refs:
                 reason = "WORKBOOK_REDACTED_EXCLUSION" if ref in quarantine_refs else "WORKBOOK_DECISION_NO"
                 journal.append("PROPOSAL_EXCLUDED", payload={"proposal_ref": ref, "reason_code": reason, "input_sha256": input_hash})
-        excluded = set(source["excluded_ids"]) | recorded_exclusions
+        excluded = set(source["excluded_ids"]) | recorded_exclusions | retired
         excluded_refs = set(source["excluded_refs"]) | recorded_refs
         rows, candidates = [], {}
         mutation_ids = {source["records"][ref]["source_id"] for ref in selected if ref in source["records"]}
@@ -462,7 +509,8 @@ def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
             "workbook_id": expected_workbook_id, "captured_at_utc": export["exported_at_utc"],
             "input_sha256": input_hash, "proposal_revision": "workbook:" + input_hash,
             "batch_id": batch_id, "selected_refs": selected, "rows": rows,
-            "excluded_ids": sorted(excluded), "excluded_refs": sorted(excluded_refs), "execution_approved": False,
+            "excluded_ids": sorted(excluded), "retired_ids": sorted(retired),
+            "excluded_refs": sorted(excluded_refs), "execution_approved": False,
             "redacted_tombstones": source["redacted_tombstones"],
             "quarantined_tombstones": source["quarantined_tombstones"],
             "proposal_hash": plan.proposal_hash if plan else None,

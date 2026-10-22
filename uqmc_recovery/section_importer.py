@@ -8,7 +8,7 @@ import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from .importer import ImportResult, WORKBOOK_ID, catalog, import_workbook, destination_route_record
+from .importer import ImportResult, WORKBOOK_ID, catalog, import_workbook, destination_route_record, retired_source_ids, persist_retirements
 from .model import FOLDER, NATIVE, Plan, SafetyError, digest, snapshot
 
 _SEAL = object()
@@ -758,7 +758,7 @@ def _hybrid_profile(journal, projection, members, operations, boundary, metadata
     # cleared spreadsheet cell never reopens an already excluded identity/ref.
     records = journal.records()
     original["excluded_ids"] = sorted(set(original.get("excluded_ids", [])) | {
-        e["payload"]["file_id"] for e in records if e["kind"] == "EXCLUDED"})
+        e["payload"]["file_id"] for e in records if e["kind"] == "EXCLUDED"} | retired_source_ids(records))
     original["excluded_refs"] = sorted(set(original.get("excluded_refs", [])) | {
         e["payload"]["proposal_ref"] for e in records if e["kind"] == "PROPOSAL_EXCLUDED"})
     paths = projection.get("destination_paths")
@@ -843,9 +843,10 @@ def import_section(journal, export, *, projection, owner_approval_ref, expected_
         members, operations, boundary = _projection(projection, source, expected_section_id, expected_workbook_id)
         approval = _approval(journal, owner_approval_ref, projection, members, operations, boundary)
         # Persist all current exclusions before any metadata access or early block.
+        retired = persist_retirements(journal, source)
         excluded_sources = {r["payload"]["file_id"] for r in journal.records() if r["kind"] == "EXCLUDED"}
         excluded_refs = {r["payload"]["proposal_ref"] for r in journal.records() if r["kind"] == "PROPOSAL_EXCLUDED"}
-        for source_id in source["excluded_ids"]:
+        for source_id in source["private_excluded_ids"]:
             if source_id not in excluded_sources:
                 journal.append("EXCLUDED", payload={"file_id": source_id, "reason_code": "WORKBOOK_WITHDRAWN_OR_EXCLUDED"})
         quarantined_refs = {ref for row in source.get("quarantined_tombstones", []) for ref in row["refs"]}
@@ -853,7 +854,7 @@ def import_section(journal, export, *, projection, owner_approval_ref, expected_
             if ref not in excluded_refs:
                 reason = "WORKBOOK_REDACTED_EXCLUSION" if ref in quarantined_refs else "WORKBOOK_DECISION_NO"
                 journal.append("PROPOSAL_EXCLUDED", payload={"proposal_ref": ref, "reason_code": reason})
-        excluded_sources |= set(source["excluded_ids"])
+        excluded_sources |= set(source["excluded_ids"]) | retired
         excluded_refs |= set(source["excluded_refs"])
         target_sections = {r.get("parent_section_id") for r in projection.get("destination_requirements", [])}
         target_sections.add(projection.get("reuse_target", {}).get("target_section_id"))
@@ -933,7 +934,7 @@ def import_section(journal, export, *, projection, owner_approval_ref, expected_
                                    _section_eligibility=token, metadata_profile=metadata_profile)
         plan = imported.plan
         scope_reason = None
-        exclusions = {r["payload"]["file_id"] for r in journal.records() if r["kind"] == "EXCLUDED"}
+        exclusions = {r["payload"]["file_id"] for r in journal.records() if r["kind"] == "EXCLUDED"} | retired_source_ids(journal.records())
         excluded_refs = {r["payload"]["proposal_ref"] for r in journal.records() if r["kind"] == "PROPOSAL_EXCLUDED"}
         if set(members) & exclusions or boundary & exclusions:
             scope_reason = "SECTION_CONTAINS_EXCLUDED_SOURCE_OR_TARGET"

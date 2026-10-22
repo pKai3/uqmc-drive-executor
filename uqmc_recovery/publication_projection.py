@@ -15,6 +15,7 @@ from pathlib import Path
 import uuid
 
 from .journal import _validate, canonical, digest
+from .importer import retired_source_ids
 from .projection import build_projections, validate_snapshot, _ordered_plan_operations
 
 FOLDER = 'application/vnd.google-apps.folder'
@@ -301,6 +302,7 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
         elif item['observed']['read_state']=='VERIFIED':
             item['location']['effect']='NONE'
     excluded, recoverable_excluded, private_excluded = _publication_exclusions(records)
+    retired = retired_source_ids(records)
     section_rows=[]; allowed=set(allowed_source_ids)-private_excluded
     for source in recoverable_excluded:
         item = items.get(source)
@@ -310,6 +312,12 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
             item['reason_codes'] = [code for code in item['reason_codes'] if code != 'WITHDRAWN']
             item['reason_codes'] = list(dict.fromkeys([
                 *item['reason_codes'], 'EXCLUDED', 'MISSING_OR_INACCESSIBLE', 'NOT_APPLIED']))
+    for source in retired:
+        item = items.get(source)
+        if item is not None:
+            # Retirement is an audit disposition, never an observed Drive effect.
+            item['reason_codes'] = list(dict.fromkeys([
+                *item['reason_codes'], 'RETIRED', 'USER_CONFIRMED_DELETED', 'NOT_APPLIED']))
     destination_observations={}
     for event in records:
         if event['kind']!='DESTINATION_VERIFIED':continue
@@ -336,6 +344,8 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
             if ph in hashes:plan.update(part)
         if len(ids)!=len(set(ids)) or not set(ids)<=allowed or not set(spec.get('source_folder_ids_left_in_place',[]))<=allowed:
             raise ValueError('SECTION_IDENTITIES_NOT_PUBLIC_ALLOWLISTED')
+        retired_ids = sorted(set(ids) & retired)
+        ids = [sid for sid in ids if sid not in retired]
         if spec['destination_mode'] not in {'REUSED_MOVED','REUSED_EXISTING','CREATED'}:
             raise ValueError('Unknown destination mode')
         def matching_destination_observation(sid):
@@ -396,6 +406,7 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
             'mode':spec['destination_mode'],'expected_file_count':len(ids),'completed_file_count':len(verified),
             'remaining_file_count':len(ids)-len(verified),'verified_at_utc':max(times) if times else None,
             'verified_file_ids':verified,'verified_destinations':verified_destinations,
+            'retired_file_ids':retired_ids,'retired_file_count':len(retired_ids),
             'created_destinations':[{**created[s], **({'path':spec['destination_paths'][s]} if s in spec.get('destination_paths',{}) else {})} for s in destination_ids if s in created],
             'retained_source_folder_ids':spec.get('source_folder_ids_left_in_place',[]),
             'created_folder_ids':[s for s in destination_ids if s in created],
