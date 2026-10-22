@@ -106,6 +106,8 @@ class ConsoleReporter:
                           + ": " + concise(value.get("observed_name", "")) + " → "
                           + concise(value.get("approved_target_name", ""))
                           + "; rollback will preserve the observed name.")
+            elif stage == "import_blocked":
+                self.line(value.get("message", "SECTION_IMPORT_BLOCKED"))
             elif stage == "folder_verified":
                 self.line("Folder verified: " + concise(value.get("path", "")))
             elif stage == "item_started":

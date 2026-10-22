@@ -18,9 +18,10 @@ import signal
 import threading
 import time
 import uuid
+from types import SimpleNamespace
 
 from .__main__ import save_new, plan_from_json
-from .model import FOLDER, NATIVE, MIME_EXTENSIONS, SafetyError, digest, uploaded_extension
+from .model import FOLDER, NATIVE, MIME_EXTENSIONS, SafetyError, digest, uploaded_extension, validate_rename_name
 from .section_prepare import _path, exact_rename
 from .section_execution import collect_metadata, normalize, authorize
 from .destination_planner import plan_destination, build_hybrid_preparation, logical_parent, file_parent_path, select_destination_records as select_records
@@ -362,8 +363,53 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
             'semantic_selection':semantic_selection(source,section)}
 
 
+def import_blocked(manifest, report):
+    """Keep row errors visible even when the section-level reason is null."""
+    rows=[r for r in manifest.get('rows',[]) if r.get('state')=='BLOCKED']
+    groups={}
+    for row in rows:
+        groups.setdefault(row.get('reason_code') or 'UNSPECIFIED_ROW_ERROR',[]).append(row.get('reference','?'))
+    details=[]
+    if manifest.get('section_reason_code'):details.append(manifest['section_reason_code'])
+    for reason,refs in sorted(groups.items()):
+        examples=', '.join(refs[:10]) + (', …' if len(refs)>10 else '')
+        details.append(f"{reason} ({len(refs)}: {examples})")
+    message='SECTION_IMPORT_BLOCKED:'+('; '.join(details) or 'NO_EXECUTABLE_PLAN')
+    report({'stage':'import_blocked','message':message,'blocked_rows':rows})
+    raise SafetyError(message)
+
+
+def prepare_rename_evidence(journal, layout, metadata, evidence_ref, report):
+    """Validate exact target titles/extensions before any destination mutation.
+
+    Checks needing newly allocated destination IDs remain in the final import.
+    Proofs retain exact observed names and MIME; no original evidence is changed.
+    """
+    native,corrections,errors={},{},[]
+    for r in layout['records']:
+        if r['action']!='RENAME' or r['source_id'] in layout['source_container_ids']:continue
+        before=metadata[r['source_id']]
+        try:
+            name=exact_rename(r,before);mime=before['mime_type']
+            if name!=r['row']['Proposed name + type suffix']:
+                native[r['reference']]=journal.evidence({'schema_version':'uqmc.rename.native-display-conversion.v1','source_id':before['id'],'mime_type':mime,
+                    'workbook_row_sha256':r['row_sha256'],'workbook_proposed_name':r['row']['Proposed name + type suffix'],
+                    'exact_target_name':name,'display_suffix':NATIVE[mime],'provenance_ref':evidence_ref})
+            suffix=uploaded_extension(before['name'])
+            if mime not in NATIVE and mime!=FOLDER and suffix and uploaded_extension(name).casefold()!=suffix.casefold():
+                proof=journal.evidence({'kind':'VERIFIED_EXTENSION_CORRECTION','source_id':before['id'],'source_exact_name':before['name'],
+                    'target_exact_name':name,'mime_type':mime,'provenance_ref':evidence_ref})
+                corrections[r['reference']]={'source_suffix':suffix,'target_suffix':uploaded_extension(name),'mime_type':mime,'evidence_ref':proof}
+            validate_rename_name(SimpleNamespace(direction='FORWARD',target={'name':name},
+                extension_correction=corrections.get(r['reference'],{})),before)
+        except SafetyError as error:
+            errors.append({'state':'BLOCKED','reference':r['reference'],'source_id':r['source_id'],'reason_code':str(error)})
+    if errors:import_blocked({'rows':errors},report)
+    return native,corrections
+
+
 def freeze(config, section, journal, state, factory, run_dir, report):
-    from .folder_creation import ensure_required_folder
+    from .folder_creation import prepare_required_folders
     from .section_importer import import_section
     from .agent_profile import register_agent_plan
     from .batch_source import bind_initial_section_source
@@ -374,16 +420,17 @@ def freeze(config, section, journal, state, factory, run_dir, report):
         'provenance':'Operator invoked destination CLI with --apply for this exact destination subtree.',
         'access_policy':'SCOPED_INHERITANCE_ACCEPTED','no_permission_changes':True})
     layout=state['layout'];paths=dict(layout['destination_paths']);live=state['live'];metadata=live['metadata']
+    source_ref=journal.evidence({'metadata':{r['source_id']:live['raw'][r['source_id']] for r in layout['records']
+        if r['action']=='RENAME' and r['source_id'] not in layout['source_container_ids']},'permission_audit':False})
+    native,corrections=prepare_rename_evidence(journal,layout,metadata,source_ref,report)
     missing=layout['missing_folders'];keys={s['logical_path']:s['logical_key'] for s in missing}
     specs=[{'key':s['logical_key'],'name':s['folder_name'],**({'parent_key':keys[s['parent_path']]} if s['parent_path'] in keys else {'parent_id':paths[s['parent_path']]})} for s in missing]
     creation_ref=journal.evidence({'schema_version':'uqmc.folder-create-authority.v1','decision':'APPROVED','section_id':sid,
         'approval_id':approval_id,'provenance_ref':instruction_ref,'access_policy':'SCOPED_INHERITANCE_ACCEPTED','folders':specs})
-    for spec in missing:
-        parent=paths[spec['parent_path']]
-        client=factory({parent},set(),state['excluded'],True,creation_parent_ids={parent})
-        raw=ensure_required_folder(journal,client,key=spec['logical_key'],name=spec['folder_name'],parent_id=parent,authority_ref=creation_ref)
-        paths[spec['logical_path']]=raw['id'];live['raw'][raw['id']]=raw;live['listings'][raw['id']]=[];metadata[raw['id']]=normalize(raw,[])
-        report({'stage':'folder_verified','path':spec['logical_path'],'source_id':raw['id']})
+    created=prepare_required_folders(journal,factory,specs=missing,paths=paths,excluded_ids=state['excluded'],
+        authority_ref=creation_ref,workers=config.get('workers',10),report=report)
+    for logical,raw in created.items():
+        paths[logical]=raw['id'];live['raw'][raw['id']]=raw;live['listings'][raw['id']]=[];metadata[raw['id']]=normalize(raw,[])
     evidence_ref=journal.evidence({'metadata':live['raw'],'listings':live['listings'],'permission_audit':False,
         'history_cached_source_ids':live.get('history_cached_source_ids',[])})
     for logical,folder_id in paths.items():
@@ -395,19 +442,6 @@ def freeze(config, section, journal, state, factory, run_dir, report):
                 'parent_ids':value['parents'],'proposal_path':logical,'observed_ref':journal.evidence(value)})
     mapping_ref=journal.evidence({'schema_version':'uqmc.section.destination-paths.v1','section_id':sid,
         'input_sha256':state['source']['input_sha256'],'destination_paths':paths,'provenance_ref':evidence_ref})
-    native,corrections={},{}
-    for r in layout['records']:
-        if r['action']!='RENAME' or r['source_id'] in layout['source_container_ids']:continue
-        before=metadata[r['source_id']];name=exact_rename(r,before);mime=before['mime_type']
-        if name!=r['row']['Proposed name + type suffix']:
-            native[r['reference']]=journal.evidence({'schema_version':'uqmc.rename.native-display-conversion.v1','source_id':before['id'],'mime_type':mime,
-                'workbook_row_sha256':r['row_sha256'],'workbook_proposed_name':r['row']['Proposed name + type suffix'],
-                'exact_target_name':name,'display_suffix':NATIVE[mime],'provenance_ref':evidence_ref})
-        suffix=uploaded_extension(before['name'])
-        if mime not in NATIVE and mime!=FOLDER and suffix and not name.endswith(suffix):
-            proof=journal.evidence({'kind':'VERIFIED_EXTENSION_CORRECTION','source_id':before['id'],'source_exact_name':before['name'],
-                'target_exact_name':name,'mime_type':mime,'provenance_ref':evidence_ref})
-            corrections[r['reference']]={'source_suffix':suffix,'target_suffix':uploaded_extension(name),'mime_type':mime,'evidence_ref':proof}
     prepared=build_hybrid_preparation(state['source'],section_path=section,section_id=sid,workbook_id=config['workbook_id'],
         metadata_by_id=metadata,destination_paths=paths,destination_path_evidence_ref=mapping_ref,native_conversion_refs=native,extension_corrections=corrections)
     p=prepared['projection']
@@ -418,7 +452,7 @@ def freeze(config, section, journal, state, factory, run_dir, report):
     result=import_section(journal,state['capture'],projection=p,owner_approval_ref=journal.evidence(owner),expected_section_id=sid,
         expected_workbook_id=config['workbook_id'],batch_id=sid+'-'+uuid.uuid4().hex[:12],metadata_by_id=metadata,resolutions=prepared['resolutions'],
         expected_method_profile='destination_hybrid',metadata_profile='AGENT_ASSISTED')
-    if result.plan is None:raise SafetyError('SECTION_IMPORT_BLOCKED:'+str(result.manifest.get('section_reason_code',result.manifest.get('rows'))))
+    if result.plan is None:import_blocked(result.manifest,report)
     plan=result.plan;register_agent_plan(journal,plan);bind_initial_section_source(journal,plan,state['capture'])
     # Preserve original proposal/history; the new plan and mutation intent use
     # the observed preimage so explicit rollback restores the actual starting name.
@@ -536,9 +570,11 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
             with journal.locked():
                 with timed_stage(report,'Backup before plan preparation'):
                     journal.backup(Path(config['backup_directory'])/('before-destination-'+uuid.uuid4().hex))
-                if capture_client._revision()!=capture['source_revision']:raise SafetyError('WORKBOOK_CHANGED_BEFORE_FREEZE_REFRESH_REQUIRED')
-                with timed_stage(report,'Freeze plan and validate authority'):
-                    prepared=freeze(config,section,journal,state,factory,run_dir,report)
+            if capture_client._revision()!=capture['source_revision']:raise SafetyError('WORKBOOK_CHANGED_BEFORE_FREEZE_REFRESH_REQUIRED')
+            # Folder workers retain the process lock via shared_locked(); their
+            # network requests must not run under the controller's journal gate.
+            with timed_stage(report,'Freeze plan and validate authority'):
+                prepared=freeze(config,section,journal,state,factory,run_dir,report)
             registry.setdefault('runs',[]).append(prepared);atomic_json(registry_path,registry)
         else:run_dir=Path(prepared['plan_path']).parent
         if not apply:return {'section':section,'preview_only':True,'saved_run_id':prepared['run_id'],'selected_identities':len(prepared['selected_source_ids'])}

@@ -69,6 +69,25 @@ and the parent's complete direct listing. Wrong identity, name/MIME disagreement
 missing membership, invalid capabilities or a trashed parent still block. Known
 destination placement and every folder being moved retain strict parent checks.
 
+Uploaded extensions are compared without letter-case differences, so an approved
+`.JPG` to `.jpg` change is accepted without changing the file format. Genuine
+extension changes still require the existing MIME/provenance validation. Exact
+observed and target titles remain in recovery history.
+
+Before creating destination folders, the command validates proposed rename titles
+and extensions. Import failures report reason counts and proposal references;
+the private console log retains every blocked row. Checks requiring allocated
+folder IDs still run during the final import.
+
+Independent folder creation and verification use the configured bounded worker
+count (default 10), with separate HTTP transports. Children wait for their parent
+to be verified. The process writer lock stays held and durable journal writes are
+serialized, while network requests overlap. Failure stops new scheduling and
+in-flight outcomes are recorded. Restart reconciles previously allocated folder
+IDs before any retry; it does not create replacement identities. If preparation
+fails before a saved executable batch exists, rerun ordinary `--apply` after
+resolving the reported blocker. Use `--resume` only for an existing saved batch.
+
 To execute that destination section and publish its verified status:
 
 ```sh

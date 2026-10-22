@@ -53,7 +53,10 @@ def validate_rename_name(op, before):
             raise SafetyError("SYNTHETIC_NATIVE_EXTENSION")
     elif before["mime_type"] != FOLDER:
         suffix = uploaded_extension(old)
-        if suffix and not title.endswith(suffix):
+        # Casing is part of the approved title, not a change of file format.
+        # Keep exact names in evidence/rollback while comparing extensions
+        # case-insensitively (including known compound archive suffixes).
+        if suffix and not title.casefold().endswith(suffix.casefold()):
             target_suffix = uploaded_extension(title)
             correction = op.extension_correction
             allowed = MIME_EXTENSIONS.get(before["mime_type"], set())
