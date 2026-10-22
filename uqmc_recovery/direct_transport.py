@@ -29,7 +29,7 @@ READONLY_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
 DEFAULT_REQUEST_TIMEOUT = 15
 FILE_FIELDS = (
     "id,name,mimeType,parents,modifiedTime,version,trashed,size,md5Checksum,"
-    "owners,driveId,capabilities,permissions,shortcutDetails,"
+    "owners,driveId,capabilities,permissions,shortcutDetails,appProperties,"
     "inheritedPermissionsDisabled,shared,hasAugmentedPermissions"
 )
 # Explicitly accepted no-audit mode still reads fields used for identity,
@@ -37,7 +37,7 @@ FILE_FIELDS = (
 # changes sharing. The default field selection remains unchanged.
 NO_PERMISSION_AUDIT_FIELDS = (
     "id,name,mimeType,parents,modifiedTime,version,trashed,size,md5Checksum,"
-    "owners,driveId,shortcutDetails,"
+    "owners,driveId,shortcutDetails,appProperties,"
     "capabilities(canRename,canAddChildren,canMoveItemWithinDrive,canMoveItemOutOfDrive)"
 )
 # Membership and collision checks use only these fields. Full source and
@@ -297,6 +297,9 @@ class GoogleDriveTransport:
         result = self._read(request, request="files.get", item_id=file_id)
         if result.get("id") != file_id:
             raise TransportError("DRIVE_RESPONSE_ID_MISMATCH", outcome="READ_FAILED")
+        # Drive may omit an empty appProperties map. Preserve that we actually
+        # requested it, so cache recovery can distinguish absence from omission.
+        result["_app_properties_requested"] = True
         # This is an HTTP response header, not a synthetic File resource field.
         # The Python client exposes response callbacks; Drive returning and
         # enforcing an ETag for this account still needs a live integration test.
@@ -392,7 +395,7 @@ class GoogleDriveTransport:
         if file_id not in self._reserved_folder_ids:
             raise TransportError("UNRESERVED_FOLDER_ID")
         result = self._read(lambda: self.service.files().get(
-            fileId=self._guard(file_id), fields=self.file_fields + ",appProperties",
+            fileId=self._guard(file_id), fields=self.file_fields,
             supportsAllDrives=True), request="files.get", item_id=file_id)
         if result.get("id") != file_id:
             raise TransportError("DRIVE_RESPONSE_ID_MISMATCH", outcome="READ_FAILED")
@@ -416,7 +419,7 @@ class GoogleDriveTransport:
             result = self.service.files().create(body={
                 "id": file_id, "name": name, "mimeType": "application/vnd.google-apps.folder",
                 "parents": [parent_id], "appProperties": {"uqmcFolderKey": stable_key}},
-                fields=self.file_fields + ",appProperties", supportsAllDrives=True,
+                fields=self.file_fields, supportsAllDrives=True,
                 ignoreDefaultVisibility=True).execute(num_retries=0)
         except Exception as error:
             raise _failure(error, dispatched=True, request="files.create", item_id=file_id,

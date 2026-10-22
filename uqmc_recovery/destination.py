@@ -188,7 +188,15 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
         for saved in cache_dir.glob('*.json'):
             value=json.loads(saved.read_text())
             if 0<=now-value['read_at_unix']<=300 and digest(value['value'])==value['value_sha256']:
-                cache[value['key']]=value['value']
+                key=value['key'];raw_value=value['value']
+                # Old ordinary GETs did not request creation markers. Refresh
+                # only those recovered-folder reads; a requested-but-absent or
+                # genuinely different marker still reaches the conflict guard.
+                if (key.startswith('get_file:') and key[len('get_file:'):] in recovered
+                        and 'appProperties' not in raw_value
+                        and raw_value.get('_app_properties_requested') is not True):
+                    continue
+                cache[key]=raw_value
     reused_cache=len(cache)
     def on_read(method,sid,value):
         if cache_dir is not None:
