@@ -205,3 +205,40 @@ def load_created_folder_proofs_for_path(journal, section_path):
                            'destination_event_ref': _event_ref(requested[-1])}
             path_owners[logical_path] = sid
     return result
+
+
+def verified_destination_anchors(journal, section_path, metadata, source_ids):
+    """Reuse observed destination identities from this section or its ancestors.
+
+    This supplies structural evidence only. The planner still restricts required
+    paths and verifies recovered children and final parent identities.
+    """
+    from .section_prepare import _path, _inside
+    section_path = _path(section_path)
+    parts = section_path.split('/')
+    section_ids = {'destination-' + digest({'canonical_path': '/'.join(parts[:n])})[:20]
+                   for n in range(1, len(parts) + 1)}
+    result = {}
+    for event in journal.records():
+        value = event['payload']; sid = value.get('file_id'); path = value.get('proposal_path')
+        if (event['kind'] != 'DESTINATION_VERIFIED' or value.get('section_id') not in section_ids
+                or sid in source_ids or sid not in metadata or not isinstance(path, str)
+                or not _inside(path, section_path) or not value.get('observed_ref')):
+            continue
+        observed = journal.read_evidence(value['observed_ref'])
+        if (observed.get('id') != sid or observed.get('name') != value.get('exact_name')
+                or observed.get('parents') != value.get('parent_ids')
+                or observed.get('mime_type', observed.get('mimeType')) != FOLDER
+                or observed.get('trashed') is not False):
+            raise SafetyError('RECOVERY_DESTINATION_ANCHOR_EVIDENCE_CONFLICT:' + sid)
+        current = metadata[sid]
+        marker = (observed.get('appProperties') or {}).get('uqmcFolderKey')
+        if (current.get('id') != sid or current.get('mime_type') != FOLDER
+                or current.get('trashed') is not False or current.get('name') != value['exact_name']
+                or current.get('parents') != value['parent_ids']
+                or (marker is not None and (current.get('appProperties') or {}).get('uqmcFolderKey') != marker)):
+            continue  # Mismatched evidence cannot satisfy the planner's parent guard.
+        if path in result and result[path] != sid:
+            raise SafetyError('RECOVERY_DESTINATION_ANCHOR_AMBIGUOUS:' + path)
+        result[path] = sid
+    return result

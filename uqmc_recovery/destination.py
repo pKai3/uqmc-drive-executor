@@ -287,18 +287,8 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
     # A failed preparation can verify destination anchors before saving a run
     # registry. Reuse only exact-ID observations corroborated by this capture;
     # source folders still require the planner's intact-reuse proof.
-    recovery_anchors={}
-    for event in history:
-        value=event['payload'];folder_id=value.get('file_id');path=value.get('proposal_path')
-        if (event['kind']!='DESTINATION_VERIFIED' or value.get('section_id')!=section_key(section)
-                or folder_id in ids or folder_id not in metadata or not isinstance(path,str)
-                or not (path==section or path.startswith(section+'/'))):continue
-        current=metadata[folder_id]
-        if (current.get('id')!=folder_id or current.get('mime_type')!=FOLDER or current.get('trashed') is not False
-                or current['name']!=value.get('exact_name') or current['parents']!=value.get('parent_ids')):continue
-        if path in recovery_anchors and recovery_anchors[path]!=folder_id:
-            raise SafetyError('RECOVERY_DESTINATION_ANCHOR_AMBIGUOUS:'+path)
-        recovery_anchors[path]=folder_id
+    from .destination_recovery import verified_destination_anchors
+    recovery_anchors=verified_destination_anchors(journal,section,metadata,ids)
     paths.update(recovery_anchors)
     for p,s in known.items():
         if p==section or p.startswith(section+'/'):
