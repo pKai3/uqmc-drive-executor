@@ -281,7 +281,27 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
         parent=layout['destination_paths'].get(spec['parent_path'])
         if parent is None:continue
         folder(parent,parent_context=parent==paths[anchor] and parent not in ids)
-        reject_trailing_whitespace_aliases(listings[parent],spec['folder_name'],context=spec['logical_path'])
+        children=listings[parent]
+        reused_id=layout['destination_paths'].get(spec['logical_path'])
+        own_rename=by_id.get(reused_id,{}).get('RENAME')
+        # A proved reused folder can already occupy this parent under its exact
+        # original name. Its explicit trim-only rename is not a second identity.
+        own_child=next((c for c in children if c['id']==reused_id),None)
+        approved_self_rename=(reused_id in layout['reused_folder_ids'] and own_rename is not None
+            and own_child is not None and own_child.get('mimeType')==FOLDER
+            and own_child['name']==raw[reused_id]['name']==own_rename['row'].get('Current name + type suffix')
+            and own_child['name']!=spec['folder_name']
+            and own_child['name'].rstrip()==spec['folder_name']
+            and exact_rename(own_rename,metadata[reused_id])==spec['folder_name'])
+        if approved_self_rename:
+            # An exact or whitespace-equivalent name on any other ID remains a
+            # conflict; never let discovery rebind the proved destination ID.
+            for child in children:
+                if child['id']!=reused_id and child['name'].rstrip()==spec['folder_name']:
+                    raise SafetyError('DESTINATION_TRAILING_WHITESPACE_CONFLICT:'
+                                      +spec['logical_path']+':'+child['id'])
+            children=[c for c in children if c['id']!=reused_id]
+        reject_trailing_whitespace_aliases(children,spec['folder_name'],context=spec['logical_path'])
         matches=[c for c in listings[parent] if c['name']==spec['folder_name']]
         if len(matches)>1 or any(c['mimeType']!=FOLDER for c in matches):raise SafetyError('AMBIGUOUS_EXISTING_DESTINATION:'+spec['logical_path'])
         if matches:

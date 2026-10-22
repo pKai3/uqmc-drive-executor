@@ -6,6 +6,7 @@ import test_destination_command as destination
 import test_folder_creation as creation
 from uqmc_recovery.folder_creation import reject_trailing_whitespace_aliases
 from uqmc_recovery.journal import Journal
+from test_importer import set_cell
 from uqmc_recovery.model import SafetyError
 
 
@@ -49,6 +50,75 @@ class DestinationWhitespaceGuardTests(unittest.TestCase):
         for name in ('Skills ','Skills\t','Skills\u00a0'):
             with self.subTest(name=name),self.assertRaisesRegex(SafetyError,'DESTINATION_TRAILING_WHITESPACE_CONFLICT'):
                 reject_trailing_whitespace_aliases([{'id':'alias','name':name}],'Skills')
+
+    def approved_self_fixture(self, title='Skills', whitespace=' '):
+        f=self.fixture()
+        section='Club/'+title
+        for tab, row, field, value in [
+            ('Proposed Moves',1,'Proposed target path',section),
+            ('Move Manifest',1,'Exact target path',section),
+            ('Proposed Renames',1,'Current name + type suffix',title+whitespace),
+            ('Proposed Renames',1,'Proposed name + type suffix',title),
+            ('Proposed Renames',2,'Proposed destination folder',section)]:
+            set_cell(f.export,tab,row,field,value)
+        f.server.drive.files['source-root']['name']=title+whitespace
+        f.server.drive.files['source-root']['parents']=['club']
+        def run(**kwargs):
+            return destination.run_destination(f.config,section,capture_client=f.capture,
+                factory=f.server.factory,publisher=f.publisher,report=f.progress.append,**kwargs)
+        return f,run
+
+    def test_approved_self_rename_is_general_and_preview_never_mutates(self):
+        for title, whitespace in [('Skills',' '),('Film Festival Announcement','  '),
+                                 ('Archive','\t'),('Media','\u00a0')]:
+            with self.subTest(title=title,whitespace=whitespace):
+                f,run=self.approved_self_fixture(title,whitespace)
+                before=copy.deepcopy(f.server.drive.files)
+                result=run()
+                self.assertEqual(result['blockers'],[])
+                self.assertEqual(result['whole_folder_reuse_ids'],['source-root'])
+                self.assertEqual(result['missing_folders'],[])
+                self.assertEqual(f.server.drive.files,before)
+                self.assertEqual(f.server.requests,[])
+                self.assertEqual(Journal(f.config['store']).records(),[])
+
+    def test_approved_self_rename_apply_keeps_id_parent_and_history(self):
+        f,run=self.approved_self_fixture()
+        result=run(apply=True)
+        self.assertEqual(result['counts'],{'APPLIED':2})
+        self.assertEqual(f.server.requests[0],{'fileId':'source-root','name':'Skills'})
+        self.assertEqual(f.server.drive.files['source-root']['parents'],['club'])
+        self.assertEqual(f.server.created,[])
+        journal=Journal(f.config['store'])
+        self.assertTrue(any(e['kind']=='DESIRED_ATTEMPTED' for e in journal.records()))
+        requests=copy.deepcopy(f.server.requests)
+        again=run(apply=True)
+        self.assertTrue(again['no_op'])
+        self.assertEqual(f.server.requests,requests)
+
+    def test_approved_self_rename_cannot_adopt_different_collision_id(self):
+        for name,folder in [('Skills',True),('Skills ',True),('Skills\t',True),('Skills',False)]:
+            with self.subTest(name=name,folder=folder):
+                f,run=self.approved_self_fixture()
+                f.server.drive.files['other']=destination.raw('other',name,['club'],folder)
+                before=copy.deepcopy(f.server.drive.files)
+                with self.assertRaisesRegex(SafetyError,'DESTINATION_TRAILING_WHITESPACE_CONFLICT:.*:other'):
+                    run(apply=True)
+                self.assertEqual(f.server.drive.files,before)
+                self.assertEqual(f.server.requests,[])
+                self.assertEqual(f.server.created,[])
+                self.assertEqual(Journal(f.config['store']).records(),[])
+
+    def test_self_rename_requires_exact_original_title_and_explicit_proposal(self):
+        for mode in ('drift','missing','declined'):
+            with self.subTest(mode=mode):
+                f,run=self.approved_self_fixture()
+                if mode=='drift':f.server.drive.files['source-root']['name']='Skills  '
+                if mode=='missing':del f.export['sheets']['Proposed Renames'][1]
+                if mode=='declined':set_cell(f.export,'Proposed Renames',1,'Decision (Yes/No)','No')
+                with self.assertRaises(SafetyError):run(apply=True)
+                self.assertEqual(f.server.requests,[])
+                self.assertEqual(f.server.created,[])
 
     def creation_fixture(self):
         f=creation.FolderCreationTests(methodName='runTest')
