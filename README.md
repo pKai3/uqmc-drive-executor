@@ -22,6 +22,11 @@ python3 -m uqmc_recovery backup private/backups/checkpoint-001
 
 `private/` and generated projections are ignored before staging. This folder contains the actual workbook ID, permanent withdrawal policy, connector receipts, exact metadata, permission snapshots and journals. Do not stage ignored files with `git add -f`. Exported status and proposal inputs can still contain private data. Neither the repository nor any public viewer is an evidence backup.
 
+Local checkpoints retain a full journal and a manifest of every evidence hash. Their `evidence/` directories reuse verified backup blobs by hard link from `private/backups/.snapshot-evidence/`, copying only new evidence; the live evidence store is not linked into this pool. The first checkpoint can seed the pool from a verified recent legacy backup without copying its contents. Existing backups are retained. Every checkpoint remains readable independently of the pool directory, and no earlier backup directory is recursively included.
+
+The pool's private verification index caches device, inode, size, modification time and change time; changed files are rehashed, and a missing or invalid index triggers verification again. Interrupted checkpoints retain `.snapshot-incomplete` and cannot be resumed. Recovery reads verify evidence hashes. Shared blobs are immutable by program convention, not tamper-proof storage: editing one backup blob affects checkpoints sharing it. Keep an independent off-device backup for disk failure or owner-level changes. Torn-journal recovery still creates an independent store and preserves the damaged original.
+
+
 ## Spreadsheet input and approvals
 
 See [importer contract](docs/importer.md). The importer reads complete connector-exported proposal ranges, exact headers and explicit selection. `Yes` makes a row eligible for review; it does not authorise execution. Paths and display labels are never used as Drive mutation targets. Exact destination IDs, complete current metadata, and reviewed exact native titles are required. Source and row withdrawals persist across revisions. A changed workbook fingerprint invalidates target resolutions and approval binding.

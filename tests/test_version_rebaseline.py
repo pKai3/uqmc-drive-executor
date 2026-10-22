@@ -90,15 +90,17 @@ class VersionRebaselineTests(unittest.TestCase):
                     self.reconcile()
         self.assertFalse(any(r["kind"] == "DESIRED_REBASELINED" for r in self.journal.records()))
 
-    def test_later_version_change_remains_a_conflict(self):
+    def test_later_version_only_advance_is_reconciled_without_replaying_rename(self):
         self.reconcile()
         self.transport.files["fixture-source"]["version"] = str(int(self.transport.files["fixture-source"]["version"]) + 1)
         result = self.fixture.run_plan(self.fixture.runner(audit_permissions=False))
-        self.assertEqual(result["counts"], {"CONFLICT": 1})
-        self.assertEqual(result["items"][0]["reason"], "CONCURRENT_CHANGE")
-        self.assertEqual(self.transport.calls, [])
+        self.assertEqual(result["counts"], {"APPLIED": 1})
+        self.assertEqual(self.transport.calls, [{"fileId": "fixture-source",
+            "addParents": "fixture-destination", "removeParents": "fixture-parent"}])
+        accepted = [r for r in self.journal.records() if r["kind"] == "DESIRED_STATE_COMPARISON"]
+        self.assertEqual(accepted[-1]["payload"]["outcome"], "ACCEPTED_VERSION_ONLY")
 
-    def test_change_between_observation_and_prewrite_still_blocks(self):
+    def test_version_only_change_between_observation_and_prewrite_is_recorded(self):
         self.reconcile()
         read_number = self.transport.reads["fixture-source"]
         def changed(source_id, count):
@@ -106,8 +108,11 @@ class VersionRebaselineTests(unittest.TestCase):
                 self.transport.files[source_id]["version"] = str(int(self.transport.files[source_id]["version"]) + 1)
         self.transport.on_get = changed
         result = self.fixture.run_plan(self.fixture.runner(audit_permissions=False))
-        self.assertEqual(result["counts"], {"CONFLICT": 1})
-        self.assertEqual(self.transport.calls, [])
+        self.assertEqual(result["counts"], {"APPLIED": 1})
+        self.assertEqual(len(self.transport.calls), 1)
+        accepted = [r for r in self.journal.records() if r["kind"] == "DESIRED_STATE_COMPARISON"]
+        self.assertEqual(accepted[-1]["payload"]["stage"], "PRE_DISPATCH")
+        self.assertEqual(accepted[-1]["payload"]["outcome"], "ACCEPTED_VERSION_ONLY")
 
     def test_pending_attempt_cannot_be_rebaselined(self):
         self.runner.record("ATTEMPTED", self.item, before_ref=self.journal.evidence(self.applied_raw),

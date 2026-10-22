@@ -264,6 +264,65 @@ class DesiredRunner:
         rolled = {r["payload"].get("forward_event_id") for r in self.events(item["source_id"]) if r["kind"] == "DESIRED_ROLLED_BACK"}
         return next((r for r in reversed(changes) if r["event_id"] not in rolled), None)
 
+    def _state_differences(self, before, observed):
+        """Known operation-relevant fields, excluding provider-only annotations."""
+        old, new = core(before), core(observed)
+        differences = {key: {"before": value, "observed": new[key]}
+                       for key, value in old.items() if value != new[key]}
+        keys = ("version", "modifiedTime", "_http_etag", "size", "md5Checksum",
+                "sha1Checksum", "sha256Checksum", "owners", "driveId",
+                "shortcutDetails", "trashed", "capabilities")
+        if self.audit_permissions:
+            keys += ("_permissions",)
+        for key in keys:
+            if key in before and before[key] != observed.get(key):
+                differences[key] = {"before": before[key], "observed": observed.get(key)}
+        return differences
+
+    @staticmethod
+    def _counter_advanced(before, observed):
+        old, new = before.get("version"), observed.get("version")
+        return (isinstance(old, str) and old.isdecimal() and
+                isinstance(new, str) and new.isdecimal() and int(new) > int(old))
+
+    def _record_comparison(self, item, before, observed, *, stage, outcome,
+                           reason, direction="FORWARD", attempt=0):
+        return self.record("STATE_COMPARISON", item, direction=direction, attempt=attempt,
+            stage=stage, outcome=outcome, reason=reason,
+            before_ref=self.journal.evidence(before), observed_ref=self.journal.evidence(observed),
+            differences=self._state_differences(before, observed),
+            limitation="Version causation is unknown; this does not resolve an uncertain request.")
+
+    def _check_current(self, item, before, observed, *, stage,
+                       allow_counter_advance=False, read_only=False,
+                       core_error="CONCURRENT_NAME_OR_PARENT_CHANGE",
+                       direction="FORWARD", attempt=0):
+        """Compare fresh reads; only a monotonic version-only change may pass.
+
+        Pending writes call this with the exception disabled. Both accepted
+        counter advances and rejected comparisons retain their exact evidence.
+        """
+        differences = self._state_differences(before, observed)
+        advanced = False
+        try:
+            if core(before) != core(observed):
+                raise SafetyError(core_error)
+            self.unchanged(before, observed)
+            if differences:
+                advanced = (allow_counter_advance and set(differences) == {"version"}
+                            and self._counter_advanced(before, observed))
+                if not advanced:
+                    raise SafetyError("CONCURRENT_CHANGE")
+        except SafetyError as error:
+            if not read_only:
+                self._record_comparison(item, before, observed, stage=stage, outcome="CONFLICT",
+                    reason=str(error), direction=direction, attempt=attempt)
+            raise
+        if advanced and not read_only:
+            self._record_comparison(item, before, observed, stage=stage, outcome="ACCEPTED_VERSION_ONLY",
+                reason="MATCHING_RELEVANT_STATE_COUNTER_ADVANCE", direction=direction, attempt=attempt)
+        return advanced
+
     def _version_only_match(self, item, before, observed):
         """Accept only an explicit historical counter advance, never live drift."""
         if (core(before) != core(observed) or
@@ -387,6 +446,32 @@ class DesiredRunner:
             raise SafetyError("FOLDER_CAPABILITY_DRIFT")
 
     def _check_applied(self, item, active, applied, observed, *, read_only=False):
+        pending = self.pending(item, "FORWARD") or self.pending(item, "ROLLBACK")
+        try:
+            advanced = self._check_current(item, applied, observed, stage="RECORDED_APPLIED",
+                allow_counter_advance=not pending, read_only=True,
+                core_error="RECORDED_APPLIED_STATE_WAS_CHANGED")
+        except SafetyError:
+            # Keep the existing folder reconciliation for recorded related
+            # membership changes; it must never resolve a pending request.
+            try:
+                if (pending or item["original"]["mime_type"] != FOLDER or
+                        not self._counter_advanced(applied, observed) or
+                        not set(self._state_differences(applied, observed)) <=
+                            {"version", "modifiedTime", "_http_etag"}):
+                    raise
+                self._check_applied_folder(item, active, applied, observed, read_only=read_only)
+                return
+            except SafetyError as error:
+                if not read_only:
+                    self._record_comparison(item, applied, observed, stage="RECORDED_APPLIED",
+                        outcome="CONFLICT", reason=str(error))
+                raise
+        if advanced and not read_only:
+            self._record_comparison(item, applied, observed, stage="RECORDED_APPLIED",
+                outcome="ACCEPTED_VERSION_ONLY", reason="MATCHING_RELEVANT_STATE_COUNTER_ADVANCE")
+
+    def _check_applied_folder(self, item, active, applied, observed, *, read_only=False):
         try:
             self.unchanged(applied, observed, strict=True)
             return
@@ -430,8 +515,8 @@ class DesiredRunner:
 
         The authority reference records the human instruction and exact scope;
         its hash is not itself permission. Original before/applied evidence stays
-        intact. Subsequent observe and pre-dispatch reads use the accepted version
-        strictly, so another change after this observation still blocks the move.
+        intact. Subsequent reads still reject substantive changes; a further
+        version-only advance uses the ordinary durable comparison path.
         """
         with self.journal.locked():
             self.authority()
@@ -507,7 +592,7 @@ class DesiredRunner:
         return current
 
     def unchanged(self, before, after, *, strict=False, moving=False):
-        for key in ("id", "mimeType", "size", "md5Checksum", "owners", "driveId", "shortcutDetails", "trashed"):
+        for key in ("id", "mimeType", "size", "md5Checksum", "sha1Checksum", "sha256Checksum", "owners", "driveId", "shortcutDetails", "trashed"):
             if key in before and before[key] != after.get(key):
                 raise SafetyError("PROTECTED_METADATA_DRIFT")
         if self.audit_permissions and not moving and before.get("_permissions") != after.get("_permissions"):
@@ -644,9 +729,8 @@ class DesiredRunner:
             self.unchanged(recovery_before, before, moving=core(recovery_before)["parents"] != target["parents"])
             return self.applied(item, recovery_before, before, pending["payload"], rollback_event, recovered=True)
         if pending:
-            if core(before) != core(recovery_before):
-                raise SafetyError("INTERRUPTED_ATTEMPT_STATE_CONFLICT")
-            self.unchanged(recovery_before, before, strict=True)
+            self._check_current(item, recovery_before, before, stage="PENDING_REQUEST",
+                core_error="INTERRUPTED_ATTEMPT_STATE_CONFLICT", direction=direction)
         for attempt in range(1, self.max_attempts + 1):
             if self.stop_requested:
                 return {"source_id": item["source_id"], "state": "NOT_APPLIED", "reason": "PAUSED_BEFORE_DISPATCH"}
@@ -659,9 +743,13 @@ class DesiredRunner:
                 "concurrency": "IF_MATCH_HEADER_UNVERIFIED_LIVE" if before.get("_http_etag") else "FRESH_READ_RACE_REMAINS"}
             self.record("PREPARED", item, direction=direction, attempt=attempt, **payload)
             fresh = self.read(item["source_id"])
-            if core(fresh) != core(before):
-                raise SafetyError("CONCURRENT_NAME_OR_PARENT_CHANGE")
-            self.unchanged(before, fresh, strict=True)
+            self._check_current(item, before, fresh, stage="PRE_DISPATCH",
+                allow_counter_advance=not pending and attempt == 1,
+                direction=direction, attempt=attempt)
+            # ATTEMPTED binds the actual fresh state. PREPARED retains the
+            # earlier read, and any accepted difference has its own evidence.
+            before = fresh
+            payload["before_ref"] = self.journal.evidence(fresh)
             if self.stop_requested:
                 return {"source_id": item["source_id"], "state": "NOT_APPLIED", "reason": "PAUSED_BEFORE_DISPATCH"}
             self.authority()  # Cheap live revocation/expiry check immediately before dispatch.
@@ -686,9 +774,8 @@ class DesiredRunner:
             self.unchanged(before, observed, moving=core(before)["parents"] != target["parents"])
             if core(observed) == target:
                 return self.applied(item, before, observed, payload, rollback_event, recovered=bool(error))
-            if core(observed) != core(before):
-                raise SafetyError("UNAPPROVED_POST_WRITE_STATE")
-            self.unchanged(before, observed, strict=True)
+            self._check_current(item, before, observed, stage="POST_WRITE_NOT_AT_TARGET",
+                core_error="UNAPPROVED_POST_WRITE_STATE", direction=direction, attempt=attempt)
             self.record("OBSERVED", item, direction=direction, attempt=attempt, observed_ref=self.journal.evidence(observed),
                 state="NOT_APPLIED", request_outcome="UNKNOWN" if error else "RETURNED_SUCCESS", **payload)
             transient = self.transient(error)
@@ -700,9 +787,8 @@ class DesiredRunner:
             before = self.read(item["source_id"])
             if core(before) == target:
                 return self.applied(item, recovery_before, before, payload, rollback_event, recovered=True)
-            if core(before) != core(observed):
-                raise SafetyError("STATE_CHANGED_BEFORE_RETRY")
-            self.unchanged(observed, before, strict=True)
+            self._check_current(item, observed, before, stage="BEFORE_RETRY",
+                core_error="STATE_CHANGED_BEFORE_RETRY", direction=direction, attempt=attempt)
         raise AssertionError("unreachable")
 
     def applied(self, item, before, after, payload, rollback_event, *, recovered):

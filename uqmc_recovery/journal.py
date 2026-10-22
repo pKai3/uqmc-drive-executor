@@ -131,6 +131,25 @@ def _new_file(path: Path, data: bytes) -> None:
         raise JournalCorrupt(f"Durable file readback failed: {path}")
 
 
+
+def _new_snapshot_directory(destination: Path) -> None:
+    """Publish a checkpoint directory only after its incomplete marker is durable.
+
+    Callers hold the source lock (and incremental backups hold the pool lock).
+    Abandoned hidden staging directories are not recovery checkpoints.
+    """
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(destination)
+    staged = destination.parent / (".checkpoint-" + str(uuid.uuid4()))
+    staged.mkdir(mode=0o700, parents=False, exist_ok=False)
+    _new_file(staged / ".snapshot-incomplete", b"Incomplete snapshot: do not resume\n")
+    _fsync_dir(staged)
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(destination)
+    os.rename(staged, destination)
+    _fsync_dir(destination.parent)
+
+
 def _validate_record(line: bytes, index: int, previous: str) -> dict[str, Any]:
     """Validate one canonical entry against the already verified chain tip."""
     try:
@@ -462,9 +481,7 @@ class Journal:
                         verify_refs(child)
             for record in records:
                 verify_refs(record["payload"])
-            destination.mkdir(mode=0o700, parents=False, exist_ok=False)
-            _fsync_dir(destination.parent)
-            _new_file(destination / ".snapshot-incomplete", b"Incomplete snapshot: do not resume\n")
+            _new_snapshot_directory(destination)
             (destination / "evidence").mkdir(mode=0o700)
             _fsync_dir(destination)
             _new_file(destination / "events.jsonl", prefix)
@@ -502,8 +519,9 @@ class Journal:
             return manifest
 
     def backup(self, destination: str | Path) -> dict[str, Any]:
-        """Create a verified, consistent local snapshot; never overwrite a backup."""
-        return self._snapshot(destination, recover=False)
+        """Create a consistent checkpoint, reusing verified backup evidence bytes."""
+        from .snapshot_store import incremental_backup
+        return incremental_backup(self, destination)
 
     def recover_to(self, destination: str | Path) -> dict[str, Any]:
         """Salvage only a torn terminal record into a NEW store.
