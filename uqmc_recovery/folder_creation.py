@@ -11,6 +11,19 @@ from .direct_transport import TransportError
 from .model import FOLDER, SafetyError, digest
 
 
+def reject_trailing_whitespace_aliases(children, name, *, context=None):
+    """Do not create/adopt a destination beside a whitespace-only near match.
+
+    This guard resolves nothing and renames nothing. Exact IDs/titles must be
+    reconciled explicitly before execution; a normalized label is not identity.
+    """
+    for child in children:
+        observed = child.get("name")
+        if isinstance(observed, str) and observed != name and observed.rstrip() == name.rstrip():
+            raise SafetyError("DESTINATION_TRAILING_WHITESPACE_CONFLICT:"
+                              + (context or name) + ":" + str(child.get("id", "UNKNOWN")))
+
+
 def _authority(journal, reference, key, name, parent_id):
     authority = journal.read_evidence(reference)
     if (authority.get("schema_version") != "uqmc.folder-create-authority.v1"
@@ -98,7 +111,9 @@ def ensure_required_folder(journal, transport, *, key, name, parent_id, authorit
         else:
             # List only the selected parent. Do not adopt a coincidentally
             # matching name or create another copy beside an existing folder.
-            if any(x.get("name") == name for x in transport.list_children(parent_id)):
+            children = transport.list_children(parent_id)
+            reject_trailing_whitespace_aliases(children, name)
+            if any(x.get("name") == name for x in children):
                 raise SafetyError("REQUIRED_FOLDER_NAME_COLLISION")
             file_id = transport.reserve_folder_id(parent_id)
             journal.append("REQUIRED_FOLDER_ALLOCATED", operation_id, payload={
@@ -124,7 +139,9 @@ def ensure_required_folder(journal, transport, *, key, name, parent_id, authorit
         attempt = sum(e["kind"] == "REQUIRED_FOLDER_ATTEMPTED" for e in history) + 1
         if attempt > max_attempts:
             raise SafetyError("REQUIRED_FOLDER_ATTEMPT_LIMIT")
-        if any(x.get("name") == name and x.get("id") != file_id for x in transport.list_children(parent_id)):
+        children = transport.list_children(parent_id)
+        reject_trailing_whitespace_aliases(children, name)
+        if any(x.get("name") == name and x.get("id") != file_id for x in children):
             raise SafetyError("REQUIRED_FOLDER_NAME_COLLISION")
         current_parent = transport.get_file(parent_id)
         if _parent(current_parent) != parent_core:

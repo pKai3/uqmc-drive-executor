@@ -25,6 +25,7 @@ from .section_prepare import _path, exact_rename
 from .section_execution import collect_metadata, normalize, authorize
 from .destination_planner import plan_destination, build_hybrid_preparation, logical_parent, file_parent_path, select_destination_records as select_records
 from .destination_history import build_history_index, reconcile_item
+from .folder_creation import reject_trailing_whitespace_aliases
 
 
 def utc(): return datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
@@ -277,6 +278,7 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
         parent=layout['destination_paths'].get(spec['parent_path'])
         if parent is None:continue
         folder(parent,parent_context=parent==paths[anchor] and parent not in ids)
+        reject_trailing_whitespace_aliases(listings[parent],spec['folder_name'],context=spec['logical_path'])
         matches=[c for c in listings[parent] if c['name']==spec['folder_name']]
         if len(matches)>1 or any(c['mimeType']!=FOLDER for c in matches):raise SafetyError('AMBIGUOUS_EXISTING_DESTINATION:'+spec['logical_path'])
         if matches:

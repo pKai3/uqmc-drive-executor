@@ -252,3 +252,21 @@ and proposed names, rejecting ambiguous aliases. Completion of a registered
 subsection contributes its verified sealed plan history to parent status. This
 changes display aggregation only and never authorizes a migration. Publication
 failures retain safe reason codes instead of only an exception class.
+
+## Trailing whitespace in destination folders
+
+Folder titles are exact values. Before adopting or creating a destination, the
+runner rejects a sibling whose name differs only by trailing whitespace, including
+an exact-name folder beside a spaced variant. It does not silently merge, rename,
+or resolve those identities. A collision must be resolved explicitly by stable ID.
+
+The internal `folder_cleanup.cleanup_folder` helper performs separately authorized
+trailing-whitespace corrections only. Its sealed authority lists exact folder IDs,
+before names, target names and unchanged parent IDs. Run it under the destination
+command lock and journal lock. It checks live state and sibling collisions, journals
+intent before a name-only update, and verifies readback. Restart reconciles a prior
+attempt; an unresolved unchanged request is never automatically sent again.
+A change after verified success is a conflict. Existing frozen plans stay intact;
+current destination observations may be appended by stable ID after verification.
+Match any sheet corrections to exact destination references, preserving formulas,
+approvals, source filenames and literal slashes. Do not trim arbitrary path cells.
