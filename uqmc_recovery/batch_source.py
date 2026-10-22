@@ -32,6 +32,44 @@ def _age(snapshot):
         raise SafetyError('FRESH_BATCH_CAPTURE_EXPIRED_REFRESH_AGAIN')
 
 
+def _initial_capture_freshness(capture, revalidation=None):
+    """A fresh unchanged revision proves old captured cells remain current.
+
+    Keep the original capture timestamp/hash. The separate read bracket has its
+    own five-minute lifetime, measured from request start, not response arrival.
+    """
+    if revalidation is None:
+        return _age({'captured_at_utc': capture.get('exported_at_utc')})
+    if (not isinstance(revalidation, dict)
+            or revalidation.get('method') != 'drive.files.get_revision'
+            or revalidation.get('capture_sha256') != capture.get('capture_sha256')
+            or revalidation.get('source_revision') != capture.get('source_revision')):
+        raise SafetyError('INITIAL_BATCH_REVISION_REVALIDATION_MISMATCH')
+    try:
+        stamps = [datetime.fromisoformat(value.replace('Z', '+00:00')) for value in (
+            capture['exported_at_utc'], revalidation['started_at_utc'], revalidation['checked_at_utc'])]
+        if any(stamp.tzinfo is None for stamp in stamps) or not stamps[0] <= stamps[1] <= stamps[2]:
+            raise ValueError()
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise SafetyError('INITIAL_BATCH_REVISION_REVALIDATION_TIME_INVALID') from None
+    _age({'captured_at_utc': revalidation['started_at_utc']})
+    _age({'captured_at_utc': revalidation['checked_at_utc']})
+
+
+def revalidate_initial_capture(capture, revision_reader):
+    """Read the current workbook revision; never restamp captured sheet cells."""
+    started = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    revision = revision_reader()
+    checked = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    if revision != capture['source_revision']:
+        raise SafetyError('WORKBOOK_CHANGED_BEFORE_BIND_REFRESH_REQUIRED')
+    proof = {'method': 'drive.files.get_revision',
+        'capture_sha256': capture['capture_sha256'], 'source_revision': revision,
+        'started_at_utc': started, 'checked_at_utc': checked}
+    _initial_capture_freshness(capture, proof)
+    return proof
+
+
 def _snapshot_for_plan(journal, plan, snapshot_ref, *, fresh):
     snapshot = journal.read_evidence(snapshot_ref)
     records = journal.records()
@@ -123,7 +161,7 @@ def bind_batch_source(journal, plan, snapshot_ref):
             'input_sha256':snapshot['input_sha256'],'execution_approved':False})
 
 
-def _initial_source(journal, plan, capture, *, fresh):
+def _initial_source(journal, plan, capture, *, fresh, revalidation=None):
     """Prove this initial imported plan used this exact canonical capture."""
     from .agent_profile import _require_frozen_agent
     from .importer import catalog
@@ -162,18 +200,18 @@ def _initial_source(journal, plan, capture, *, fresh):
             original.get('exported_at_utc') != capture.get('exported_at_utc')):
         raise SafetyError('INITIAL_BATCH_CAPTURE_DIFFERS_FROM_SECTION_IMPORT')
     if fresh:
-        _age({'captured_at_utc': capture.get('exported_at_utc')})
+        _initial_capture_freshness(capture, revalidation)
     return authority
 
 
-def bind_initial_section_source(journal, plan, capture):
+def bind_initial_section_source(journal, plan, capture, *, revision_reader=None):
     """Bind an initial section import to its one fresh capture; never approve it.
 
     The caller imports and registers the exact plan first. A later capture or
     edited plan requires ordinary refresh/reconciliation, not this shortcut.
     """
     with journal.locked():
-        authority = _initial_source(journal, plan, capture, fresh=True)
+        authority = _initial_source(journal, plan, capture, fresh=False)
         records = journal.records()
         if any(e['kind'] in {'INITIAL_BATCH_SOURCE_BOUND', 'BATCH_SOURCE_BOUND'} and
                 e['payload'].get('proposal_hash') == plan.proposal_hash for e in records):
@@ -182,6 +220,10 @@ def bind_initial_section_source(journal, plan, capture):
                 e['payload'].get('plan_sha256', e['payload'].get('proposal_hash')) == plan.proposal_hash
                 for e in records):
             raise SafetyError('INITIAL_BATCH_ALREADY_STARTED')
+        revalidation = None
+        if revision_reader is not None:
+            revalidation = revalidate_initial_capture(capture, revision_reader)
+        _initial_capture_freshness(capture, revalidation)
         capture_ref = journal.evidence(capture)
         return journal.append('INITIAL_BATCH_SOURCE_BOUND', payload={
             'proposal_hash': plan.proposal_hash, 'run_id': plan.run_id,
@@ -190,6 +232,7 @@ def bind_initial_section_source(journal, plan, capture):
             'capture_ref': capture_ref, 'capture_sha256': capture['capture_sha256'],
             'input_sha256': capture['input_sha256'],
             'source_revision': capture['source_revision'],
+            **({'revision_revalidation': revalidation} if revalidation else {}),
             'history_sequence': records[-1]['seq'] if records else 0,
             'history_tip_sha256': records[-1]['hash'] if records else None,
             'execution_approved': False})
@@ -198,7 +241,8 @@ def bind_initial_section_source(journal, plan, capture):
 def _require_initial_source(journal, plan, event):
     payload = event['payload']
     capture = journal.read_evidence(payload['capture_ref'])
-    authority = _initial_source(journal, plan, capture, fresh=True)
+    authority = _initial_source(journal, plan, capture, fresh=True,
+                                revalidation=payload.get('revision_revalidation'))
     if (payload.get('run_id') != plan.run_id or payload.get('batch_id') != plan.batch_id or
             payload.get('section_id') != authority['section_id'] or
             payload.get('section_manifest_ref') != authority['section_manifest_ref'] or

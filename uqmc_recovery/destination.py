@@ -430,13 +430,16 @@ def prepare_rename_evidence(journal, layout, metadata, evidence_ref, report):
     return native,corrections
 
 
-def freeze(config, section, journal, state, factory, run_dir, report):
+def freeze(config, section, journal, state, factory, run_dir, report, *, revision_reader=None):
     from .folder_creation import prepare_required_folders
     from .section_importer import import_section
     from .agent_profile import register_agent_plan
     from .batch_source import bind_initial_section_source
-    from .batch_source import _age
-    _age({'captured_at_utc':state['capture']['exported_at_utc']})
+    from .batch_source import _age, revalidate_initial_capture
+    if revision_reader is None:
+        _age({'captured_at_utc':state['capture']['exported_at_utc']})
+    else:
+        revalidate_initial_capture(state['capture'],revision_reader)
     sid=section_key(section);approval_id=sid+'-'+uuid.uuid4().hex;stamp=utc()
     instruction_ref=journal.evidence({'kind':'TRUSTED_USER_INSTRUCTION','text':section,
         'provenance':'Operator invoked destination CLI with --apply for this exact destination subtree.',
@@ -490,7 +493,8 @@ def freeze(config, section, journal, state, factory, run_dir, report):
             expected_workbook_id=config['workbook_id'],batch_id=sid+'-'+uuid.uuid4().hex[:12],metadata_by_id=metadata,resolutions=prepared['resolutions'],
             expected_method_profile='destination_hybrid',metadata_profile='AGENT_ASSISTED')
         if result.plan is None:import_blocked(result.manifest,report)
-        plan=result.plan;register_agent_plan(journal,plan);bind_initial_section_source(journal,plan,state['capture'])
+        plan=result.plan;register_agent_plan(journal,plan)
+        bind_initial_section_source(journal,plan,state['capture'],revision_reader=revision_reader)
         # Preserve original proposal/history; the new plan and mutation intent use
         # the observed preimage so explicit rollback restores the actual starting name.
         rename_records={r['source_id']:r for r in layout['records'] if r['action']=='RENAME'}
@@ -619,14 +623,16 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
             with journal.locked():
                 with timed_stage(report,'Backup before plan preparation'):
                     journal.backup(Path(config['backup_directory'])/('before-destination-'+uuid.uuid4().hex))
-            if capture_client._revision()!=capture['source_revision']:raise SafetyError('WORKBOOK_CHANGED_BEFORE_FREEZE_REFRESH_REQUIRED')
+            if revision_manifest and capture_client._revision()!=capture['source_revision']:
+                raise SafetyError('WORKBOOK_CHANGED_BEFORE_FREEZE_REFRESH_REQUIRED')
             # Folder workers retain the process lock via shared_locked(); their
             # network requests must not run under the controller's journal gate.
             with timed_stage(report,'Freeze plan and validate authority'):
                 if revision_manifest:
                     from .destination_revision import freeze_revision
                     prepared=freeze_revision(config,section,journal,state,factory,run_dir,report)
-                else:prepared=freeze(config,section,journal,state,factory,run_dir,report)
+                else:prepared=freeze(config,section,journal,state,factory,run_dir,report,
+                                     revision_reader=capture_client._revision)
             registry.setdefault('runs',[]).append(prepared);atomic_json(registry_path,registry)
         else:run_dir=Path(prepared['plan_path']).parent
         if not apply:return {'section':section,'preview_only':True,'saved_run_id':prepared['run_id'],'selected_identities':len(prepared['selected_source_ids'])}

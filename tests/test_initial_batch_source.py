@@ -91,6 +91,77 @@ class InitialBatchSourceTests(unittest.TestCase):
             with self.assertRaisesRegex(SafetyError, 'EXPIRED_REFRESH_AGAIN'):
                 require_batch_source(self.journal, self.plan)
 
+    def test_long_preflight_revalidates_revision_without_restamping_capture(self):
+        original = copy.deepcopy(self.capture)
+        later = datetime.now(timezone.utc) + timedelta(minutes=6)
+        with patch('uqmc_recovery.batch_source.datetime', wraps=datetime) as clock:
+            clock.now.return_value = later
+            event = bind_initial_section_source(self.journal, self.plan, self.capture,
+                revision_reader=lambda: copy.deepcopy(original['source_revision']))
+            require_batch_source(self.journal, self.plan)
+        self.assertEqual(self.capture, original)
+        self.assertEqual(self.journal.read_evidence(event['payload']['capture_ref']), original)
+        proof = event['payload']['revision_revalidation']
+        self.assertEqual(proof['capture_sha256'], original['capture_sha256'])
+        self.assertEqual(proof['source_revision'], original['source_revision'])
+        self.assertEqual(proof['started_at_utc'], later.isoformat().replace('+00:00', 'Z'))
+
+    def test_old_capture_without_revalidation_still_blocks_binding(self):
+        with patch('uqmc_recovery.batch_source.datetime', wraps=datetime) as clock:
+            clock.now.return_value = datetime.now(timezone.utc) + timedelta(minutes=6)
+            with self.assertRaisesRegex(SafetyError, 'EXPIRED_REFRESH_AGAIN'):
+                bind_initial_section_source(self.journal, self.plan, self.capture)
+        self.assertFalse(any(e['kind'] == 'INITIAL_BATCH_SOURCE_BOUND' for e in self.journal.records()))
+
+    def test_changed_revision_and_unavailable_read_cannot_bind(self):
+        for field, value in [('version', '13'), ('modifiedTime', '2026-10-22T00:00:00Z'),
+                             ('id', 'different-workbook'), ('trashed', True)]:
+            revision = self.capture['source_revision'] | {field: value}
+            with self.subTest(field=field), self.assertRaisesRegex(
+                    SafetyError, 'WORKBOOK_CHANGED_BEFORE_BIND_REFRESH_REQUIRED'):
+                bind_initial_section_source(self.journal, self.plan, self.capture,
+                    revision_reader=lambda: revision)
+        def unavailable():
+            raise TimeoutError('fixture read timeout')
+        with self.assertRaisesRegex(TimeoutError, 'fixture read timeout'):
+            bind_initial_section_source(self.journal, self.plan, self.capture,
+                revision_reader=unavailable)
+        self.assertFalse(any(e['kind'] == 'INITIAL_BATCH_SOURCE_BOUND' for e in self.journal.records()))
+
+    def test_revalidation_expiry_and_authority_revocation_remain_enforced(self):
+        later = datetime.now(timezone.utc) + timedelta(minutes=6)
+        with patch('uqmc_recovery.batch_source.datetime', wraps=datetime) as clock:
+            clock.now.return_value = later
+            bind_initial_section_source(self.journal, self.plan, self.capture,
+                revision_reader=lambda: self.capture['source_revision'])
+            clock.now.return_value = later + timedelta(seconds=301)
+            with self.assertRaisesRegex(SafetyError, 'EXPIRED_REFRESH_AGAIN'):
+                require_batch_source(self.journal, self.plan)
+            clock.now.return_value = later
+            self.journal.append('SECTION_APPROVAL_REVOKED', payload={'approval_id': self.approval_id})
+            with self.assertRaisesRegex(SafetyError, 'REVOKED_OR_SUPERSEDED'):
+                require_batch_source(self.journal, self.plan)
+
+    def test_slow_revision_request_does_not_make_old_read_fresh(self):
+        later = datetime.now(timezone.utc) + timedelta(minutes=6)
+        with patch('uqmc_recovery.batch_source.datetime', wraps=datetime) as clock:
+            clock.now.return_value = later
+            def slow_read():
+                clock.now.return_value = later + timedelta(seconds=301)
+                return self.capture['source_revision']
+            with self.assertRaisesRegex(SafetyError, 'EXPIRED_REFRESH_AGAIN'):
+                bind_initial_section_source(self.journal, self.plan, self.capture,
+                    revision_reader=slow_read)
+        self.assertFalse(any(e['kind'] == 'INITIAL_BATCH_SOURCE_BOUND' for e in self.journal.records()))
+
+    def test_revalidation_does_not_allow_changed_capture(self):
+        capture = copy.deepcopy(self.capture)
+        set_cell(capture, 'Move Manifest', 1, 'Exact target path', 'Unapproved/Elsewhere')
+        self.seal_capture(capture)
+        with self.assertRaisesRegex(SafetyError, 'WORKBOOK_DIFFERS_FROM_SECTION_IMPORT'):
+            bind_initial_section_source(self.journal, self.plan, capture,
+                revision_reader=lambda: capture['source_revision'])
+
     def test_late_revocation_blocks_dispatch(self):
         bind_initial_section_source(self.journal, self.plan, self.capture)
         self.journal.append('SECTION_APPROVAL_REVOKED', payload={'approval_id': self.approval_id})
@@ -134,6 +205,47 @@ class InitialBatchSourceTests(unittest.TestCase):
         bind_initial_section_source(self.journal, self.plan, self.capture)
         with self.assertRaisesRegex(SafetyError, 'BATCH_SOURCE_ALREADY_BOUND'):
             bind_initial_section_source(self.journal, self.plan, self.capture)
+
+
+class LongPreflightCommandTests(unittest.TestCase):
+    def test_destination_command_rechecks_revision_after_long_freeze(self):
+        from test_destination_command import DestinationCommandTests
+        from uqmc_recovery.journal import Journal
+        fixture = DestinationCommandTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        later = datetime.now(timezone.utc) + timedelta(minutes=6)
+        with patch('uqmc_recovery.batch_source.datetime', wraps=datetime) as clock:
+            clock.now.return_value = later
+            result = fixture.run_command(apply=True)
+        self.assertEqual(result['counts'], {'APPLIED': 2})
+        self.assertEqual(fixture.capture.calls, 1)
+        self.assertEqual(len(fixture.server.requests), 2)
+        event = next(e for e in Journal(fixture.config['store']).records()
+                     if e['kind'] == 'INITIAL_BATCH_SOURCE_BOUND')
+        proof = event['payload']['revision_revalidation']
+        self.assertEqual(proof['source_revision'], fixture.capture._revision())
+        self.assertEqual(proof['started_at_utc'], later.isoformat().replace('+00:00', 'Z'))
+
+    def test_revision_change_stops_before_preparation_or_binding(self):
+        from test_destination_command import DestinationCommandTests
+        for changed_on in (2, 3):
+            with self.subTest(changed_on=changed_on):
+                fixture = DestinationCommandTests()
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                original_read = fixture.capture._revision
+                reads = []
+                def revision():
+                    reads.append(True)
+                    value = original_read()
+                    return value | {'version': '2'} if len(reads) >= changed_on else value
+                fixture.capture._revision = revision
+                with self.assertRaisesRegex(SafetyError, 'WORKBOOK_CHANGED_BEFORE_BIND_REFRESH_REQUIRED'):
+                    fixture.run_command(apply=True)
+                self.assertEqual(fixture.server.requests, [])
+                self.assertEqual(fixture.server.created, [])
+                self.assertEqual(fixture.capture.calls, 1)
 
 
 if __name__ == '__main__':

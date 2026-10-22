@@ -174,6 +174,12 @@ capability checks remain active.
 A new batch fetches the canonical spreadsheet once for planning, records its revision, capture
 time and hash, and freezes the exact selected section. It does not read a full
 sheet for each file or change the frozen plan in response to editable cells.
+After preflight, the command reads the workbook revision before preparation and
+again before binding the initial batch. An exact revision match validates the
+original captured cells even when preparation took more than five minutes; it
+does not change the capture time, hash, or imported approval. The separate
+revision-check evidence expires five minutes after that request starts. A
+changed revision or failed read stops binding and requires a fresh batch.
 A lightweight remote revision guard checks at most once per configured interval
 (default 30 seconds) during progress and stops new dispatch when it detects a
 changed or unavailable revision. Edits can occur between these periodic checks;
