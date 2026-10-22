@@ -560,6 +560,8 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
     if capture_client is None:capture_client=GoogleSheetsCapture.from_authorized_user_file(config['token'],workbook_id=config['workbook_id'],timeout=15)
     with command_lock(config['run_directory']):
         journal=Journal(config['store']);registry_path=Path(config['registry']);registry=json.loads(registry_path.read_text()) if registry_path.exists() else {'sections':[],'runs':[]}
+        from .revision_cleanup import filter_registry,after_success,retired_parent_ids,reconcile_restored
+        registry=filter_registry(journal,registry)
         account=factory(set(config['anchor_paths'].values()),set(),set(config.get('excluded_ids',[])),False).get_account()
         if account['emailAddress'].casefold()!=config['expected_account'].casefold():raise SafetyError('AUTHENTICATED_ACCOUNT_MISMATCH')
         report({'stage':'account_verified','account':account['emailAddress']})
@@ -640,6 +642,12 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
         if not apply:return {'section':section,'preview_only':True,'saved_run_id':prepared['run_id'],'selected_identities':len(prepared['selected_source_ids'])}
         plan=plan_from_json(json.loads(Path(prepared['plan_path']).read_text()))
         if plan.proposal_hash!=prepared['plan_sha256']:raise SafetyError('SAVED_PLAN_HASH_MISMATCH')
+        if rollback:
+            required={p for op in plan.operations for p in op.before['parents']}&retired_parent_ids(journal)
+            reconcile_restored(journal,factory,required)
+            required &= retired_parent_ids(journal)
+            if required:raise SafetyError('ROLLBACK_REQUIRES_RESTORE_TRASHED_PARENTS:'+','.join(sorted(required)))
+
         # Re-authorize only the exact stored plan after fresh resume mapping check.
         if resume or rollback:
             with journal.locked():
@@ -671,7 +679,6 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
         finished={'section':section,'run_id':plan.run_id,'counts':result['counts'],'journal_sequence':tip['seq'],
             'backup':str(backup),'result_path':result_path,'exports':exports,'elapsed_seconds':round(time.monotonic()-started,3),
             'revision_stop_reason':guard.reason,'warnings':prepared.get('warnings',[])}
-        report({'stage':'execution_finished',**finished})
         # Registry updates are private; failed publication never restarts actions.
         entry=next((x for x in registry['sections'] if x.get('proposal_path',x.get('publication_spec',{}).get('proposal_path'))==section),None)
         if entry is None:entry={};registry['sections'].append(entry)
@@ -685,6 +692,26 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
             'destination_ids':[v for k,v in paths.items() if k==section or k.startswith(section+'/')],
             'destination_paths':{v:k for k,v in paths.items() if k==section or k.startswith(section+'/')},'retained_source_folder_ids':prepared['source_container_ids'],'source_folder_ids_left_in_place':prepared['source_container_ids']})
         entry.clear();entry.update(publication_spec=spec,destination_paths=paths);atomic_json(registry_path,registry)
+        # Only this successfully completed batch can retire its empty old parents.
+        # Cleanup failures are separate from the already verified migration.
+        cleanup_sequence=tip['seq']
+        try:
+            with timed_stage(report,'Clean up empty obsolete parents'):
+                finished['cleanup']=after_success(journal,prepared,registry,capture,factory,result=result,
+                    rollback=bool(rollback),guard_reason=guard.reason,current_revision=capture_client._revision,
+                    protected_ids=set(config['anchor_paths'].values())|set(config.get('excluded_ids',[])))
+        except Exception as exc:
+            finished['cleanup']={'state':'PENDING','error':str(exc),'counts':{}}
+        with journal.locked():
+            tip=journal.records()[-1]
+            if tip['seq']!=cleanup_sequence:
+                backup=Path(config['backup_directory'])/('after-empty-parent-cleanup-'+uuid.uuid4().hex)
+                journal.backup(backup)
+                finished.update(backup=str(backup),journal_sequence=tip['seq'])
+            registry=filter_registry(journal,registry);atomic_json(registry_path,registry)
+            atomic_json(run_dir/('cleanup-'+uuid.uuid4().hex+'.json'),finished['cleanup'])
+        finished['elapsed_seconds']=round(time.monotonic()-started,3)
+        report({'stage':'execution_finished',**finished})
         finished['publication']=publish_current()
         return finished
 

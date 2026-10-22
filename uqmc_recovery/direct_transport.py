@@ -428,6 +428,31 @@ class GoogleDriveTransport:
             raise TransportError("DRIVE_WRITE_RESPONSE_UNPROVEN", outcome="UNKNOWN")
         return copy.deepcopy(result)
 
+    def get_trash_candidate(self, file_id):
+        """Read only the exact identity and trash capability needed for cleanup."""
+        file_id = self._guard(file_id)
+        return self._read(lambda: self.service.files().get(fileId=file_id,
+            fields="id,name,mimeType,parents,trashed,version,capabilities(canTrash)",
+            supportsAllDrives=True), request="files.get", item_id=file_id)
+
+    def trash_file(self, file_id):
+        """One explicitly scoped recoverable trash request; never permanent delete."""
+        if not self.apply_enabled:
+            raise TransportError("READ_ONLY_TRANSPORT")
+        file_id = self._guard(file_id)
+        if file_id not in self.mutation_ids:
+            raise TransportError("OUTSIDE_APPROVED_MUTATION_IDS")
+        self._ready(item_id=file_id)
+        try:
+            result = self.service.files().update(fileId=file_id, body={"trashed": True},
+                fields="id,name,mimeType,parents,trashed,version", supportsAllDrives=True).execute(num_retries=0)
+        except Exception as error:
+            raise _failure(error, dispatched=True, request="files.update", item_id=file_id,
+                           secret_values=self._secret_values) from None
+        if not isinstance(result, dict) or result.get("id") != file_id:
+            raise TransportError("DRIVE_WRITE_RESPONSE_UNPROVEN", outcome="UNKNOWN")
+        return copy.deepcopy(result)
+
     def update_file(self, args):
         """Legacy bridge entry point: one effect per call, kept compatible."""
         return self._update(args, combined=False)

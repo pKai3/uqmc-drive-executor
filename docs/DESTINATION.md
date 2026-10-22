@@ -458,3 +458,42 @@ delete newly created parents, or automatically run on failure. Preview and
 execution use existing credentials, timeout, bounded worker pool, journaling and
 publication recovery. Offline fixture tests prove the workflow; a new revision
 is not live-tested until the operator runs it.
+
+
+## Automatic empty-parent cleanup
+
+After a successful apply/resume, the destination command checks only old direct
+parents emptied by that exact sealed run. It processes nested candidates from
+children upward; it does not crawl for unrelated empty folders. Roots, exclusions,
+fresh planned destinations, active source assignments and other registered
+sections are protected. An explicitly retired/deleted proposal remains audit
+history and does not reserve its obsolete destination forever. Cleanup is skipped
+if execution stopped/failed, rollback ran, or the workbook revision changed.
+
+Each candidate needs its captured ID/name/parents/MIME to match a fresh read,
+`canTrash=true`, and a complete empty immediate-child listing. Cleanup records
+intent before one `files.update` containing only `trashed: true`, then verifies
+readback. It never permanently deletes, changes sharing, or blindly retries an
+unresolved write. Remote edits can still race between listing and update because
+Drive provides no atomic "trash only if empty" operation; avoid concurrent manual
+changes during the run. Cleanup results are separate from migration results and
+are backed up before publication. Original events and rollback preimages remain.
+
+For a specific completed revision, preview/reconcile only its candidates with:
+
+```sh
+.venv/bin/python -m uqmc_recovery.revision_cleanup --run-id REVISION_RUN_ID
+```
+
+Add `--apply` only to perform that explicitly selected cleanup. This command is
+also the recovery path for a cleanup interruption; it reads the exact IDs first.
+It does not repeat an unresolved unchanged request. A failed capability or unknown
+identity leaves the folder untouched.
+
+Rollback does not automatically restore parents from Trash. If it reports
+`ROLLBACK_REQUIRES_RESTORE_TRASHED_PARENTS`, restore those exact IDs in Drive first,
+then repeat the rollback command. A fresh exact metadata read records the restore
+without erasing retirement history. Restored parents are not trashed again by the
+same cleanup run. A changed name/parent or unavailable identity stays blocked.
+Google normally permanently deletes items after 30 days in Trash, so recoverable
+trashing is not an indefinite backup. Retain the private journal/evidence backups.
