@@ -211,7 +211,72 @@ by source ID; event IDs deduplicate log delivery. The spreadsheet and original D
 receive the same snapshot identity. The viewer receives only the redacted
 projection, never private evidence, tokens, raw errors or permission snapshots.
 Publication fetches a fresh proposal snapshot again so later human edits are preserved.
-No server deployment is performed.
+Server sync is disabled unless the optional project configuration below enables it.
+
+## Optional mounted-share server sync
+
+The default is off. To use the existing mounted share, set only these optional
+keys in the ignored project configuration; the destination must already exist:
+
+```json
+"server_sync": {
+  "enabled": true,
+  "destination_directory": "/absolute/path/to/existing/mounted/share"
+}
+```
+
+The publication command builds and validates `viewer.html` once in its private
+publication directory. It attempts spreadsheet delivery independently, then syncs
+that exact local artifact to the share's fixed `index.html`, verifies its SHA-256,
+and only then uploads the same bytes to the original Drive HTML file. It never
+uses Drive Desktop as the server source. No new credentials, SSH integration or
+mount creation are involved. The existing standalone shell script remains usable.
+
+The transfer uses `rsync -c --progress -- SOURCE DEST/index.html` as an argument
+array, without a shell. Default rsync temporary-file/rename behavior is retained;
+there is no `--inplace`. The local rsync subprocess has a 60-second timeout,
+separate from Google's 15-second socket timeout. The wrapper kills and waits for
+rsync on timeout, then checks the destination hash. Filesystem access to an
+unresponsive mounted share can still block at the OS level; the subprocess limit
+is not a deadline for every filesystem operation or the whole publication.
+
+A missing share, invalid/empty/unsealed HTML, symlink target or destination,
+changed server preimage or newer verified publication blocks replacement. The
+program creates no destination directory. One project lock serializes transfers.
+A small private target-wide index records intent before transfer and verification
+after readback. It prevents an older unsent publication from overwriting a newer
+delivery, including a crash after copying but before its success receipt. Receipt state stays in `server-sync.json`
+alongside the local publication, with a separate stage in `publication.json`;
+private receipts are never copied to the share. A normal remount with the same
+canonical path and verified target hash can reconcile without another copy.
+There remains a filesystem race with external writers after the last precheck;
+the program does not provide a remote lock or exactly-once guarantee.
+
+Server failure leaves new Drive HTML delivery `WAITING_FOR_SERVER`; spreadsheet
+success and migration results remain recorded. A previously verified Drive copy
+is not downgraded or reuploaded merely because server sync was enabled later.
+The final console reports spreadsheet, server and Drive states separately.
+The aggregate publication is verified only when every enabled stage is verified.
+
+Check or retry **only the server**, without Google calls or a migration:
+
+```sh
+.venv/bin/python -m uqmc_recovery.server_sync --publication private/destination-publications/DELIVERY_DIRECTORY --check
+.venv/bin/python -m uqmc_recovery.server_sync --publication private/destination-publications/DELIVERY_DIRECTORY --apply
+```
+
+`--check` validates local evidence and reads the destination hash without upload
+or receipt changes. `--apply` is explicit server-write authority. Both commands
+use the existing private configuration by default; `--config PATH` selects it
+explicitly. After server recovery, the earlier destination `--publish-only` command
+reconciles the server checksum and finishes Drive delivery without replaying a
+migration or a verified transfer.
+
+If interruption left an `ATTEMPTED`/`UNCERTAIN` transfer and the target still matches
+its recorded preimage, first confirm the old rsync process has stopped. Only then
+use the server-only `--apply --confirm-transfer-stopped` option. It still rejects
+changed target contents. A target already matching the source is verified without
+retransfer. Do not delete receipts to bypass a conflict or stale-publication guard.
 
 ## Practical limits and verification
 

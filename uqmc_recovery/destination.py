@@ -441,7 +441,8 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
         if publish_only:
             if not apply:raise SafetyError('PUBLICATION_RETRY_REQUIRES_APPLY')
             drive=GooglePublicationDrive(factory({config['viewer_file_id']},{config['viewer_file_id']},set(),True),config['viewer_file_id'],apply=True)
-            return resume_publication(publish_only,sheet_capture=capture_client,drive=drive,apply=True)
+            return resume_publication(publish_only,sheet_capture=capture_client,drive=drive,apply=True,
+                                      server_sync=config.get('server_sync'))
         capture=capture_client.capture();source=catalog(capture,expected_workbook_id=config['workbook_id'],include_subtree_coverage=True,subtree_section_path=section)
         if not apply:atomic_json(Path(config['run_directory'])/(section_key(section)+'-preview-workbook.json'),capture)
         if verify_completed is not None:

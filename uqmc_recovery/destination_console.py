@@ -124,7 +124,7 @@ class ConsoleReporter:
                 self.line("Scheduling stopped: " + concise(value.get("reason", "unknown reason")))
             elif stage == "execution_finished":
                 self.line(f"Execution saved: {counts_text(value.get('counts'))}; checkpoint {value.get('journal_sequence', '?')}.")
-                self.line("Publishing verified status to spreadsheet and Drive HTML…")
+                self.line("Publishing verified status and viewer (local HTML → configured server → Drive)…")
             elif stage:
                 self.line(concise(str(stage).replace("_", " ").capitalize()) + ".")
 
@@ -160,7 +160,7 @@ class ConsoleReporter:
                 if error == "SECTION_IDENTITIES_NOT_PUBLIC_ALLOWLISTED":
                     self.line("Publication stopped: section membership conflicts with the public display allowlist. Saved migration results are unchanged.")
                 if isinstance(publication, dict):
-                    for key, label in (("sheet", "Spreadsheet"), ("html", "Drive HTML")):
+                    for key, label in (("sheet", "Spreadsheet"), ("server_sync", "Server sync"), ("html", "Drive HTML")):
                         stage = publication.get(key)
                         if not isinstance(stage, dict):
                             continue

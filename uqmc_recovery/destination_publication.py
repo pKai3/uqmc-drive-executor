@@ -243,7 +243,7 @@ def _sheet_readback_saved(capture, stage):
     return seal({n: [pad(r, w) for r in current['matrices'][n]] for n, w in BASE_WIDTHS.items()}) == plan['preserved_digest']
 
 
-def resume_publication(directory, *, sheet_capture, drive, apply=False):
+def resume_publication(directory, *, sheet_capture, drive, apply=False, server_sync=None):
     """Retry only saved publication. Both stages reconcile before any dispatch.
 
     Sheet conflicts/errors do not prevent an independent HTML attempt. Receipts
@@ -265,7 +265,25 @@ def resume_publication(directory, *, sheet_capture, drive, apply=False):
             return {'result': 'PREVIEW', 'snapshot_id': receipt['snapshot_id'],
                     'directory': str(directory), 'html_path': str(directory / 'viewer.html'),
                     'journal_sequence': receipt['journal_sequence']}
-        for kind in ('sheet', 'html'):
+        server_result = {'state': 'DISABLED'}
+        for kind in ('sheet', 'server', 'html'):
+            if kind == 'server':
+                # The same frozen local bytes go to the mounted share first.
+                # Sheets remain independent; enabled server verification gates
+                # a new Drive upload of these same bytes.
+                from .server_sync import sync_publication
+                server_result = sync_publication(directory, server_sync, apply=True)
+                receipt['server_sync'] = server_result
+                _save(path, receipt)
+                continue
+            if (kind == 'html' and server_sync and server_sync.get('enabled') is True
+                    and server_result['state'] != 'VERIFIED'):
+                # Preserve prior verified/uncertain Drive outcomes honestly.
+                # A later publication-only retry can resume after server recovery.
+                if receipt['html']['state'] not in {'VERIFIED', 'ATTEMPTED', 'UNCERTAIN'}:
+                    receipt['html'] = {'state': 'WAITING_FOR_SERVER', 'reason': 'SERVER_NOT_VERIFIED'}
+                    _save(path, receipt)
+                continue
             try:
                 if kind == 'sheet':
                     stage = directory / 'sheet'
@@ -315,9 +333,10 @@ def resume_publication(directory, *, sheet_capture, drive, apply=False):
                 receipt[kind] = {'state': 'UNCERTAIN' if receipt[kind]['state'] == 'ATTEMPTED' else 'BLOCKED',
                                  **_error(exc)}
             _save(path, receipt)
-        return {'result': 'PUBLICATION_VERIFIED' if all(receipt[x]['state'] == 'VERIFIED' for x in ('sheet', 'html')) else 'PUBLICATION_INCOMPLETE',
+        return {'result': 'PUBLICATION_VERIFIED' if (all(receipt[x]['state'] == 'VERIFIED' for x in ('sheet', 'html'))
+                and (not server_sync or server_sync.get('enabled') is not True or server_result['state'] == 'VERIFIED')) else 'PUBLICATION_INCOMPLETE',
             'snapshot_id': receipt['snapshot_id'], 'journal_sequence': receipt['journal_sequence'],
-            'sheet': receipt['sheet'], 'html': receipt['html'], 'directory': str(directory),
+            'sheet': receipt['sheet'], 'html': receipt['html'], 'server_sync': server_result, 'directory': str(directory),
             'html_path': str(directory / 'viewer.html'),
             'viewer_url': 'https://drive.google.com/file/d/' + receipt['viewer_file_id'] + '/view'}
 
@@ -326,7 +345,8 @@ def publish_registered_sections(config, registry, *, journal, fresh_workbook,
                                 sheet_capture, drive, apply=False):
     directory = freeze_publication(config, registry, journal=journal,
         fresh_workbook=fresh_workbook, drive=drive)
-    return resume_publication(directory, sheet_capture=sheet_capture, drive=drive, apply=apply)
+    return resume_publication(directory, sheet_capture=sheet_capture, drive=drive, apply=apply,
+                              server_sync=config.get('server_sync'))
 
 
 class GooglePublicationDrive:
