@@ -163,15 +163,26 @@ def _catalog_rows(export, tab, tombstones, quarantined):
     return active
 
 
+def subtree_coverage_scope(scope):
+    """Recognize supported inventory expansion scopes without inferring wording."""
+    scope = _text(scope).strip().lower()
+    if scope.startswith('whole subtree'):
+        return 'whole_subtree'
+    if scope == 'exact source-id subtree partition; exclude separately scoped descendants':
+        return 'exact_partition'
+    return None
+
+
 def _subtree_coverage_records(records, coverage, section_path=None):
-    """Bind unlisted Keep-name identities to an explicit whole-subtree row.
+    """Bind unlisted Keep-name identities to an explicit source-ID subtree row.
 
     Coverage is an inventory, not independent approval. A unique enclosing
-    manifest row supplies move authority. Explicit item routes always win.
+    manifest row supplies move authority. Partition coverage must also name
+    that exact manifest item. Explicit item routes always win.
     """
     explicit_ids = {r['source_id'] for r in records.values()}
-    roots = [r for r in records.values() if r['action'] == 'MOVE'
-             and _text(r['row'].get('Scope')).strip().lower().startswith('whole subtree')]
+    roots = [r for r in records.values() if r['action'] == 'MOVE' and r['source_id']
+             and subtree_coverage_scope(r['row'].get('Scope'))]
     additions = {}
     for row in coverage:
         sid = _text(row.get('Source ID')).strip()
@@ -182,7 +193,9 @@ def _subtree_coverage_records(records, coverage, section_path=None):
         if section_path and not target.startswith(section_path + '/'):
             continue
         matches = [r for r in roots if r['row']['Proposal ID'] == pid
-                   and target.startswith(_text(r['row'].get('Exact target path')) + '/')]
+                   and target.startswith(_text(r['row'].get('Exact target path')) + '/')
+                   and (subtree_coverage_scope(r['row'].get('Scope')) != 'exact_partition'
+                        or _text(row.get('Manifest item / root reference')).strip() == r['row']['Manifest item'])]
         if not matches:
             continue
         longest = max(len(r['row']['Exact target path']) for r in matches)

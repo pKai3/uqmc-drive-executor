@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import copy
 from .agent_profile import agent_snapshot
-from .importer import destination_route_record
+from .importer import destination_route_record, subtree_coverage_scope
 from .model import FOLDER, NATIVE, SafetyError, digest
 from .section_prepare import (_inside, _path, _record_path as nested_record_path, _order_groups,
                               exact_rename, select_records as nested_select_records)
@@ -412,7 +412,7 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
         for sid, actions in groups.items():
             move = actions.get('MOVE')
             if (states[sid]['mime_type'] == FOLDER and move
-                    and str(move['row'].get('Scope', '')).lower().startswith('whole subtree')):
+                    and subtree_coverage_scope(move['row'].get('Scope'))):
                 unknown = {m['id'] for m in states[sid].get('subtree', {}).get('members', [])} - known
                 if unknown:conflicts.append(sid + ':' + ','.join(sorted(unknown)))
         # Surface every available conflict in this capture instead of another
