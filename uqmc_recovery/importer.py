@@ -281,7 +281,11 @@ def catalog(export, *, expected_workbook_id=WORKBOOK_ID, include_subtree_coverag
     if include_subtree_coverage:
         result.update(_subtree_coverage_records(result, rows_by_tab["Rename Coverage"], subtree_section_path))
     return {**({'subtree_coverage_version': 1,
-                'coverage_source_ids': sorted({_text(r.get('Source ID')).strip() for r in rows_by_tab['Rename Coverage'] if _text(r.get('Source ID')).strip()})} if include_subtree_coverage else {}),
+                'coverage_source_ids': sorted({_text(r.get('Source ID')).strip() for r in rows_by_tab['Rename Coverage'] if _text(r.get('Source ID')).strip()}),
+                # Preserve exact same-ID inventory evidence for logical folder aliases.
+                # This does not alter proposal rows, row hashes, or move authority.
+                'folder_rename_coverage': [copy.deepcopy(r) for r in rows_by_tab['Rename Coverage']
+                    if r.get('Verified MIME type') == FOLDER and _text(r.get('Rename proposal')).strip()]} if include_subtree_coverage else {}),
             "input_sha256": input_hash, "records": result, "excluded_ids": sorted(excluded | set(retired_records)),
             "private_excluded_ids": sorted(excluded), "retired_ids": sorted(retired_records), "retired_records": retired_records,
             "excluded_refs": sorted(excluded_refs), "redacted_tombstones": tombstones,

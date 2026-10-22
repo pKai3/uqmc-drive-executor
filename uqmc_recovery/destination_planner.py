@@ -28,7 +28,7 @@ def _record_path(record):
     return nested_record_path(record)
 
 
-def file_parent_path(move, rename, state):
+def file_parent_path(move, rename, state, *, canonical_path=lambda path: path):
     """Resolve a file route without mistaking literal title slashes for folders.
 
     Exact manifest/current-name labels describe the suffix used by the sheet.
@@ -38,15 +38,15 @@ def file_parent_path(move, rename, state):
     """
     sid = state['id']
     if move is None:
-        return _record_path(rename)
+        return canonical_path(_record_path(rename))
     # This field contains both a logical route and an opaque exact title. Do
     # not parse title slashes (including // or a final /) as folder separators.
     path = move['row'].get('Exact target path')
     if not isinstance(path, str) or not path:
         raise SafetyError('EXACT_LOGICAL_PATH_REQUIRED')
     if move.get('whole_subtree_origin_reference'):
-        return _path(move['coverage_target_parent_path'])
-    expected = _record_path(rename) if rename else None
+        return canonical_path(_path(move['coverage_target_parent_path']))
+    expected = canonical_path(_record_path(rename)) if rename else None
     def strip_title(title):
         if not isinstance(title, str) or not title or not path.endswith('/' + title):
             return None
@@ -79,6 +79,7 @@ def file_parent_path(move, rename, state):
         if not candidates:
             raise SafetyError('FILE_TITLE_PATH_EVIDENCE_REQUIRED:' + sid)
         parent = candidates.pop()
+    parent = canonical_path(parent)
     if rename and parent != expected:
         raise SafetyError('FILE_MOVE_RENAME_DESTINATION_DISAGREEMENT:' + sid)
     return parent
@@ -138,17 +139,90 @@ def _blocked_ids(source):
     return blocked
 
 
-def _folder_route(actions, state, required):
+def _canonical_folder_path(path, aliases):
+    """Replace only proved whole-component folder aliases, including descendants."""
+    seen = set()
+    while path not in seen:
+        seen.add(path)
+        matches = [alias for alias in aliases if _inside(path, alias)]
+        if not matches:
+            return path
+        alias = max(matches, key=len)
+        path = aliases[alias] + path[len(alias):]
+    raise SafetyError('FOLDER_RENAME_ALIAS_CYCLE')
+
+
+def _folder_aliases(source, groups, states, section):
+    """Prove old/new labels equivalent using one exact same-ID coverage row.
+
+    Coverage supplies the canonical historical collection key, never additional
+    move authority. An unproved spelling remains distinct and fails the normal
+    route ambiguity checks. Proposal records and their hashes stay untouched.
+    """
+    evidence = {}
+    for row in source.get('folder_rename_coverage', []):
+        evidence.setdefault(row.get('Source ID'), []).append(row)
+    aliases, owners, claims = {}, {}, {}
+    for sid, actions in sorted(groups.items()):
+        state = states[sid]
+        if state['mime_type'] != FOLDER:
+            continue
+        move, rename = actions.get('MOVE'), actions.get('RENAME')
+        if move:
+            claims.setdefault(_record_path(move), set()).add(sid)
+        if not rename:
+            continue
+        parent = _record_path(rename)
+        historical = rename['row'].get('Current name + type suffix') or state['name']
+        proposed = exact_rename(rename, state)
+        old, new = parent + '/' + historical, parent + '/' + proposed
+        for path in {old, new, parent + '/' + state['name']}:
+            claims.setdefault(path, set()).add(sid)
+        # Keep the caller's exact section boundary unchanged.
+        if (old == section or new == section
+                or not _inside(old, section) or not _inside(new, section)):
+            continue
+        rows = evidence.get(sid, [])
+        if not rows or old == new:
+            continue
+        if len(rows) != 1:
+            continue
+        row = rows[0]
+        if (row.get('Verified MIME type') != FOLDER
+                or row.get('Rename proposal') != rename['reference']
+                or row.get('Current name + type suffix') != historical
+                or row.get('Proposed name / retained name') != proposed
+                or row.get('Existing proposed target') != old
+                or state['name'] not in {historical, proposed}):
+            continue
+        # A slash inside an exact title is not evidence of a nested folder.
+        # Existing path machinery cannot represent that equivalence safely.
+        if '/' in historical or '/' in proposed:
+            continue
+        if move and _record_path(move) not in {old, new}:
+            continue
+        if new in owners and owners[new] != sid:
+            raise SafetyError('FOLDER_RENAME_ALIAS_IDENTITY_CONFLICT:' + sid)
+        aliases[new], owners[new] = old, sid
+    for alias, sid in owners.items():
+        canonical = _canonical_folder_path(alias, aliases)
+        for path, identities in claims.items():
+            if _canonical_folder_path(path, aliases) == canonical and identities - {sid}:
+                raise SafetyError('FOLDER_RENAME_ALIAS_IDENTITY_CONFLICT:' + sid)
+    return aliases
+
+
+def _folder_route(actions, state, required, *, canonical_path=lambda path: path):
     move, rename = actions.get('MOVE'), actions.get('RENAME')
     if move:
-        path = _record_path(move)
-        if rename and _record_path(rename) != logical_parent(path):
+        path = canonical_path(_record_path(move))
+        if rename and canonical_path(_record_path(rename)) != logical_parent(path):
             raise SafetyError('FOLDER_MOVE_RENAME_PARENT_DISAGREEMENT:' + state['id'])
     else:
         historical = rename['row'].get('Current name + type suffix') or state['name']
-        old = _record_path(rename) + '/' + historical
-        current = _record_path(rename) + '/' + state['name']
-        new = _record_path(rename) + '/' + exact_rename(rename, state)
+        old = canonical_path(_record_path(rename) + '/' + historical)
+        current = canonical_path(_record_path(rename) + '/' + state['name'])
+        new = canonical_path(_record_path(rename) + '/' + exact_rename(rename, state))
         referenced = {p for p in {old, current, new} if any(_inside(r, p) for r in required)}
         if len(referenced) > 1:
             raise SafetyError('AMBIGUOUS_RENAMED_FOLDER_LOGICAL_ALIAS:' + state['id'])
@@ -239,19 +313,21 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths):
                 unknown = {m['id'] for m in states[sid].get('subtree', {}).get('members', [])} - known
                 if unknown:
                     raise SafetyError('WHOLE_SUBTREE_CHILD_MISSING_PROPOSAL_COVERAGE:' + sid + ':' + ','.join(sorted(unknown)))
+    aliases = _folder_aliases(source, groups, states, section)
+    canonical_path = lambda path: _canonical_folder_path(path, aliases)
     required = {section}
     for sid, actions in groups.items():
         if states[sid]['mime_type'] != FOLDER:
-            required.add(file_parent_path(actions.get('MOVE'), actions.get('RENAME'), states[sid]))
+            required.add(file_parent_path(actions.get('MOVE'), actions.get('RENAME'), states[sid], canonical_path=canonical_path))
         else:
             for record in actions.values():
-                required.add(logical_parent(_record_path(record)) if record['action'] == 'MOVE' else _record_path(record))
+                required.add(canonical_path(logical_parent(_record_path(record)) if record['action'] == 'MOVE' else _record_path(record)))
     routes, names = {}, {}
     for sid, actions in sorted(groups.items()):
         state = states[sid]
         rename, move = actions.get('RENAME'), actions.get('MOVE')
         if state['mime_type'] == FOLDER:
-            path, name = _folder_route(actions, state, required)
+            path, name = _folder_route(actions, state, required, canonical_path=canonical_path)
             if not _inside(path, section):
                 raise SafetyError('FOLDER_TARGET_OUTSIDE_SECTION:' + sid)
             if path in names and names[path] != name:
@@ -260,7 +336,7 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths):
             routes[sid] = {'path': path, 'parent_path': logical_parent(path), 'exact_name': name}
             required.add(path)
         else:
-            parent = file_parent_path(move, rename, state)
+            parent = file_parent_path(move, rename, state, canonical_path=canonical_path)
             if not _inside(parent, section):
                 raise SafetyError('FILE_DESTINATION_OUTSIDE_SECTION:' + sid)
             routes[sid] = {'parent_path': parent, 'exact_name': exact_rename(rename, state) if rename else state['name']}
@@ -274,7 +350,12 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths):
             cursor = logical_parent(cursor)
     explicit_folder_name_paths = set(names)
     names = {p: names.get(p, p.rsplit('/', 1)[-1]) for p in required}
-    paths = dict(anchor_paths)
+    paths = {}
+    for path, sid in anchor_paths.items():
+        canonical = canonical_path(path)
+        if canonical in paths and paths[canonical] != sid:
+            raise SafetyError('FOLDER_RENAME_ALIAS_ANCHOR_IDENTITY_CONFLICT:' + canonical)
+        paths[canonical] = sid
     unused = set(paths) - (required | {anchor})
     if anchor not in paths or any(not _inside(path, section) for path in unused):
         raise SafetyError('DESTINATION_ANCHOR_OUTSIDE_SECTION_OR_MISSING')
