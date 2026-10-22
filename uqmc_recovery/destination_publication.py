@@ -221,7 +221,8 @@ def freeze_publication(config, registry, *, journal, fresh_workbook, drive):
     identities = {n['id'] for n in data['nodes'] if n.get('id')}
     workbook = copy.deepcopy(fresh_workbook)
     workbook.setdefault('exported_at_utc', workbook.get('captured_at_utc', _now()))
-    report = viewer.refresh_proposal(data, workbook, folder_revisions=revision_folder_updates(journal))
+    revisions = viewer.proposed_folder_updates(data, workbook, folder_revisions=revision_folder_updates(journal))
+    report = viewer.refresh_proposal(data, workbook, folder_revisions=revisions)
     specs = display_section_specs(registry, data, basis['source_ids'])
     bundle = build_publication(journal, allowed_source_ids=basis['source_ids'],
         identity_basis=basis, sections=specs)
@@ -243,6 +244,11 @@ def freeze_publication(config, registry, *, journal, fresh_workbook, drive):
             return directory
         validate_snapshot(bundle['html'])
         viewer.integrate(data, bundle)
+        if revisions:
+            proposed_report = viewer.refresh_proposal(data, workbook, folder_revisions=revisions, proposed_layout=True)
+            viewer.mark_proposed_revision_status(data, revisions)
+            report['current_proposal_layout'] = proposed_report
+            report['proposal_revision_summary'] = data['proposal_revision_summary']
         if {n['id'] for n in data['nodes'] if n.get('id')} != identities:
             raise ValueError('PUBLIC_SOURCE_IDENTITIES_CHANGED')
         target = viewer.render(source.decode('utf-8'), data).encode('utf-8')

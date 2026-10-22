@@ -54,7 +54,124 @@ def resolve_folder_path(data, value):
     return node
 
 
-def refresh_proposal(data, workbook, *, folder_revisions=()):
+def proposed_folder_updates(data, workbook, *, folder_revisions=()):
+    """Map display-only folder revisions from current sheet targets and stable IDs.
+
+    A known created container can follow its children only when every disclosed
+    file's explicit sheet target agrees with the same subtree transformation.
+    This does not freeze a migration plan or confer execution approval.
+    """
+    nodes = data['nodes']; paths = {}; children = {}
+    for n in nodes:
+        children.setdefault(n['p'], []).append(n)
+        paths[n['i']] = (paths[n['p']] if n['p'] >= 0 else ()) + (n['n'].strip(),)
+    rows = workbook.get('sheets', workbook.get('matrices', {}))['Proposed Renames']
+    ix = {k: rows[0].index(k) for k in ('Source ID', 'Proposed name + type suffix', 'Proposed destination folder')}
+    targets = {}
+    for row in rows[1:]:
+        if len(row) <= max(ix.values()): continue
+        sid, name, parent = (row[ix[k]] for k in ix)
+        if not sid or not name or not parent: continue
+        if sid in targets: raise ValueError('DUPLICATE_PROPOSAL_SOURCE')
+        targets[sid] = (parent.rstrip('/') + '/' + name, parent, name)
+    frozen = {r['source_id']: r for r in folder_revisions}
+    result = {}
+    for n in nodes:
+        if not n['f'] or n['s'] != 'destination': continue
+        sid = n.get('destination_overlay', {}).get('destination_id') or n.get('id')
+        if not sid: continue
+        current = '/'.join(paths[n['i']])
+        target = targets.get(n.get('id'))
+        if target:
+            path, _, name = target
+        elif n.get('destination_overlay'):
+            direct = [c for c in children.get(n['i'], []) if not c['f'] and not c.get('retired')]
+            if not direct or any(c.get('id') not in targets for c in direct): continue
+            parents = {targets[c['id']][1] for c in direct}
+            if len(parents) != 1: continue
+            path = next(iter(parents)); name = path.rsplit('/', 1)[-1]
+            prefix = paths[n['i']]
+            descendants = [c for c in nodes if not c['f'] and not c.get('retired')
+                           and paths[c['i']][:len(prefix)] == prefix]
+            if any(c.get('id') not in targets or path_parts(targets[c['id']][1]) !=
+                   path_parts(path) + paths[c['i']][len(prefix):-1] for c in descendants): continue
+        else: continue
+        if path_parts(path) == paths[n['i']] and not n.get('pending_revision'): continue
+        try:
+            same = resolve_folder_path(data, path) is n
+        except ValueError:
+            same = False
+        prior_pending = n.get('pending_revision', {})
+        if prior_pending.get('inherited'): prior_pending = {}
+        if same and not prior_pending and (not target or name == n['n']): continue
+        before = prior_pending.get('before_path', current)
+        if path_parts(path) == path_parts(current) and not prior_pending: continue
+        previous = frozen.get(sid)
+        verified = bool(previous and previous['verified'] and
+                        path_parts(previous['target_path']) == path_parts(path))
+        result[sid] = dict(source_id=sid, before_path=before, target_path=path,
+                           target_name=name, verified=verified)
+    for sid, r in frozen.items():
+        if sid not in result: result[sid] = r
+    ordered = sorted(result.values(), key=lambda r: len(path_parts(r['before_path'])))
+    independent = []
+    for r in ordered:
+        inherited = any(r['before_path'].startswith(p['before_path'] + '/') and
+            r['target_path'] == p['target_path'] + r['before_path'][len(p['before_path']):]
+            for p in independent)
+        if not inherited: independent.append(r)
+    return independent
+
+
+def mark_proposed_revision_status(data, revisions):
+    """Keep historical observations separate from satisfaction of fresh targets."""
+    pending = {r['source_id']: r for r in revisions if not r['verified']}
+    pending_members = set(); counts = {}
+    historical = {sid for sec in data['execution_sections']['sections'] for sid in sec.get('verified_file_ids', [])}
+    for n in data['nodes']:
+        sid = n.get('destination_overlay', {}).get('destination_id') or n.get('id')
+        inherited = data['nodes'][n['p']].get('pending_revision') if n['p'] >= 0 else None
+        if sid in pending:
+            r = pending[sid]
+            n['pending_revision'] = {k:r[k] for k in ('before_path', 'target_path', 'target_name')}
+        elif inherited:
+            n['pending_revision'] = {**inherited, 'inherited': True}
+        else: n.pop('pending_revision', None)
+        active = not n['f'] and not n.get('retired')
+        if active and n.get('pending_revision'): pending_members.add(n['id'])
+        counts[n['i']] = [int(active), int(active and n.get('id') in historical),
+                          int(active and n.get('id') in pending_members), int(not n['f'] and bool(n.get('retired')))]
+    for n in reversed(data['nodes']):
+        if n['p'] >= 0:
+            for k in range(4): counts[n['p']][k] += counts[n['i']][k]
+        if n['f']:
+            total, done, pending_count, retired = counts[n['i']]
+            summary = n.setdefault('migration_summary', {})
+            old_total = summary.get('file_count', 0)
+            summary.update(file_count=total, historically_completed_file_count=done,
+                           completed_file_count=max(0, done - pending_count), retired_file_count=retired)
+            if pending_count:
+                summary.update(status='REVISION_PENDING', pending_revision_file_count=pending_count)
+            else:
+                summary.pop('pending_revision_file_count', None)
+                if not total and (old_total or summary.get('status') == 'CURRENT_CONTAINER_RETAINED') and n.get('destination_overlay'):
+                    summary['status'] = 'CURRENT_CONTAINER_RETAINED'
+                elif total and done == total: summary['status'] = 'COMPLETE'
+                elif done: summary['status'] = 'PARTIAL'
+                elif total: summary['status'] = 'NOT_STARTED'
+    for sec in data['execution_sections']['sections']:
+        root = resolve_folder_path(data, sec['path'])
+        count = counts[root['i']][2]
+        if count:
+            sec['proposal_status'] = 'PENDING_REVISION'
+            sec['proposal_pending_file_count'] = count
+        else:
+            sec.pop('proposal_status', None); sec.pop('proposal_pending_file_count', None)
+    data['proposal_revision_summary'] = {'pending_folder_count': len(pending),
+        'pending_file_count': len(pending_members), 'basis': 'current_sheet_display_only'}
+
+
+def refresh_proposal(data, workbook, *, folder_revisions=(), proposed_layout=False):
     """Reconcile explicit rename rows, recognizing already-renamed folder aliases.
 
     Stable source IDs and source links never change. Unlisted/withheld identities
@@ -112,7 +229,7 @@ def refresh_proposal(data, workbook, *, folder_revisions=()):
                 break
         if current is None:
             raise ValueError('REVISION_VIEWER_PATH_ID_MISMATCH:' + sid)
-        if revision['verified']:
+        if revision['verified'] or proposed_layout:
             parent_path = revision['target_path'][:-len('/' + revision['target_name'])]
             parent = resolve(path_parts(parent_path))
             collision = [other for other in nodes if other is not n and other['p'] == parent
@@ -123,16 +240,18 @@ def refresh_proposal(data, workbook, *, folder_revisions=()):
                 changed.append(sid)
             n['p'], n['n'] = parent, revision['target_name']
             n.pop('pending_revision', None)
+            if not revision['verified']:
+                n['pending_revision'] = {k:revision[k] for k in ('before_path','target_path','target_name')}
         else:
             # Freeze can create target parent containers before dispatch. Keep
             # the source node in place while allowing their verified overlays.
             resolve(path_parts(revision['target_path'][:-len('/' + revision['target_name'])]))
-            n['pending_revision'] = {'target_name':revision['target_name'], 'target_path':revision['target_path']}
+            n['pending_revision'] = {k:revision[k] for k in ('before_path','target_name','target_path')}
 
     def current_proposal_path(path):
         for revision in sorted(folder_revisions, key=lambda x: len(x['target_path']), reverse=True):
             target = revision['target_path']
-            if not revision['verified'] and (path == target or path.startswith(target + '/')):
+            if not proposed_layout and not revision['verified'] and (path == target or path.startswith(target + '/')):
                 return revision['before_path'] + path[len(target):]
         return path
 
@@ -362,7 +481,7 @@ CSS = '''\n/* UQMC destination execution overlay */
 JS_HELPER = '''
 function folderMigrationBadge(n){
  const v=n.migration_summary;if(!v)return null;
- const text={COMPLETE:'Destination complete',PARTIAL:'Partially migrated',NOT_STARTED:'Not started · no tracked completion',SOURCE_RETAINED:'Source folder retained',NOT_TRACKED:'Source context · not tracked'}[v.status];
+ const text={COMPLETE:'Destination complete',PARTIAL:'Partially migrated',NOT_STARTED:'Not started · no tracked completion',SOURCE_RETAINED:'Source folder retained',NOT_TRACKED:'Source context · not tracked',REVISION_PENDING:'Proposed revision pending',CURRENT_CONTAINER_RETAINED:'Existing empty folder retained'}[v.status];
  const cls=v.status==='COMPLETE'?'migration-complete':v.status==='PARTIAL'?'migration-partial':'migration-pending';
  const b=badge(text+(v.file_count&&['COMPLETE','PARTIAL'].includes(v.status)?' · '+v.completed_file_count+'/'+v.file_count+' files':''),cls);
  b.title='Verified destination-section completion at this snapshot. Not started means no tracked completion, not a claim about current live location.';
@@ -372,8 +491,8 @@ function appendDestinationDetails(panel,n){
  const d=n.destination_overlay,v=n.migration_summary;if(!d&&!v)return;
  panel.append(el('h3','execution-detail-title','Destination migration'));
  const dl=el('dl','detail-grid');
- if(v)dl.append(el('dt','','Completion'),el('dd','',v.status==='COMPLETE'?'Verified complete':v.status==='PARTIAL'?'Partial':'No destination completion recorded'));
- if(d){dl.append(el('dt','','Destination handling'),el('dd','',d.mode==='CREATED'?'New destination folder created; original source folders retained.':d.mode==='REUSED_EXISTING'?'Existing destination folder reused in place.':'Existing source folder moved to its approved destination.'));const a=el('a','source-link','Open actual destination in Drive ↗');a.href=safeLink(d.destination_url);a.target='_blank';a.rel='noopener noreferrer';panel.append(a);}
+ if(v)dl.append(el('dt','','Completion'),el('dd','',v.status==='COMPLETE'?'Verified complete':v.status==='PARTIAL'?'Partial':v.status==='REVISION_PENDING'?'Proposed layout pending; prior execution remains recorded':'No destination completion recorded'));
+ if(n.pending_revision){dl.append(el('dt','','Proposed location'),el('dd','',n.pending_revision.target_path),el('dt','','Last verified layout'),el('dd','',n.pending_revision.before_path));}if(d){dl.append(el('dt','','Destination handling'),el('dd','',d.mode==='CREATED'?'New destination folder created; original source folders retained.':d.mode==='REUSED_EXISTING'?'Existing destination folder reused in place.':'Existing source folder moved to its approved destination.'));const a=el('a','source-link','Open actual destination in Drive ↗');a.href=safeLink(d.destination_url);a.target='_blank';a.rel='noopener noreferrer';panel.append(a);}
  if(v&&v.source_retained)dl.append(el('dt','','Original source folder'),el('dd','','Source folder retained; not moved or deleted by this run.'));
  panel.append(dl);
 }
@@ -388,7 +507,8 @@ def render(source, data):
         mode = ('Existing folder moved; its identity was preserved.' if sec['mode'] == 'REUSED_MOVED' else 'Existing destination folder reused in place.' if sec['mode'] == 'REUSED_EXISTING' else f"{sec['created_folder_count']} destination folders created; original source folders left in place.")
         retired_note = (f" {sec['retired_file_count']} retired (user-confirmed deleted; not migrated)."
                         if sec.get('retired_file_count') else '')
-        cards.append('<article class="migration-card"><h3>' + html.escape(sec['title']) + '</h3><p><strong>' + html.escape(sec['status'].title()) + '</strong> · ' + str(sec['completed_file_count']) + '/' + str(sec['expected_file_count']) + ' active files verified.' + html.escape(retired_note) + '</p><p>' + html.escape(mode) + '</p><a target="_blank" rel="noopener noreferrer" href="' + html.escape(folder_link(sec['destination_url']), quote=True) + '">Open actual destination ↗</a></article>')
+        pending_note = (f" Proposed revision pending for {sec['proposal_pending_file_count']} files; counts below describe the previous verified layout." if sec.get('proposal_status') == 'PENDING_REVISION' else '')
+        cards.append('<article class="migration-card"><h3>' + html.escape(sec['title']) + '</h3><p><strong>' + html.escape('Revision pending' if pending_note else sec['status'].title()) + '</strong>' + html.escape(pending_note) + ' · ' + str(sec['completed_file_count']) + '/' + str(sec['expected_file_count']) + ' active files verified.' + html.escape(retired_note) + '</p><p>' + html.escape(mode) + '</p><a target="_blank" rel="noopener noreferrer" href="' + html.escape(folder_link(sec['destination_url']), quote=True) + '">Open actual destination ↗</a></article>')
     section = START + '<section class="execution-summary" aria-label="Migrated destination folders"><h2>Migrated destination folders</h2><p>Verified destination status from journal checkpoint ' + str(data['execution']['journal_sequence']) + '. Other folders show partial or not-started status in the tree. This is a static snapshot.</p><div class="migration-cards">' + ''.join(cards) + '</div></section>' + END
     if START in source:
         source = re.sub(re.escape(START) + '.*?' + re.escape(END), lambda _: section, source, flags=re.S)
@@ -396,6 +516,8 @@ def render(source, data):
         source = source.replace('<section class="execution-summary"', section + '<section class="execution-summary"', 1)
     if '/* UQMC destination execution overlay */' not in source:
         source = source.replace('</style>', CSS + '</style>', 1)
+    if 'function folderMigrationBadge(' in source:
+        source = re.sub(r'function folderMigrationBadge\(n\)\{.*?(?=function executionBadges\(n\)\{)', lambda _: JS_HELPER + '\n', source, count=1, flags=re.S)
     if 'function folderMigrationBadge(' not in source:
         source = source.replace('function executionBadges(n){', JS_HELPER + '\nfunction executionBadges(n){', 1)
         source = source.replace("const wrap=el('div','execution-badges');if(!n.id)return wrap;", "const wrap=el('div','execution-badges');if(n.f){const b=folderMigrationBadge(n);if(b)wrap.append(b);}if(n.destination_overlay)wrap.append(badge(n.destination_overlay.mode==='CREATED'?'New destination · source retained':n.destination_overlay.mode==='REUSED_EXISTING'?'Existing destination reused':'Existing folder moved','execution applied'));if(!n.id)return wrap;", 1)
