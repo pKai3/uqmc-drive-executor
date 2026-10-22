@@ -228,6 +228,9 @@ def validate_section_authority(journal, plan):
     preparation/dispatch. An ordinary non-section fixture plan returns None.
     Section plans must retain their exact recorded import origin.
     """
+    if plan.proposal_revision.startswith("revision:"):
+        from .destination_revision import validate_revision_authority
+        return validate_revision_authority(journal, plan)
     origins = [event for event in journal.records() if event["kind"] == "SECTION_IMPORTED"
                and event["payload"].get("proposal_hash") == plan.proposal_hash]
     if not origins:

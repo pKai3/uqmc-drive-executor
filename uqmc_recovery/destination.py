@@ -168,6 +168,11 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
     history=journal.records()
     from .destination_recovery import load_created_folder_proofs_for_path
     recovered=load_created_folder_proofs_for_path(journal,section)
+    from .destination_revision import superseded_creation_path_ids
+    registered_paths={}
+    for entry in registry.get('sections',[]):registered_paths.update(entry.get('destination_paths',{}))
+    revised_ids=superseded_creation_path_ids(journal,section,registered_paths)
+    recovered={sid:proof for sid,proof in recovered.items() if sid not in revised_ids}
     # A later blank cell does not reopen a durably excluded source/proposal.
     # Preserve the capture hash; these exclusions are separate journal authority.
     source['excluded_ids']=sorted(set(source['excluded_ids'])|{e['payload']['file_id'] for e in history if e['kind']=='EXCLUDED'}|retired_source_ids(history))
@@ -462,6 +467,9 @@ def freeze(config, section, journal, state, factory, run_dir, report):
             live['listings'].setdefault(raw['id'],[]);metadata[raw['id']]=normalize(raw,live['listings'][raw['id']])
         from .destination_recovery import load_created_folder_proofs_for_path
         recovered=load_created_folder_proofs_for_path(journal,section)
+        from .destination_revision import superseded_creation_path_ids
+        revised_ids=superseded_creation_path_ids(journal,section,paths)
+        recovered={sid:proof for sid,proof in recovered.items() if sid not in revised_ids}
         # Fold our confirmed creations into membership evidence before import.
         # Do not discard new children on restart by replacing a recovered listing.
         for logical,raw in created.items():
@@ -536,7 +544,7 @@ class RevisionGuard:
 
 
 def run_destination(config,section,*,apply=False,resume=False,rollback=None,publish_only=None,
-                    capture_client=None,factory=None,publisher=None,verify_completed=None,report=lambda x:None):
+                    capture_client=None,factory=None,publisher=None,verify_completed=None,revision_manifest=None,report=lambda x:None):
     from .journal import Journal
     from .importer import catalog
     from .desired import DesiredRunner,export_status
@@ -573,7 +581,14 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
             prepared=matches[-1]
             if prepared.get('subtree_coverage_version') != 1:
                 source=catalog(capture,expected_workbook_id=config['workbook_id'])
-            if not rollback:validate_resume_scope(source,section,prepared,journal)
+            if not rollback:
+                validate_resume_scope(source,section,prepared,journal)
+                if prepared.get('revision_manifest'):
+                    from .destination_revision import read_manifest
+                    bound=read_manifest(prepared['revision_manifest'],source,section,config['workbook_id'])
+                    if revision_manifest and digest(read_manifest(revision_manifest,source,section,config['workbook_id']))!=digest(bound):
+                        raise SafetyError('RESUME_REVISION_MANIFEST_CHANGED')
+                elif revision_manifest:raise SafetyError('SAVED_RUN_IS_NOT_REVISION')
         def publish_current():
             try:
                 if publisher is not None:return publisher(registry)
@@ -589,7 +604,10 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
                         'error_class':type(exc).__name__}
         if not prepared:
             with timed_stage(report,'Source and destination checks'), journal.locked():
-                state=read_and_plan(config,section,journal,capture,factory,registry,report,preview=not apply)
+                if revision_manifest:
+                    from .destination_revision import read_revision
+                    state=read_revision(config,section,journal,capture,factory,registry,report,revision_manifest)
+                else:state=read_and_plan(config,section,journal,capture,factory,registry,report,preview=not apply)
             blocked=[x for x in state['checks'] if x['disposition']=='BLOCKED']
             pending=[x for x in state['checks'] if x['disposition']!='COMPLETE']
             summary={'section':section,'preview_only':not apply,'counts':dict(Counter(x['disposition'] for x in state['checks'])),
@@ -613,7 +631,10 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
             # Folder workers retain the process lock via shared_locked(); their
             # network requests must not run under the controller's journal gate.
             with timed_stage(report,'Freeze plan and validate authority'):
-                prepared=freeze(config,section,journal,state,factory,run_dir,report)
+                if revision_manifest:
+                    from .destination_revision import freeze_revision
+                    prepared=freeze_revision(config,section,journal,state,factory,run_dir,report)
+                else:prepared=freeze(config,section,journal,state,factory,run_dir,report)
             registry.setdefault('runs',[]).append(prepared);atomic_json(registry_path,registry)
         else:run_dir=Path(prepared['plan_path']).parent
         if not apply:return {'section':section,'preview_only':True,'saved_run_id':prepared['run_id'],'selected_identities':len(prepared['selected_source_ids'])}
@@ -698,6 +719,7 @@ def verify_completed_sample(config,section,journal,source,factory,registry,limit
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('destination')
     parser.add_argument('--config',default='private/destination-config.json');parser.add_argument('--apply',action='store_true')
+    parser.add_argument('--revision-manifest',metavar='PATH',help='Explicit fresh-sheet-bound new targets for completed stable IDs; preview unless --apply')
     parser.add_argument('--resume',action='store_true');parser.add_argument('--rollback',metavar='RUN_ID');parser.add_argument('--publish-only',metavar='DIRECTORY')
     parser.add_argument('--verify-completed',type=int,metavar='N',help='Read-only sample of 1–30 already completed files; never a whole-section completion claim')
     parser.add_argument('--json',action='store_true',help='Emit complete JSON records instead of readable console progress')
@@ -707,7 +729,7 @@ def main(argv=None):
     try:
         config_path=Path(args.config).resolve();config=json.loads(config_path.read_text())
         console.open_log(config['run_directory'])
-        result=run_destination(config,args.destination,apply=args.apply,resume=args.resume,rollback=args.rollback,publish_only=args.publish_only,verify_completed=args.verify_completed,
+        result=run_destination(config,args.destination,apply=args.apply,resume=args.resume,rollback=args.rollback,publish_only=args.publish_only,verify_completed=args.verify_completed,revision_manifest=args.revision_manifest,
             report=console.progress)
         console.finish(result)
         return 2 if result.get('blockers') or result.get('revision_stop_reason') or any(k not in {'APPLIED','TARGET','COMPLETE','ROLLED_BACK','UNCHANGED'} and v for k,v in result.get('counts',{}).items()) and args.apply else 0

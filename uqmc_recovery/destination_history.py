@@ -205,7 +205,7 @@ def build_history_index(journal):
 
 def reconcile_item(history, desired, live, *, baseline=None, approved=True,
                    excluded=False, logical_destination=None, prior_logical_destination=None,
-                   explicit_rename=False):
+                   explicit_rename=False, revision_target=None):
     """Classify a fresh desired core against history and an exact live read.
 
     An explicit pending rename may warn on starting-name drift; callers freeze
@@ -244,6 +244,25 @@ def reconcile_item(history, desired, live, *, baseline=None, approved=True,
         actual = live.get(raw_key, live.get(normalized_key))
         if value is not None and value != actual:
             return blocked("PROTECTED_METADATA_DRIFT:" + raw_key)
+    if revision_target is not None:
+        # Only the explicit revision controller supplies this exact target after
+        # binding the fresh sheet and stable identities. Existing uncertainty
+        # must be resolved in its original plan, never moved into a new revision.
+        if _core(revision_target) != desired:
+            return blocked("REVISION_TARGET_BINDING_MISMATCH")
+        if requests:
+            return blocked("REVISION_UNRESOLVED_PRIOR_REQUEST")
+        if h.get("rolled_back_fields"):
+            return blocked("REVISION_ROLLED_BACK_HISTORY_REQUIRES_RESUME")
+        previous = h.get("latest_observation")
+        if not previous:
+            return blocked("REVISION_VERIFIED_PREIMAGE_REQUIRED")
+        if _core(previous) != current:
+            return blocked("REVISION_COMPLETED_PREIMAGE_DRIFT")
+        result["pending_fields"] = [f for f in _FIELDS if current[f] != desired[f]]
+        result["disposition"] = "READY" if result["pending_fields"] else "COMPLETE"
+        result["revision_preimage"] = current
+        return result
     if ("parents" in completed and prior_logical_destination is not None
             and logical_destination != prior_logical_destination):
         return blocked("COMPLETED_DESTINATION_CHANGED_REQUIRES_SEPARATE_WORK")

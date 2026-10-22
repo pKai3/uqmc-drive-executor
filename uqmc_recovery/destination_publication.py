@@ -160,6 +160,57 @@ def display_section_specs(registry, data, allowed_source_ids):
     return specs
 
 
+def revision_folder_updates(journal):
+    """Project frozen revision identity and current readbacks, without new authority.
+
+    Expiry gates dispatch, not historical display. Frozen targets alone remain
+    pending; actual tree relocation requires the same ID's verified target state.
+    """
+    from .publication_projection import _core, _desired_state
+    result = {}
+    records = journal.records()
+    latest = {}
+    for event in records:
+        if _desired_state(event) and event['payload'].get('source_id'):
+            latest[event['payload']['source_id']] = event
+    for event in records:
+        if event['kind'] != 'DESTINATION_REVISION_FROZEN':
+            continue
+        payload = event['payload']; evidence = journal.read_evidence(payload['manifest_ref'])
+        manifest = evidence['manifest']; owner = journal.read_evidence(evidence['owner_approval_ref'])
+        if (evidence.get('schema_version') != 'uqmc.destination.revision-frozen.v1'
+                or _sha(_bytes(evidence['plan'])) != payload['proposal_hash']
+                or evidence['owner_approval_ref'] != payload['owner_approval_ref']
+                or owner.get('decision') != 'APPROVED'
+                or owner.get('plan_sha256') != payload['proposal_hash']
+                or owner.get('manifest_sha256') != _sha(_bytes(manifest))
+                or owner.get('section_id') != payload['section_id']):
+            raise ValueError('VIEWER_REVISION_EVIDENCE_MISMATCH')
+        raw = journal.read_evidence(evidence['source_metadata_ref'])['metadata']
+        prior, target = evidence['prior_destination_paths'], evidence['destination_paths']
+        for item in manifest['items']:
+            sid = item['source_id']; before = raw.get(sid)
+            if not before or _core(before)['mime_type'] != 'application/vnd.google-apps.folder':
+                continue
+            parent_path = item['target_path'][:-len('/' + item['target_name'])]
+            if prior.get(item['before_path']) != sid or target.get(item['target_path']) != sid or parent_path not in target:
+                raise ValueError('VIEWER_REVISION_STABLE_ID_MAPPING_MISMATCH')
+            expected = {'id':sid, 'name':item['target_name'], 'parents':[target[parent_path]],
+                        'mime_type':'application/vnd.google-apps.folder'}
+            current = latest.get(sid)
+            # A preflight already at target can prove satisfaction, not an action.
+            verified = _core(before) == expected and before.get('trashed') is False
+            if current is not None and current['seq'] > event['seq']:
+                cp = current['payload']
+                verified = False
+                if (cp.get('plan_sha256') == payload['proposal_hash'] and cp.get('observed_ref')
+                        and _desired_state(current) == 'VERIFIED_APPLIED'):
+                    observed = journal.read_evidence(cp['observed_ref'])
+                    verified = _core(observed) == expected and observed.get('trashed') is not True
+            result[sid] = {**item, 'verified':verified}
+    return list(result.values())
+
+
 def freeze_publication(config, registry, *, journal, fresh_workbook, drive):
     """Read remote HTML; freeze private artifacts without any remote writes."""
     basis = config['identity_basis']
@@ -170,7 +221,7 @@ def freeze_publication(config, registry, *, journal, fresh_workbook, drive):
     identities = {n['id'] for n in data['nodes'] if n.get('id')}
     workbook = copy.deepcopy(fresh_workbook)
     workbook.setdefault('exported_at_utc', workbook.get('captured_at_utc', _now()))
-    report = viewer.refresh_proposal(data, workbook)
+    report = viewer.refresh_proposal(data, workbook, folder_revisions=revision_folder_updates(journal))
     specs = display_section_specs(registry, data, basis['source_ids'])
     bundle = build_publication(journal, allowed_source_ids=basis['source_ids'],
         identity_basis=basis, sections=specs)

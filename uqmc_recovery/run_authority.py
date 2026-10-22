@@ -21,7 +21,7 @@ from .section_importer import validate_section_authority
 
 _REFERENCE = re.compile(r"sha256:([0-9a-f]{64})\Z")
 _REVOCATIONS = {"REVOKED", "SECTION_APPROVAL_REVOKED", "SECTION_APPROVAL_SUPERSEDED"}
-_BINDINGS = {"SECTION_IMPORTED", "HANDOFF_AUTHORIZED", "APPROVED", "DRAFTED",
+_BINDINGS = {"DESTINATION_REVISION_FROZEN", "SECTION_IMPORTED", "HANDOFF_AUTHORIZED", "APPROVED", "DRAFTED",
              "HANDOFF_DISPATCH_ENABLED", "HANDOFF_DISPATCH_DISABLED"}
 
 
@@ -193,7 +193,7 @@ class RunAuthority:
             return True
         if event["kind"] in {"HANDOFF_DISPATCH_ENABLED", "HANDOFF_DISPATCH_DISABLED"}:
             return payload.get("controller_id") == self._handoff.get("controller_id")
-        if event["kind"] == "SECTION_IMPORTED" and self._section_id is not None:
+        if event["kind"] in {"SECTION_IMPORTED", "DESTINATION_REVISION_FROZEN"} and self._section_id is not None:
             # A replacement section can have a new batch and hash. Prove that a
             # new import is unrelated rather than silently retaining old scope.
             if not payload.get("manifest_ref"):

@@ -215,12 +215,14 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
         if e['kind'] in {'PREPARED','ATTEMPTED','VERIFIED_APPLIED','FAILED_NOT_APPLIED','UNCERTAIN','BLOCKED_CONFLICT','SKIPPED','RECONCILED_AT_TARGET'}:
             latest_legacy[e['payload'].get('file_id')] = e['seq']
     observed_raw, applied_folder_moves, created, inherited = {}, {}, {}, {}
+    latest_desired = {}
     histories = {}
     for e in records:
         p, state = e['payload'], _desired_state(e)
         if not state or not p.get('source_id'):
             continue
         source = p['source_id']
+        latest_desired[source] = e['seq']
         group = plans.get(p.get('plan_sha256'), {}).get(source)
         if group is None:
             raise ValueError('Desired event has no sealed plan item')
@@ -346,7 +348,17 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
             created[p['file_id']]={'id':p['file_id'],'name':p['name'],'parent_ids':[p['parent_id']],
                 'verified_at_utc':e['at'],'destination_link':'https://drive.google.com/drive/folders/'+p['file_id']}
             item=items.setdefault(p['file_id'],_blank(p['file_id']))
-            _observe(item,raw,e['at']); observed_raw[p['file_id']]=_core(raw)
+            if latest_desired.get(p['file_id'], 0) <= e['seq']:
+                _observe(item,raw,e['at']); observed_raw[p['file_id']]=_core(raw)
+            else:
+                # Creation history stays intact; a later rename/move readback is
+                # the destination's current observed state, including uncertainty.
+                observed = item['observed']
+                if observed['read_state'] == 'VERIFIED':
+                    created[p['file_id']].update(name=observed['exact_name'], parent_ids=observed['parent_ids'],
+                        verified_at_utc=observed['metadata_verified_at_utc'])
+                else:
+                    created.pop(p['file_id'], None)
     for source, (raw, at) in _satisfied_preflight_observations(
             journal, plans, sections, items, latest_legacy).items():
         item = items[source]
@@ -461,7 +473,16 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
                 if d is None:continue
             if sid in spec.get('destination_paths',{}):d['path']=spec['destination_paths'][sid]
             verified_destinations.append(d)
+        # A created destination can have a later approved revision. Its original
+        # creation/current link does not prove that new name/parent target applied.
+        destination_targets_satisfied = all(sid not in plan or
+            (items[sid]['observed']['read_state']=='VERIFIED' and
+             {'id':sid, 'name':items[sid]['observed']['exact_name'],
+              'parents':items[sid]['observed']['parent_ids'],
+              'mime_type':items[sid]['observed']['mime_type']}==plan[sid]['target']) or
+            matching_destination_observation(sid) is not None for sid in destination_ids)
         complete=(len(verified)==len(ids) and root_ok and all(s in created for s in required_created)
+                  and destination_targets_satisfied
                   and set(destination_ids)<={d['id'] for d in verified_destinations})
         times=[items[s]['observed']['metadata_verified_at_utc'] for s in verified]
         section_rows.append({'section_id':spec['section_id'],'title':spec['title'],'path':spec['proposal_path'],

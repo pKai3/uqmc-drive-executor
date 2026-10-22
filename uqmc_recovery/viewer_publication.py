@@ -54,7 +54,7 @@ def resolve_folder_path(data, value):
     return node
 
 
-def refresh_proposal(data, workbook):
+def refresh_proposal(data, workbook, *, folder_revisions=()):
     """Reconcile explicit rename rows, recognizing already-renamed folder aliases.
 
     Stable source IDs and source links never change. Unlisted/withheld identities
@@ -89,6 +89,53 @@ def refresh_proposal(data, workbook):
             parent = node['i']
         return parent
 
+    # A completed folder revision reuses the same viewer node and descendants.
+    # Pending revisions retain the current tree and expose their proposed path.
+    revisions = {r['source_id']: r for r in folder_revisions}
+    if len(revisions) != len(folder_revisions):
+        raise ValueError('DUPLICATE_VIEWER_FOLDER_REVISION')
+    for revision in folder_revisions:
+        sid = revision['source_id']
+        matches = [n for n in nodes if n['f'] and n['s'] == 'destination' and
+                   (n.get('id') == sid or n.get('destination_overlay', {}).get('destination_id') == sid)]
+        if len(matches) != 1:
+            raise ValueError('REVISION_VIEWER_ID_NOT_UNIQUE:' + sid)
+        n = matches[0]
+        current = None
+        for path in (revision['before_path'], revision['target_path']):
+            try:
+                candidate = resolve_folder_path(data, path)
+            except ValueError:
+                continue
+            if candidate is n:
+                current = candidate
+                break
+        if current is None:
+            raise ValueError('REVISION_VIEWER_PATH_ID_MISMATCH:' + sid)
+        if revision['verified']:
+            parent_path = revision['target_path'][:-len('/' + revision['target_name'])]
+            parent = resolve(path_parts(parent_path))
+            collision = [other for other in nodes if other is not n and other['p'] == parent
+                         and other['f'] and other['s'] == 'destination' and other['n'] == revision['target_name']]
+            if collision:
+                raise ValueError('REVISION_VIEWER_TARGET_COLLISION:' + sid)
+            if n['p'] != parent or n['n'] != revision['target_name']:
+                changed.append(sid)
+            n['p'], n['n'] = parent, revision['target_name']
+            n.pop('pending_revision', None)
+        else:
+            # Freeze can create target parent containers before dispatch. Keep
+            # the source node in place while allowing their verified overlays.
+            resolve(path_parts(revision['target_path'][:-len('/' + revision['target_name'])]))
+            n['pending_revision'] = {'target_name':revision['target_name'], 'target_path':revision['target_path']}
+
+    def current_proposal_path(path):
+        for revision in sorted(folder_revisions, key=lambda x: len(x['target_path']), reverse=True):
+            target = revision['target_path']
+            if not revision['verified'] and (path == target or path.startswith(target + '/')):
+                return revision['before_path'] + path[len(target):]
+        return path
+
     seen = set()
     for row in rows[1:]:
         if len(row) <= max(ix.values()):
@@ -107,11 +154,13 @@ def refresh_proposal(data, workbook):
         # silently moving their whole subtree based on a file-level row refresh.
         if n['f']:
             if n['n'] != target_name:
-                raise ValueError('FOLDER_PROPOSAL_CHANGED_REQUIRES_REBUILD')
+                revision = revisions.get(sid)
+                if revision is None or revision['verified'] or revision['target_name'] != target_name:
+                    raise ValueError('FOLDER_PROPOSAL_CHANGED_REQUIRES_REBUILD')
             continue
         parent = n['p']
         if n['s'] == 'destination':
-            parent = resolve(path_parts(row[ix['Proposed destination folder']]))
+            parent = resolve(path_parts(current_proposal_path(row[ix['Proposed destination folder']])))
         if parent != n['p'] or target_name != n['n']:
             changed.append(sid)
             n['p'] = parent
@@ -267,7 +316,12 @@ def integrate(data, bundle):
         for fid, dp in destination_paths.items():
             if fid == section['destination_id']:
                 continue
-            matches = path_nodes.get(dp, [])
+            # A verified revision preserves destination ID while changing its
+            # logical path. Prefer that existing stable identity over stale aliases.
+            matches = [n for n in nodes if n['s']=='destination' and n['f'] and
+                       (n.get('id')==fid or n.get('destination_overlay',{}).get('destination_id')==fid)]
+            if not matches:
+                matches = path_nodes.get(dp, [])
             if len(matches) != 1:
                 raise ValueError('CREATED_DESTINATION_PATH_NOT_UNIQUE:' + '/'.join(dp))
             d = destinations[fid]
@@ -352,6 +406,9 @@ def render(source, data):
         source = source.replace("map?'Map':'Drive'", "n.destination_overlay?'Destination':map?'Map':'Drive'", 1)
         source = source.replace("if(n.id||n.context_id){const details", "if(n.id||n.context_id||n.destination_overlay){const details", 1)
         source = source.replace("n.holding?'Pending review · no destination assigned':n.context_id?", "n.destination_overlay?(n.destination_overlay.mode==='CREATED'?'Destination created and verified':'Destination verified'):n.holding?'Pending review · no destination assigned':n.context_id?", 1)
+    revision_badge = "if(n.pending_revision){const r=el('div','execution-badges');r.append(badge('Revision pending · '+n.pending_revision.target_path,'migration-pending'));return r;}"
+    if revision_badge not in source:
+        source = source.replace('function executionBadges(n){', 'function executionBadges(n){' + revision_badge, 1)
     retirement_badge = "if(n.retired){const r=el('div','execution-badges');r.append(badge('Retired · user-confirmed deleted · not migrated','migration-pending'));return r;}"
     if retirement_badge not in source:
         source = source.replace('function executionBadges(n){', 'function executionBadges(n){' + retirement_badge, 1)

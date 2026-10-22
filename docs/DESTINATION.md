@@ -388,3 +388,73 @@ deleted; not migrated**, while excluding it from active completion counts. It
 does not invent a verified name, location, rename or move. Ordinary **No**
 decisions and recoverable missing/inaccessible exclusions remain outstanding;
 private exclusions remain private. Existing journal history is preserved.
+
+## Explicit revisions of completed destinations
+
+Ordinary `--apply` still refuses to silently replace completed targets. For a
+separately approved layout or filename revision, use a private manifest bound to
+the **fresh canonical sheet after the proposal edits**:
+
+```sh
+.venv/bin/python -m uqmc_recovery.destination '02 Meetings' --revision-manifest private/reviews/meetings-year-first-20261022/revision-manifest.json
+.venv/bin/python -m uqmc_recovery.destination '02 Meetings' --revision-manifest private/reviews/meetings-year-first-20261022/revision-manifest.json --apply
+```
+
+The first command previews. The second is explicit authority to execute only
+that exact revision. Neither a manifest nor its hash alone confers approval.
+The manifest schema is `uqmc.destination.revision.v1`:
+
+```json
+{
+  "schema_version": "uqmc.destination.revision.v1",
+  "revision_id": "year-first-reviewed-v1",
+  "section_path": "Section",
+  "workbook_id": "canonical-workbook-id",
+  "input_sha256": "fresh-catalog-input-sha256",
+  "items": [{
+    "source_id": "stable-existing-id",
+    "before_path": "Section/Category/2020",
+    "target_path": "Section/2020/Category",
+    "target_name": "Category"
+  }],
+  "new_folders": [{"path": "Section/2020", "name": "2020"}]
+}
+```
+
+`input_sha256` is the `input_sha256` returned by `importer.catalog` for the saved
+fresh workbook capture, with `include_subtree_coverage=True` and
+`subtree_section_path` equal to the section. Unchanged sheet binding is required;
+if the proposal changes, review and regenerate the manifest rather than bypassing
+the mismatch. IDs and original paths must have verified prior journal/registry
+provenance. New folder entries must be required ancestors of the exact targets.
+A same-name unrecorded destination is an ambiguity, not an ID to adopt.
+
+The command creates a new plan, run and operation IDs, preserves old completion
+references, and records freshly observed before names/parents for rollback.
+Previously journal-created folders are moved/renamed by their existing IDs.
+Their descendants are checked against the fresh sheet by stable parent ID and
+exact name, then carried intact without new file operations or reopened
+completion records. Unrelated completed work stays complete. Unknown children,
+changed child targets, actual source drift and unresolved old requests block.
+An interrupted folder creation is reconciled against its previously reserved ID.
+
+After a saved revision is interrupted, resume its exact frozen plan:
+
+```sh
+.venv/bin/python -m uqmc_recovery.destination '02 Meetings' --resume --apply
+```
+
+Do not start another revision while a request remains uncertain. Resume reads
+current state before retrying and never replays an already satisfied effect.
+For an explicit rollback of this revision alone:
+
+```sh
+.venv/bin/python -m uqmc_recovery.destination '02 Meetings' --rollback REVISION_RUN_ID --apply
+```
+
+Rollback restores the revision's recorded starting names/parents only if the
+current state still matches its applied state. It does not undo earlier batches,
+delete newly created parents, or automatically run on failure. Preview and
+execution use existing credentials, timeout, bounded worker pool, journaling and
+publication recovery. Offline fixture tests prove the workflow; a new revision
+is not live-tested until the operator runs it.
