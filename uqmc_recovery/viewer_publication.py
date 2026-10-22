@@ -359,7 +359,8 @@ def render(source, data):
     source = source.replace('The proposed reorganisation has not been executed. This viewer makes no changes. Drive links open the source item, even when a new name is proposed.', 'Completed destination sections and verified execution progress are shown below. This viewer makes no changes. Destination links open verified folders; source links remain in Details.')
     source = source.replace('Synthetic grouping folders have no execution status.', 'Grouping folders show destination completion separately from source actions.')
     source = source.replace('>Proposal only<', '>Proposal + execution snapshot<')
-    source = re.sub(r'Version \d+ · Updated[^<]+', 'Execution update · Journal checkpoint ' + str(data['execution']['journal_sequence']), source, count=1)
+    source = re.sub(r'(?:Version \d+ · Updated[^<]+|Execution update · Journal checkpoint \d+)',
+                    'Execution update · Journal checkpoint ' + str(data['execution']['journal_sequence']), source, count=1)
     return source
 
 

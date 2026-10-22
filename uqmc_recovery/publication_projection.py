@@ -93,6 +93,63 @@ def _plans(journal):
     return result
 
 
+def _satisfied_preflight_observations(journal, plans, sections, items, latest_legacy):
+    """Recover observations omitted from dispatch because their fields were satisfied.
+
+    A drafted target alone is not evidence. Require the approved section import's
+    hash-bound raw preflight capture and an unchanged sealed preimage. This is an
+    observation at capture time, never a synthetic action or new live readback.
+    """
+    wanted = {ph for spec in sections for ph in spec.get('plan_sha256s', [spec.get('plan_sha256')])}
+    approved = {e['payload'].get('proposal_hash') for e in journal.records() if e['kind'] == 'APPROVED'}
+    observations = {}
+    for event in journal.records():
+        p = event['payload']; ph = p.get('proposal_hash')
+        if event['kind'] != 'SECTION_IMPORTED' or ph not in wanted or ph not in approved:
+            continue
+        candidates = {sid: group for sid, group in plans.get(ph, {}).items()
+            if group['original'] == group['target'] and group['target']['mime_type'] != FOLDER
+            and sid in items and sid not in latest_legacy
+            and items[sid]['observed']['read_state'] == 'NEVER_VERIFIED'
+            and all(items[sid][effect]['last_event_state'] is None for effect in ('move', 'rename'))}
+        if not candidates:
+            continue
+        imported = journal.read_evidence(p['manifest_ref'])
+        projection = imported['projection']; manifest = imported['manifest']
+        # Older non-destination import profiles do not carry this evidence hook.
+        reference = projection.get('destination_path_evidence_ref')
+        if not reference:
+            continue
+        owner = journal.read_evidence(imported['owner_approval_ref'])
+        if (digest(canonical(imported['plan'])) != ph
+                or digest(canonical(projection)) != p['projection_sha256']
+                or owner.get('projection_sha256') != p['projection_sha256']
+                or imported['owner_approval_ref'] != p['owner_approval_ref']
+                or owner.get('decision') != 'APPROVED'
+                or manifest.get('section_approval_validated') is not True
+                or owner.get('section_id') != projection.get('section_id')):
+            raise ValueError('SATISFIED_PREFLIGHT_AUTHORITY_MISMATCH')
+        mapping = journal.read_evidence(reference)
+        if (mapping.get('section_id') != projection['section_id']
+                or mapping.get('input_sha256') != projection.get('input_sha256')):
+            raise ValueError('SATISFIED_PREFLIGHT_MAPPING_MISMATCH')
+        capture = journal.read_evidence(mapping['provenance_ref'])
+        at = manifest['captured_at_utc']
+        if datetime.fromisoformat(at.replace('Z', '+00:00')).tzinfo is None:
+            raise ValueError('SATISFIED_PREFLIGHT_CAPTURE_TIME_REQUIRED')
+        members = {m['source_id'] for m in projection['members']} & set(owner['member_source_ids'])
+        cached = set(capture.get('history_cached_source_ids', []))
+        for sid, group in candidates.items():
+            raw = capture.get('metadata', {}).get(sid)
+            if (sid not in members or sid in cached or not raw or raw.get('trashed') is not False
+                    or group['baseline'].get('trashed') is not False
+                    or group['baseline'].get('parents_complete') is not True
+                    or _core(raw) != group['original']):
+                continue
+            observations[sid] = (raw, at)
+    return observations
+
+
 def _desired_state(event):
     if event['kind'] in DESIRED_STATES:
         return DESIRED_STATES[event['kind']]
@@ -290,6 +347,13 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
                 'verified_at_utc':e['at'],'destination_link':'https://drive.google.com/drive/folders/'+p['file_id']}
             item=items.setdefault(p['file_id'],_blank(p['file_id']))
             _observe(item,raw,e['at']); observed_raw[p['file_id']]=_core(raw)
+    for source, (raw, at) in _satisfied_preflight_observations(
+            journal, plans, sections, items, latest_legacy).items():
+        item = items[source]
+        _observe(item, raw, at)
+        for label in ('move', 'rename'):
+            item[label].update(effect='UNCHANGED', verified_at_utc=at)
+        observed_raw[source] = _core(raw)
     for source,item in items.items():
         ancestors=sorted(set(item['location']['ancestor_move_operation_ids']) | inherited.get(source,set()))
         item['location']['ancestor_move_operation_ids']=ancestors
