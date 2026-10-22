@@ -67,6 +67,18 @@ class DestinationConsoleTests(unittest.TestCase):
         self.assertIn('Drive HTML: BLOCKED; TransportError.',text)
         self.assertNotIn('private',text)
 
+    def test_publication_validation_reason_is_actionable_not_only_exception_class(self):
+        from uqmc_recovery.destination_publication import _error
+        detail = _error(ValueError('SECTION_IDENTITIES_NOT_PUBLIC_ALLOWLISTED'))
+        r = self.reporter()
+        r.finish({'counts': {'APPLIED': 3}, 'publication': {
+            'state': 'PENDING', 'error': detail['reason'], 'error_class': 'ValueError'}})
+        text = self.out.getvalue()
+        self.assertIn('Publication: PENDING; SECTION_IDENTITIES_NOT_PUBLIC_ALLOWLISTED', text)
+        self.assertIn('section membership conflicts with the public display allowlist', text)
+        self.assertIn('Saved migration results are unchanged', text)
+        self.assertNotIn('ValueError', text)
+
     def test_json_mode_keeps_original_values(self):
         r = self.reporter(json_output=True)
         progress = {'event':'item_finished','state':'APPLIED','source_id':'fixture'}

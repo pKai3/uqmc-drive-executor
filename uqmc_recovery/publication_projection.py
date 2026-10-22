@@ -114,6 +114,28 @@ def _action(p, group):
     return 'MOVE_AND_RENAME' if name and move else 'RENAME' if name else 'MOVE'
 
 
+def _publication_exclusions(records):
+    """Keep withdrawal/private exclusions stronger than recoverable execution skips.
+
+    A recoverable missing identity is public only through the caller's explicit
+    allowlist. This classification does not modify execution exclusion history.
+    Any other exclusion for the same ID continues to prohibit public display.
+    """
+    excluded, recoverable, private = set(), set(), set()
+    for event in records:
+        if event['kind'] != 'EXCLUDED':
+            continue
+        payload = event['payload']
+        source = payload.get('file_id')
+        excluded.add(source)
+        if (payload.get('recoverable') is True and payload.get('effect') == 'NOT_APPLIED'
+                and payload.get('reason_code') == 'MISSING_OR_INACCESSIBLE'):
+            recoverable.add(source)
+        else:
+            private.add(source)
+    return excluded, recoverable - private, private
+
+
 def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(), verified_source_links=None):
     """Return workbook/html strict snapshots, private operation_log, and sections.
 
@@ -278,8 +300,16 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
             item['location']['effect']='INHERITED'
         elif item['observed']['read_state']=='VERIFIED':
             item['location']['effect']='NONE'
-    excluded={e['payload'].get('file_id') for e in records if e['kind']=='EXCLUDED'}
-    section_rows=[]; allowed=set(allowed_source_ids)-excluded
+    excluded, recoverable_excluded, private_excluded = _publication_exclusions(records)
+    section_rows=[]; allowed=set(allowed_source_ids)-private_excluded
+    for source in recoverable_excluded:
+        item = items.get(source)
+        if item is not None:
+            # Preserve observed effects, but distinguish a recoverable execution
+            # skip from permanent withdrawal. Missing is not verified unchanged.
+            item['reason_codes'] = [code for code in item['reason_codes'] if code != 'WITHDRAWN']
+            item['reason_codes'] = list(dict.fromkeys([
+                *item['reason_codes'], 'EXCLUDED', 'MISSING_OR_INACCESSIBLE', 'NOT_APPLIED']))
     destination_observations={}
     for event in records:
         if event['kind']!='DESTINATION_VERIFIED':continue
@@ -305,13 +335,30 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
         for ph,part in plans.items():
             if ph in hashes:plan.update(part)
         if len(ids)!=len(set(ids)) or not set(ids)<=allowed or not set(spec.get('source_folder_ids_left_in_place',[]))<=allowed:
-            raise ValueError('Section identities are not uniquely public-allowlisted')
+            raise ValueError('SECTION_IDENTITIES_NOT_PUBLIC_ALLOWLISTED')
         if spec['destination_mode'] not in {'REUSED_MOVED','REUSED_EXISTING','CREATED'}:
             raise ValueError('Unknown destination mode')
+        def matching_destination_observation(sid):
+            observed = destination_observations.get((spec['section_id'], sid))
+            expected_path = spec.get('destination_paths', {}).get(
+                sid, spec['proposal_path'] if sid == dest else None)
+            if observed is None or observed['path'] != expected_path:
+                return None
+            if sid in plan:
+                core = {'id': sid, 'name': observed['name'],
+                        'parents': observed['parent_ids'], 'mime_type': FOLDER}
+                # A no-op folder has no action result. Its explicit destination
+                # verification can prove the exact target, but cannot replace a
+                # later failed/conflicting action observation or a different plan.
+                if (core != plan[sid]['target'] or
+                        items[sid]['observed']['read_state'] != 'NEVER_VERIFIED'):
+                    return None
+            return dict(observed)
+
         observed_dest=destination_observations.get((spec['section_id'],dest))
         if dest not in allowed and dest not in created and observed_dest is None:
             raise ValueError('Destination is not an allowed source or verified creation')
-        verified=[s for s in ids if s in plan and items[s]['observed']['read_state']=='VERIFIED' and
+        verified=[s for s in ids if s not in excluded and s in plan and items[s]['observed']['read_state']=='VERIFIED' and
                   {'id':s,'name':items[s]['observed']['exact_name'],'parents':items[s]['observed']['parent_ids'],
                    'mime_type':items[s]['observed']['mime_type']}==plan[s]['target']]
         destination_ids=spec.get('destination_ids',[dest]); required_created=[s for s in destination_ids
@@ -320,24 +367,24 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
                  (dest in plan and items[dest]['observed']['read_state']=='VERIFIED' and
                  items[dest]['observed']['parent_ids']==plan[dest]['target']['parents'] and
                  items[dest]['observed']['exact_name']==plan[dest]['target']['name']) or
-                 (dest not in plan and observed_dest is not None and observed_dest['path']==spec['proposal_path']))
+                 matching_destination_observation(dest) is not None)
         verified_destinations=[]
         for sid in destination_ids:
             if sid in created:
                 d={**created[sid],'mode':'CREATED'}
             elif sid in plan and sid in items:
                 item=items[sid];obs=item['observed']
-                if obs['read_state']!='VERIFIED' or {'id':sid,'name':obs['exact_name'],
-                    'parents':obs['parent_ids'],'mime_type':obs['mime_type']}!=plan[sid]['target']:
-                    continue
-                d={'id':sid,'name':obs['exact_name'],'parent_ids':obs['parent_ids'],
-                   'verified_at_utc':obs['metadata_verified_at_utc'],'mode':'REUSED_MOVED',
-                   'destination_link':'https://drive.google.com/drive/folders/'+sid}
-            elif (spec['section_id'],sid) in destination_observations:
-                d=dict(destination_observations[(spec['section_id'],sid)])
-                if d['path']!=spec.get('destination_paths',{}).get(sid,spec['proposal_path'] if sid==dest else None):
-                    continue
-            else:continue
+                if obs['read_state']=='VERIFIED' and {'id':sid,'name':obs['exact_name'],
+                    'parents':obs['parent_ids'],'mime_type':obs['mime_type']}==plan[sid]['target']:
+                    d={'id':sid,'name':obs['exact_name'],'parent_ids':obs['parent_ids'],
+                       'verified_at_utc':obs['metadata_verified_at_utc'],'mode':'REUSED_MOVED',
+                       'destination_link':'https://drive.google.com/drive/folders/'+sid}
+                else:
+                    d=matching_destination_observation(sid)
+                    if d is None:continue
+            else:
+                d=matching_destination_observation(sid)
+                if d is None:continue
             if sid in spec.get('destination_paths',{}):d['path']=spec['destination_paths'][sid]
             verified_destinations.append(d)
         complete=(len(verified)==len(ids) and root_ok and all(s in created for s in required_created)
@@ -364,8 +411,6 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
     workbook['operations']=[op for op in ops.values() if op['source_id'] in basis_ids]
     times=[i['observed']['metadata_verified_at_utc'] for i in items.values() if i['observed']['metadata_verified_at_utc']]
     workbook['coverage']['last_reconciled_at_utc']=max(times) if times else None
-    excluded={e['payload'].get('file_id') for e in records if e['kind']=='EXCLUDED'}
-    allowed-=excluded
     html=copy.deepcopy(workbook)
     html['items']=[i for i in html['items'] if i['source_id'] in allowed]
     html['operations']=[o for o in html['operations'] if o['source_id'] in allowed]

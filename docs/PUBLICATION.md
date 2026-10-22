@@ -57,3 +57,22 @@ verified item effects may supersede them; they must not be displayed as still
 pending. No system record means NOT_TRACKED, not proof that a file has stayed in
 its original location. A child relocated with a folder has an inherited location
 effect, not a direct child move.
+
+Recoverable execution exclusions are distinct from private withdrawals. An
+already-public, explicitly allowlisted item marked `recoverable: true`,
+`effect: NOT_APPLIED`, and `reason_code: MISSING_OR_INACCESSIBLE` remains visible
+as excluded/not migrated. It remains in the expected section count and cannot
+make the section complete. Any separate private/default exclusion still removes
+it from public output. The shared automatic CLI and publication-only paths use
+this same projection; they never retry file migration to repair publication.
+
+A public-membership conflict now reports
+`SECTION_IDENTITIES_NOT_PUBLIC_ALLOWLISTED` with a console explanation instead
+of only `ValueError`. Private evidence and raw API error text stay private.
+
+An unchanged destination folder may have no mutation event. Publication can use
+its explicit `DESTINATION_VERIFIED` observation only when it matches the exact
+sealed target ID, name, parent IDs, MIME type and registry path. This fallback
+cannot replace a later uncertain or conflicting action result. Verified child
+files can therefore be displayed beneath a reused no-op folder without inventing
+a folder move or weakening destination verification.

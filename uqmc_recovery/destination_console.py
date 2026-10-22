@@ -157,6 +157,8 @@ class ConsoleReporter:
                 else:
                     state, error = publication, None
                 self.line("Publication: " + concise(state) + ("; " + concise(error, 180) if error else "") + ".")
+                if error == "SECTION_IDENTITIES_NOT_PUBLIC_ALLOWLISTED":
+                    self.line("Publication stopped: section membership conflicts with the public display allowlist. Saved migration results are unchanged.")
                 if isinstance(publication, dict):
                     for key, label in (("sheet", "Spreadsheet"), ("html", "Drive HTML")):
                         stage = publication.get(key)

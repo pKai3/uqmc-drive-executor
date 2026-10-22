@@ -65,6 +65,8 @@ def read_existing(capture):
 
 def item_status(item):
     if not item:return 'NOT_TRACKED — no executor record'
+    if {'EXCLUDED','MISSING_OR_INACCESSIBLE','NOT_APPLIED'} <= set(item.get('reason_codes',[])):
+        return 'EXCLUDED — missing or inaccessible; not migrated'
     move,rename=item['move']['effect'],item['rename']['effect']
     location=item['location']['effect']
     suffix='; relocated with ancestor folder' if location in ('INHERITED','DIRECT_AND_INHERITED') else ''
@@ -78,7 +80,7 @@ def build_sheet_plan(bundle,existing):
     if pad(matrices['Operation Log'][0],26)!=LOG_HEADERS:raise ValueError('LOG_HEADERS_CHANGED')
     items={i['source_id']:i for i in snapshot['items']}
     tracked={sid:i for sid,i in items.items() if i['observed']['read_state']!='NEVER_VERIFIED'
-             or any(i[field]['operation_ids'] for field in ('move','rename'))}
+             or any(i[field]['operation_ids'] for field in ('move','rename')) or 'EXCLUDED' in i.get('reason_codes',[])}
     operations={op['operation_id']:op for op in snapshot['operations']}
     requests=[];changes=[];sheet_sizes={n:dict(p['gridProperties']) for n,p in props.items()}
 
