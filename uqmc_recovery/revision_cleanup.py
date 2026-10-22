@@ -1,8 +1,10 @@
 """Recoverable cleanup of empty old parents proved obsolete by one completed run.
 
 No broad search, permanent deletion, sharing changes or automatic retries. The
-ordinary destination command calls this only after a successful unchanged-sheet
-run. The explicit CLI can recover a named historical revision. Trash remains
+destination command calls this only after an explicitly requested revision,
+successful unchanged-sheet execution, and fresh ID ancestry proof inside the
+configured new tree. Normal migrations never clean up. The explicit CLI can
+recover a named historical revision. Trash remains
 subject to Google's retention policy; rollback first needs its parents restored.
 """
 from __future__ import annotations
@@ -158,16 +160,40 @@ def candidates(journal,prepared,registry,workbook,protected_ids=()):
     return sorted(output,key=depth,reverse=True)
 
 
-def cleanup_run(journal,prepared,registry,workbook,factory,*,apply=False,protected_ids=()):
-    selected=candidates(journal,prepared,registry,workbook,protected_ids)
+def _new_tree_ancestry(raw,root_id,factory,excluded):
+    """Prove containment with fresh stable-ID parent links, never path labels."""
+    chain=[copy.deepcopy(raw)];seen={raw['id']};current=raw
+    for _ in range(64):
+        parents=current.get('parents')
+        if not isinstance(parents,list) or len(parents)!=1:return None
+        parent=parents[0]
+        if parent in seen or parent in excluded:return None
+        seen.add(parent)
+        transport=factory({parent},set(),excluded,False)
+        current=getattr(transport,'get_trash_candidate',transport.get_file)(parent)
+        if (current.get('id')!=parent or current.get('mimeType',current.get('mime_type'))!=FOLDER
+                or current.get('trashed') is not False):return None
+        chain.append(copy.deepcopy(current))
+        if parent==root_id:return chain
+    return None
+
+
+def cleanup_run(journal,prepared,registry,workbook,factory,*,apply=False,protected_ids=(),new_tree_root_id=None):
+    binding_ref=prepared.get('revision_origin_ref')
+    if not binding_ref:
+        return {'state':'SKIPPED','reason':'EXPLICIT_REARCHITECTURE_REQUIRED','counts':{},'items':[],'candidate_count':0}
+    if not new_tree_root_id:
+        return {'state':'SKIPPED','reason':'NEW_TREE_ROOT_NOT_CONFIGURED','counts':{},'items':[],'candidate_count':0}
+    binding=journal.read_evidence(binding_ref)
+    if (binding.get('schema_version')!='uqmc.destination.revision-frozen.v1'
+            or binding.get('plan',{}).get('run_id')!=prepared['run_id']
+            or digest(binding.get('plan'))!=prepared['plan_sha256']):
+        raise SafetyError('CLEANUP_EXPLICIT_REVISION_BINDING_REQUIRED')
+    selected=candidates(journal,prepared,registry,workbook,set(protected_ids)|{new_tree_root_id})
     if not selected:return {'counts':{},'items':[],'candidate_count':0}
     ids={i['source_id'] for i in selected};transport=factory(ids,ids if apply else set(),set(prepared.get('excluded_ids',[])),apply)
     output=[]
     with journal.locked():
-        binding_ref=prepared.get('revision_origin_ref')
-        if apply and not binding_ref:
-            binding_ref=journal.evidence({'schema_version':'uqmc.run-cleanup-binding.v1','run_id':prepared['run_id'],
-                'plan_sha256':prepared['plan_sha256'],'source_metadata_ref':prepared['source_metadata_ref']})
         for item in selected:
             sid=item['source_id'];operation='empty-parent-'+digest({'run_id':prepared['run_id'],'source_id':sid})[:24]
             existing=[e for e in journal.records() if e['operation_id']==operation]
@@ -177,6 +203,12 @@ def cleanup_run(journal,prepared,registry,workbook,factory,*,apply=False,protect
                 'prior_path':item['prior_path'],'name':original['name'],'parent_ids':original['parents'],'reason':REASON}
             if _core(raw)!=_core(original):
                 output.append({'source_id':sid,'state':'SKIPPED','reason':'PARENT_IDENTITY_DRIFT'});continue
+            try:ancestry=_new_tree_ancestry(raw,new_tree_root_id,factory,set(prepared.get('excluded_ids',[])))
+            except TransportError:
+                output.append({'source_id':sid,'state':'SKIPPED','reason':'NEW_TREE_ANCESTRY_UNAVAILABLE'});continue
+            if not ancestry:
+                output.append({'source_id':sid,'state':'SKIPPED','reason':'PARENT_NOT_PROVEN_INSIDE_NEW_TREE'});continue
+            common['new_tree_root_id']=new_tree_root_id
             attempted=[e for e in existing if e['kind']==PREFIX+'ATTEMPTED']
             verified=[e for e in existing if e['kind']==PREFIX+'VERIFIED']
             if raw.get('trashed') is True:
@@ -200,7 +232,9 @@ def cleanup_run(journal,prepared,registry,workbook,factory,*,apply=False,protect
             if not apply:
                 output.append({'source_id':sid,'name':raw['name'],'state':'READY'});continue
             before_ref=journal.evidence(raw)
-            common.update(before_ref=before_ref,empty_listing_ref=journal.evidence({'parent_id':sid,'complete':True,'children':children}))
+            common.update(before_ref=before_ref,
+                ancestry_ref=journal.evidence({'root_id':new_tree_root_id,'chain':ancestry}),
+                empty_listing_ref=journal.evidence({'parent_id':sid,'complete':True,'children':children}))
             journal.append(PREFIX+'PREPARED',operation,payload=common)
             journal.append(PREFIX+'ATTEMPTED',operation,payload=common)
             error=None
@@ -224,8 +258,10 @@ def cleanup_run(journal,prepared,registry,workbook,factory,*,apply=False,protect
 
 
 def after_success(journal,prepared,registry,capture,factory,*,result,rollback,guard_reason,
-                  current_revision,protected_ids=()):
+                  current_revision,protected_ids=(),new_tree_root_id=None):
     """Only the successful just-completed batch, while its sheet is unchanged."""
+    if not prepared.get('revision_origin_ref'):
+        return {'state':'SKIPPED','reason':'EXPLICIT_REARCHITECTURE_REQUIRED','counts':{}}
     if rollback or guard_reason or not result.get('counts') or any(n and state not in
             {'APPLIED','TARGET','COMPLETE','UNCHANGED'} for state,n in result['counts'].items()):
         return {'state':'SKIPPED','reason':'RUN_NOT_SUCCESSFUL','counts':{}}
@@ -233,7 +269,8 @@ def after_success(journal,prepared,registry,capture,factory,*,result,rollback,gu
     except Exception:return {'state':'SKIPPED','reason':'WORKBOOK_REVISION_UNAVAILABLE','counts':{}}
     if revision!=capture['source_revision']:
         return {'state':'SKIPPED','reason':'WORKBOOK_CHANGED_AFTER_RUN','counts':{}}
-    return cleanup_run(journal,prepared,registry,capture,factory,apply=True,protected_ids=protected_ids)
+    return cleanup_run(journal,prepared,registry,capture,factory,apply=True,
+                       protected_ids=protected_ids,new_tree_root_id=new_tree_root_id)
 
 
 def main(argv=None):
@@ -255,7 +292,8 @@ def main(argv=None):
                 excluded_ids=excluded,apply=apply,audit_permissions=False,timeout=15)
         account=factory(set(c['anchor_paths'].values()),set(),set(c.get('excluded_ids',[])),False).get_account()
         if account['emailAddress'].casefold()!=c['expected_account'].casefold():raise SafetyError('AUTHENTICATED_ACCOUNT_MISMATCH')
-        result=cleanup_run(j,prepared,registry,workbook,factory,apply=args.apply,protected_ids=set(c['anchor_paths'].values())|set(c.get('excluded_ids',[])))
+        result=cleanup_run(j,prepared,registry,workbook,factory,apply=args.apply,
+            protected_ids=set(c['anchor_paths'].values())|set(c.get('excluded_ids',[])),new_tree_root_id=c.get('root_id'))
         if args.apply:
             backup=Path(c['backup_directory'])/('after-empty-parent-cleanup-'+uuid.uuid4().hex)
             with j.locked():j.backup(backup)

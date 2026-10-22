@@ -682,16 +682,20 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
             'destination_ids':[v for k,v in paths.items() if k==section or k.startswith(section+'/')],
             'destination_paths':{v:k for k,v in paths.items() if k==section or k.startswith(section+'/')},'retained_source_folder_ids':prepared['source_container_ids'],'source_folder_ids_left_in_place':prepared['source_container_ids']})
         entry.clear();entry.update(publication_spec=spec,destination_paths=paths);atomic_json(registry_path,registry)
-        # Only this successfully completed batch can retire its empty old parents.
+        # Only an explicit completed rearchitecture can retire its old parents.
         # Cleanup failures are separate from the already verified migration.
         cleanup_sequence=tip['seq']
-        try:
-            with timed_stage(report,'Clean up empty obsolete parents'):
-                finished['cleanup']=after_success(journal,prepared,registry,capture,factory,result=result,
-                    rollback=bool(rollback),guard_reason=guard.reason,current_revision=capture_client._revision,
-                    protected_ids=set(config['anchor_paths'].values())|set(config.get('excluded_ids',[])))
-        except Exception as exc:
-            finished['cleanup']={'state':'PENDING','error':str(exc),'counts':{}}
+        if not prepared.get('revision_origin_ref'):
+            finished['cleanup']={'state':'SKIPPED','reason':'EXPLICIT_REARCHITECTURE_REQUIRED','counts':{}}
+        else:
+            try:
+                with timed_stage(report,'Clean up empty obsolete parents'):
+                    finished['cleanup']=after_success(journal,prepared,registry,capture,factory,result=result,
+                        rollback=bool(rollback),guard_reason=guard.reason,current_revision=capture_client._revision,
+                        protected_ids=set(config['anchor_paths'].values())|set(config.get('excluded_ids',[])),
+                        new_tree_root_id=config.get('root_id'))
+            except Exception as exc:
+                finished['cleanup']={'state':'PENDING','error':str(exc),'counts':{}}
         with journal.locked():
             tip=journal.records()[-1]
             if tip['seq']!=cleanup_sequence:

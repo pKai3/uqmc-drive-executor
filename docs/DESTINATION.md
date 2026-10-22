@@ -462,8 +462,14 @@ is not live-tested until the operator runs it.
 
 ## Automatic empty-parent cleanup
 
-After a successful apply/resume, the destination command checks only old direct
-parents emptied by that exact sealed run. It processes nested candidates from
+Only after an explicitly requested rearchitecture (`--revision-manifest`) has
+successfully applied/resumed does the destination command check old direct
+parents emptied by that exact sealed revision. Normal migrations skip cleanup.
+Every candidate must be proven beneath the configured New File Structure
+`root_id` through fresh parent IDs; names and logical path prefixes are not
+containment evidence. The root itself is always protected. Missing, ambiguous,
+unavailable or outside-tree ancestry leaves the folder untouched.
+It processes nested candidates from
 children upward; it does not crawl for unrelated empty folders. Roots, exclusions,
 fresh planned destinations, active source assignments and other registered
 sections are protected. An explicitly retired/deleted proposal remains audit

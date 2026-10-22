@@ -34,17 +34,20 @@ class CleanupTests(unittest.TestCase):
             self.j.append('DESIRED_APPLIED','desired',payload={'source_id':'moved','plan_sha256':self.plan_hash,
                 'before_ref':self.j.evidence(self.before),'target_ref':self.j.evidence(self.after),'observed_ref':self.j.evidence(self.after)})
             metadata=self.j.evidence({'metadata':{'old':self.old,'moved':self.before,'root':raw('root','Root',[]),'new':raw('new','Year',['root'])}})
-            binding=self.j.evidence({'plan':plan,'manifest':{'items':[]},'workbook_export':self.workbook})
+            binding=self.j.evidence({'schema_version':'uqmc.destination.revision-frozen.v1',
+                'plan':plan,'manifest':{'items':[]},'workbook_export':self.workbook})
         self.prepared=dict(run_id='fixture-run',plan_sha256=self.plan_hash,section_id='section',source_metadata_ref=metadata,
             revision_origin_ref=binding,prior_destination_paths={'Section/Category':'old'},destination_paths={'Section':'root','Section/Year':'new'},excluded_ids=[])
         self.registry={'sections':[{'publication_spec':{'section_id':'section','destination_id':'root','destination_paths':{'old':'Section/Category','root':'Section'},'destination_ids':['root','old']},'destination_paths':{'Section':'root','Section/Category':'old'}}], 'runs':[self.prepared]}
-        self.files={'old':copy.deepcopy(self.old)};self.children=[];self.writes=[];self.mode=None
+        self.files={'old':copy.deepcopy(self.old),'root':raw('root','Any root label',[])};self.children=[];self.writes=[];self.mode=None
 
     def factory(self, allowed, mutations, excluded, apply):
         outer=self
         class Transport:
             def get_file(self,sid):
                 assert sid in allowed and sid not in excluded
+                if sid=='root' and outer.mode=='ancestry_unavailable':
+                    raise TransportError('DRIVE_REQUEST_TIMEOUT',outcome='READ_FAILED')
                 return copy.deepcopy(outer.files[sid])
             get_trash_candidate=get_file
             def list_children(self,sid):return copy.deepcopy(outer.children)
@@ -61,7 +64,8 @@ class CleanupTests(unittest.TestCase):
         return Transport()
 
     def run_cleanup(self,apply=True):
-        return cleanup_run(self.j,self.prepared,self.registry,self.workbook,self.factory,apply=apply,protected_ids={'root'})
+        return cleanup_run(self.j,self.prepared,self.registry,self.workbook,self.factory,apply=apply,
+                           protected_ids={'root'},new_tree_root_id='root')
 
     def test_preview_no_write_then_empty_verified_and_registry_history_preserved(self):
         seq=len(self.j.records());self.assertEqual(self.run_cleanup(False)['counts'],{'READY':1});self.assertEqual(len(self.j.records()),seq)
@@ -154,6 +158,60 @@ class TrashTransportTests(unittest.TestCase):
         self.assertEqual(service.calls[0][0],'files.get')
 
 class CleanupLifecycleTests(CleanupTests):
+    def set_old_parent(self,parents):
+        self.files['old']['parents']=parents
+        with self.j.locked():
+            metadata=self.j.read_evidence(self.prepared['source_metadata_ref'])
+            metadata['metadata']['old']['parents']=parents
+            self.prepared['source_metadata_ref']=self.j.evidence(metadata)
+
+    def test_nested_id_ancestry_proof_is_recorded(self):
+        self.set_old_parent(['middle'])
+        self.files['middle']=raw('middle','Unrelated display name',['root'])
+        self.assertEqual(self.run_cleanup()['counts'],{'TRASHED':1})
+        event=next(e for e in self.j.records() if e['kind']==PREFIX+'ATTEMPTED')
+        proof=self.j.read_evidence(event['payload']['ancestry_ref'])
+        self.assertEqual(proof['root_id'],'root')
+        self.assertEqual([x['id'] for x in proof['chain']],['old','middle','root'])
+
+    def test_same_logical_path_outside_new_root_does_not_authorize_trash(self):
+        self.set_old_parent(['other-root'])
+        self.files['other-root']=raw('other-root','New File Structure',[])
+        result=self.run_cleanup()
+        self.assertEqual(result['items'][0]['reason'],'PARENT_NOT_PROVEN_INSIDE_NEW_TREE')
+        self.assertFalse(self.writes)
+
+    def test_fresh_ancestor_location_overrides_old_snapshot_and_path_labels(self):
+        self.set_old_parent(['middle'])
+        with self.j.locked():
+            metadata=self.j.read_evidence(self.prepared['source_metadata_ref'])
+            metadata['metadata']['middle']=raw('middle','Section',['root'])
+            self.prepared['source_metadata_ref']=self.j.evidence(metadata)
+        self.files['middle']=raw('middle','Section',['other-root'])
+        self.files['other-root']=raw('other-root','New File Structure',[])
+        self.assertEqual(self.run_cleanup()['items'][0]['reason'],'PARENT_NOT_PROVEN_INSIDE_NEW_TREE')
+        self.assertFalse(self.writes)
+
+    def test_cycle_multiple_parents_and_unavailable_ancestry_never_trash(self):
+        self.set_old_parent(['old'])
+        with self.assertRaisesRegex(Exception,'CLEANUP_PARENT_CYCLE'):self.run_cleanup()
+        self.set_old_parent(['root','other'])
+        self.assertEqual(self.run_cleanup()['items'][0]['reason'],'PARENT_NOT_PROVEN_INSIDE_NEW_TREE')
+        self.set_old_parent(['root']);self.mode='ancestry_unavailable'
+        self.assertEqual(self.run_cleanup()['items'][0]['reason'],'NEW_TREE_ANCESTRY_UNAVAILABLE')
+        self.assertFalse(self.writes)
+
+    def test_configured_root_and_missing_root_are_protected(self):
+        result=cleanup_run(self.j,self.prepared,self.registry,self.workbook,self.factory,apply=True,new_tree_root_id='old')
+        self.assertEqual(result['candidate_count'],0)
+        result=cleanup_run(self.j,self.prepared,self.registry,self.workbook,self.factory,apply=True)
+        self.assertEqual(result['reason'],'NEW_TREE_ROOT_NOT_CONFIGURED');self.assertFalse(self.writes)
+
+    def test_direct_cleanup_cannot_bypass_explicit_revision_requirement(self):
+        self.prepared.pop('revision_origin_ref')
+        self.assertEqual(self.run_cleanup()['reason'],'EXPLICIT_REARCHITECTURE_REQUIRED')
+        self.assertFalse(self.writes)
+
     def test_restored_parent_is_observed_and_not_retrashed(self):
         self.run_cleanup();self.files['old']['trashed']=False
         self.assertEqual(self.run_cleanup()['counts'],{'RESTORED':1})
@@ -191,21 +249,24 @@ class CleanupLifecycleTests(CleanupTests):
         for counts,rollback,guard,revision in cases:
             with patch('uqmc_recovery.revision_cleanup.cleanup_run') as run:
                 result=after_success(self.j,self.prepared,self.registry,capture,self.factory,
-                    result={'counts':counts},rollback=rollback,guard_reason=guard,current_revision=revision)
+                    result={'counts':counts},rollback=rollback,guard_reason=guard,current_revision=revision,new_tree_root_id='root')
                 self.assertEqual(result['state'],'SKIPPED');run.assert_not_called()
 
-    def test_ordinary_success_uses_exact_frozen_plan_and_records_binding(self):
+    def test_ordinary_success_does_not_call_cleanup_or_fetch_sheet(self):
         from uqmc_recovery.revision_cleanup import after_success
+        from unittest.mock import Mock
         self.prepared.pop('revision_origin_ref')
         capture={**self.workbook,'source_revision':{'version':'1'}}
-        result=after_success(self.j,self.prepared,self.registry,capture,self.factory,
-            result={'counts':{'APPLIED':1}},rollback=False,guard_reason=None,current_revision=lambda:capture['source_revision'])
-        self.assertEqual(result['counts'],{'TRASHED':1})
-        self.assertIn('old',retired_parents(self.j))
+        factory=Mock(side_effect=AssertionError('No Drive reads for normal migration cleanup'))
+        refresh=Mock(side_effect=AssertionError('No sheet read for skipped cleanup'))
+        result=after_success(self.j,self.prepared,self.registry,capture,factory,
+            result={'counts':{'APPLIED':1}},rollback=False,guard_reason=None,current_revision=refresh,new_tree_root_id='root')
+        self.assertEqual(result['reason'],'EXPLICIT_REARCHITECTURE_REQUIRED')
+        factory.assert_not_called();refresh.assert_not_called();self.assertFalse(self.writes)
 
 
 class DestinationCleanupHookTests(unittest.TestCase):
-    def test_ordinary_hook_updates_backup_before_publication(self):
+    def test_ordinary_command_never_invokes_cleanup_hook(self):
         from unittest.mock import patch
         import test_destination_command as fixture
         f=fixture.DestinationCommandTests();f.setUp();self.addCleanup(f.doCleanups);f.mixed()
@@ -215,7 +276,7 @@ class DestinationCleanupHookTests(unittest.TestCase):
             return {'counts':{'SKIPPED':1},'items':[]}
         with patch('uqmc_recovery.revision_cleanup.after_success',side_effect=cleanup) as hook:
             result=f.run_command(apply=True)
-        hook.assert_called_once();self.assertEqual(result['cleanup']['counts'],{'SKIPPED':1})
+        hook.assert_not_called();self.assertEqual(result['cleanup']['reason'],'EXPLICIT_REARCHITECTURE_REQUIRED')
         self.assertEqual(result['journal_sequence'],len(Journal(f.config['store']).records()))
         self.assertEqual((Path(result['backup'])/'events.jsonl').read_bytes(),Journal(f.config['store']).path.read_bytes())
         self.assertEqual(len(f.publications),1)
