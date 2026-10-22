@@ -78,7 +78,9 @@ class HybridPlannerTests(unittest.TestCase):
         self.assertEqual(ops['Mnested']['target_parent_ids'], ['root'])
         self.assertEqual(ops['ROUTE/Rchild']['target_parent_ids'], ['root'])
         self.assertEqual(ops['Rchild']['depends_on_refs'], ['Mroot'])
-        self.assertEqual(ops['Rother']['depends_on_refs'], [])
+        # The new Year destination is inside root, so incoming work waits
+        # for root placement even though Year itself has no source operation.
+        self.assertEqual(ops['Rother']['depends_on_refs'], ['Mroot'])
 
     def test_unassigned_passenger_never_inherits_folder_scope(self):
         self.states['root']['subtree']['members'].append({'id':'unassigned'})

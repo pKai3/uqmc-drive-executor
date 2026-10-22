@@ -107,10 +107,19 @@ Explicit per-item routes, exclusions, and verified completion history take
 precedence. Only the requested destination subtree is expanded. Historical saved
 plans retain their original importer version and are not silently enlarged.
 
-A live child absent from both the proposal inventory and explicit routes stops
-with `WHOLE_SUBTREE_CHILD_MISSING_PROPOSAL_COVERAGE`; refresh its inventory mapping
-before starting a new batch. The command never guesses where a newly discovered
-identity belongs or silently counts an omitted child as completed.
+A live child absent from the proposal inventory and explicit routes stops with
+`WHOLE_SUBTREE_CHILD_MISSING_PROPOSAL_COVERAGE`. The exception is an exact folder
+ID allocated and verified in this journal during earlier destination preparation,
+whose current name, parent, stable creation key and currently approved path still
+match. Its unplanned contents remain blockers. This proves the destination's
+identity; it does not add source files or reuse an old execution approval.
+
+A smaller subtree may reuse an ancestor batch's verified destination identity
+only when its recorded logical path falls inside that subtree. The new batch
+still reads its own fresh proposal and binds its own approval. Incoming items
+wait for moving destination ancestors, including ancestors above generated child
+folders. Ordinary `--apply` recovers a failed preparation; no special mappings or
+recreation are needed. Preview without `--apply` is read-only.
 
 ## One-time local configuration
 

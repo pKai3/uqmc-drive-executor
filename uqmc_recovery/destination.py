@@ -166,6 +166,8 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
     if not preview:
         persist_retirements(journal,source)
     history=journal.records()
+    from .destination_recovery import load_created_folder_proofs_for_path
+    recovered=load_created_folder_proofs_for_path(journal,section)
     # A later blank cell does not reopen a durably excluded source/proposal.
     # Preserve the capture hash; these exclusions are separate journal authority.
     source['excluded_ids']=sorted(set(source['excluded_ids'])|{e['payload']['file_id'] for e in history if e['kind']=='EXCLUDED'}|retired_source_ids(history))
@@ -222,14 +224,15 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
         if known.get(parent_path) not in prior['parents'] or [known.get(parent_path)]!=prior['parents'] or name!=prior['name']:continue
         if not h['completed_fields']:continue
         cached[sid]=copy.deepcopy(baseline)
-    read_ids=ids-cached.keys()
+    if set(recovered) & excluded:raise SafetyError('EXCLUDED_RECOVERED_DESTINATION')
+    read_ids=(ids | set(recovered))-cached.keys()
     live=collect_metadata(read_ids,read,excluded_ids=excluded,workers=config.get('workers',10),progress=report,recursive_sources=False,read_cache=cache if preview else None,on_read=on_read if preview else None) if read_ids else {'raw':{},'listings':{},'metadata':{},'source_ids':[]}
     for sid,baseline in cached.items():
         raw_value=copy.deepcopy(baseline)
         for normalized,raw_key in {'mime_type':'mimeType','modified_time':'modifiedTime','md5_checksum':'md5Checksum','drive_id':'driveId'}.items():
             if normalized in raw_value:raw_value[raw_key]=raw_value.pop(normalized)
         live['raw'][sid]=raw_value;live['metadata'][sid]=normalize(raw_value)
-    live['source_ids']=sorted(ids);live['history_cached_source_ids']=sorted(cached);live['preview_cached_read_count']=reused_cache
+    live['source_ids']=sorted(ids | set(recovered));live['history_cached_source_ids']=sorted(cached);live['preview_cached_read_count']=reused_cache
     live=recursive_selected(live)
     report({'stage':'verified_history_skipped','identities':len(cached),'remaining_live_identities':len(read_ids),'preview_cached_reads_available':reused_cache})
     raw,listings,metadata=live['raw'],live['listings'],live['metadata']
@@ -268,10 +271,26 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
         if len(matches)!=1 or matches[0]['mimeType']!=FOLDER:raise SafetyError('DESTINATION_PARENT_MISSING_OR_AMBIGUOUS:'+path+'/'+segment)
         sid=matches[0]['id'];path=(path+'/' if path else '')+segment;folder(sid)
     paths={anchor:sid}
+    # A failed preparation can verify destination anchors before saving a run
+    # registry. Reuse only exact-ID observations corroborated by this capture;
+    # source folders still require the planner's intact-reuse proof.
+    recovery_anchors={}
+    for event in history:
+        value=event['payload'];folder_id=value.get('file_id');path=value.get('proposal_path')
+        if (event['kind']!='DESTINATION_VERIFIED' or value.get('section_id')!=section_key(section)
+                or folder_id in ids or folder_id not in metadata or not isinstance(path,str)
+                or not (path==section or path.startswith(section+'/'))):continue
+        current=metadata[folder_id]
+        if (current.get('id')!=folder_id or current.get('mime_type')!=FOLDER or current.get('trashed') is not False
+                or current['name']!=value.get('exact_name') or current['parents']!=value.get('parent_ids')):continue
+        if path in recovery_anchors and recovery_anchors[path]!=folder_id:
+            raise SafetyError('RECOVERY_DESTINATION_ANCHOR_AMBIGUOUS:'+path)
+        recovery_anchors[path]=folder_id
+    paths.update(recovery_anchors)
     for p,s in known.items():
         if p==section or p.startswith(section+'/'):
             folder(s);paths[p]=s
-    layout=plan_destination(source,section_path=section,metadata_by_id=metadata,anchor_paths=paths)
+    layout=plan_destination(source,section_path=section,metadata_by_id=metadata,anchor_paths=paths,recovered_folders=recovered)
     # Discover existing exact destination containers before considering creation.
     # Do not adopt an unrelated same-name file or collapse duplicate folders.
     allocated={e['payload']['key'] for e in journal.records() if e['kind']=='REQUIRED_FOLDER_ALLOCATED' and e['payload'].get('section_id')==section_key(section)}
@@ -312,7 +331,7 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
         if matches:
             found=matches[0]['id'];folder(found)
             paths[spec['logical_path']]=found
-            layout=plan_destination(source,section_path=section,metadata_by_id=metadata,anchor_paths=paths)
+            layout=plan_destination(source,section_path=section,metadata_by_id=metadata,anchor_paths=paths,recovered_folders=recovered)
     for logical,folder_id in layout['destination_paths'].items():
         if logical==anchor or folder_id in layout['reused_folder_ids']:continue
         expected_parent=layout['destination_paths'].get(logical_parent(logical))
@@ -360,7 +379,7 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
             for warning in check.get('warnings',[]):
                 report({'stage':'starting_name_warning','source_id':check['source_id'],**warning})
     return {'source':source,'capture':capture,'live':live,'layout':layout,'checks':checks,'excluded':excluded,
-            'semantic_selection':semantic_selection(source,section)}
+            'semantic_selection':semantic_selection(source,section),'recovered_folders':recovered}
 
 
 def import_blocked(manifest, report):
@@ -429,55 +448,67 @@ def freeze(config, section, journal, state, factory, run_dir, report):
         'approval_id':approval_id,'provenance_ref':instruction_ref,'access_policy':'SCOPED_INHERITANCE_ACCEPTED','folders':specs})
     created=prepare_required_folders(journal,factory,specs=missing,paths=paths,excluded_ids=state['excluded'],
         authority_ref=creation_ref,workers=config.get('workers',10),report=report)
-    for logical,raw in created.items():
-        paths[logical]=raw['id'];live['raw'][raw['id']]=raw;live['listings'][raw['id']]=[];metadata[raw['id']]=normalize(raw,[])
-    evidence_ref=journal.evidence({'metadata':live['raw'],'listings':live['listings'],'permission_audit':False,
-        'history_cached_source_ids':live.get('history_cached_source_ids',[])})
-    for logical,folder_id in paths.items():
-        if logical==logical_parent(section):continue
-        value=metadata[folder_id];parent_path=logical_parent(logical)
-        expected=layout['destination_folder_names'].get(logical,logical.rsplit('/',1)[-1])
-        if value['name']==expected and value['parents']==[paths[parent_path]]:
-            journal.append('DESTINATION_VERIFIED',payload={'section_id':sid,'file_id':folder_id,'exact_name':value['name'],
-                'parent_ids':value['parents'],'proposal_path':logical,'observed_ref':journal.evidence(value)})
-    mapping_ref=journal.evidence({'schema_version':'uqmc.section.destination-paths.v1','section_id':sid,
-        'input_sha256':state['source']['input_sha256'],'destination_paths':paths,'provenance_ref':evidence_ref})
-    prepared=build_hybrid_preparation(state['source'],section_path=section,section_id=sid,workbook_id=config['workbook_id'],
-        metadata_by_id=metadata,destination_paths=paths,destination_path_evidence_ref=mapping_ref,native_conversion_refs=native,extension_corrections=corrections)
-    p=prepared['projection']
-    owner={'schema_version':'uqmc.section.owner-approval.v1','decision':'APPROVED','actor':'user','approval_id':approval_id,'approved_at_utc':stamp,
-        'provenance':{'kind':'explicit_owner_instruction','evidence_reference':instruction_ref},'section_id':sid,'method_profile':p['method_profile'],
-        'projection_revision':p['projection_revision'],'projection_sha256':digest(p),'member_source_ids':[m['source_id'] for m in p['members']],
-        'operation_refs':prepared['selected_refs'],'allowed_actions':p['allowed_actions'],'allowed_destination_parent_ids':p['allowed_destination_parent_ids']}
-    result=import_section(journal,state['capture'],projection=p,owner_approval_ref=journal.evidence(owner),expected_section_id=sid,
-        expected_workbook_id=config['workbook_id'],batch_id=sid+'-'+uuid.uuid4().hex[:12],metadata_by_id=metadata,resolutions=prepared['resolutions'],
-        expected_method_profile='destination_hybrid',metadata_profile='AGENT_ASSISTED')
-    if result.plan is None:import_blocked(result.manifest,report)
-    plan=result.plan;register_agent_plan(journal,plan);bind_initial_section_source(journal,plan,state['capture'])
-    # Preserve original proposal/history; the new plan and mutation intent use
-    # the observed preimage so explicit rollback restores the actual starting name.
-    rename_records={r['source_id']:r for r in layout['records'] if r['action']=='RENAME'}
-    for check in state['checks']:
-        if check['disposition']!='READY':continue
-        for warning in check.get('warnings',[]):
-            record=rename_records[check['source_id']]
-            journal.append('SOURCE_NAME_DRIFT_ACCEPTED',payload={'source_id':check['source_id'],
-                'run_id':plan.run_id,'plan_sha256':plan.proposal_hash,'proposal_ref':record['reference'],
-                'proposal_row_sha256':record['row_sha256'],'workbook_input_sha256':state['source']['input_sha256'],
-                'observed_ref':journal.evidence(live['raw'][check['source_id']]),**warning})
-    allowed={o.file_id for o in plan.operations}|{s for o in plan.operations for s in o.before['parents']+o.target.get('parents',[])}
-    authorize(journal,plan,{s:metadata[s] for s in allowed},instruction_ref,section_id=sid)
-    plan_path=save_new(run_dir/'plan.json',plan.body())
-    pending=[x['source_id'] for x in state['checks'] if x['disposition']!='COMPLETE']
-    files=[s for s in prepared['source_ids'] if metadata[s]['mime_type']!=FOLDER]
-    output={'run_id':plan.run_id,'plan_sha256':plan.proposal_hash,'plan_path':plan_path,'section_path':section,'section_id':sid,
-        'selected_source_ids':pending,'allowed_ids':sorted(allowed),'excluded_ids':sorted(state['excluded']),
-        'destination_paths':paths,'semantic_selection':state['semantic_selection'],'source_revision':state['capture']['source_revision'],
-        'source_ids':files,'created_folder_keys':keys,'source_container_ids':layout['source_container_ids'],'instruction_ref':instruction_ref,
-        'source_metadata_ref':evidence_ref,'new_folder_count':len(missing),
-        'warnings':[{'source_id':x['source_id'],**w} for x in state['checks'] if x['disposition']=='READY' for w in x.get('warnings',[])],
-        'subtree_coverage_version':state['source'].get('subtree_coverage_version')}
-    save_new(run_dir/'prepared.json',output);return output
+    with journal.locked():
+        for logical,raw in created.items():
+            paths[logical]=raw['id'];live['raw'][raw['id']]=raw
+            live['listings'].setdefault(raw['id'],[]);metadata[raw['id']]=normalize(raw,live['listings'][raw['id']])
+        from .destination_recovery import load_created_folder_proofs_for_path
+        recovered=load_created_folder_proofs_for_path(journal,section)
+        # Fold our confirmed creations into membership evidence before import.
+        # Do not discard new children on restart by replacing a recovered listing.
+        for logical,raw in created.items():
+            parent=raw['parents'][0]
+            children=live['listings'].setdefault(parent,[])
+            if raw['id'] not in {c['id'] for c in children}:children.append(copy.deepcopy(raw))
+        live['source_ids']=sorted(set(live['source_ids']) | set(recovered))
+        recursive_selected(live)
+        evidence_ref=journal.evidence({'metadata':live['raw'],'listings':live['listings'],'permission_audit':False,
+            'history_cached_source_ids':live.get('history_cached_source_ids',[])})
+        for logical,folder_id in paths.items():
+            if logical==logical_parent(section):continue
+            value=metadata[folder_id];parent_path=logical_parent(logical)
+            expected=layout['destination_folder_names'].get(logical,logical.rsplit('/',1)[-1])
+            if value['name']==expected and value['parents']==[paths[parent_path]]:
+                journal.append('DESTINATION_VERIFIED',payload={'section_id':sid,'file_id':folder_id,'exact_name':value['name'],
+                    'parent_ids':value['parents'],'proposal_path':logical,'observed_ref':journal.evidence(value)})
+        mapping_ref=journal.evidence({'schema_version':'uqmc.section.destination-paths.v1','section_id':sid,
+            'input_sha256':state['source']['input_sha256'],'destination_paths':paths,'provenance_ref':evidence_ref})
+        prepared=build_hybrid_preparation(state['source'],section_path=section,section_id=sid,workbook_id=config['workbook_id'],
+            metadata_by_id=metadata,destination_paths=paths,destination_path_evidence_ref=mapping_ref,native_conversion_refs=native,extension_corrections=corrections,recovered_folders=recovered)
+        p=prepared['projection']
+        owner={'schema_version':'uqmc.section.owner-approval.v1','decision':'APPROVED','actor':'user','approval_id':approval_id,'approved_at_utc':stamp,
+            'provenance':{'kind':'explicit_owner_instruction','evidence_reference':instruction_ref},'section_id':sid,'method_profile':p['method_profile'],
+            'projection_revision':p['projection_revision'],'projection_sha256':digest(p),'member_source_ids':[m['source_id'] for m in p['members']],
+            'operation_refs':prepared['selected_refs'],'allowed_actions':p['allowed_actions'],'allowed_destination_parent_ids':p['allowed_destination_parent_ids']}
+        result=import_section(journal,state['capture'],projection=p,owner_approval_ref=journal.evidence(owner),expected_section_id=sid,
+            expected_workbook_id=config['workbook_id'],batch_id=sid+'-'+uuid.uuid4().hex[:12],metadata_by_id=metadata,resolutions=prepared['resolutions'],
+            expected_method_profile='destination_hybrid',metadata_profile='AGENT_ASSISTED')
+        if result.plan is None:import_blocked(result.manifest,report)
+        plan=result.plan;register_agent_plan(journal,plan);bind_initial_section_source(journal,plan,state['capture'])
+        # Preserve original proposal/history; the new plan and mutation intent use
+        # the observed preimage so explicit rollback restores the actual starting name.
+        rename_records={r['source_id']:r for r in layout['records'] if r['action']=='RENAME'}
+        for check in state['checks']:
+            if check['disposition']!='READY':continue
+            for warning in check.get('warnings',[]):
+                record=rename_records[check['source_id']]
+                journal.append('SOURCE_NAME_DRIFT_ACCEPTED',payload={'source_id':check['source_id'],
+                    'run_id':plan.run_id,'plan_sha256':plan.proposal_hash,'proposal_ref':record['reference'],
+                    'proposal_row_sha256':record['row_sha256'],'workbook_input_sha256':state['source']['input_sha256'],
+                    'observed_ref':journal.evidence(live['raw'][check['source_id']]),**warning})
+        allowed={o.file_id for o in plan.operations}|{s for o in plan.operations for s in o.before['parents']+o.target.get('parents',[])}
+        authorize(journal,plan,{s:metadata[s] for s in allowed},instruction_ref,section_id=sid)
+        plan_path=save_new(run_dir/'plan.json',plan.body())
+        pending=[x['source_id'] for x in state['checks'] if x['disposition']!='COMPLETE']
+        files=[s for s in prepared['source_ids'] if metadata[s]['mime_type']!=FOLDER]
+        output={'run_id':plan.run_id,'plan_sha256':plan.proposal_hash,'plan_path':plan_path,'section_path':section,'section_id':sid,
+            'selected_source_ids':pending,'allowed_ids':sorted(allowed),'excluded_ids':sorted(state['excluded']),
+            'destination_paths':paths,'semantic_selection':state['semantic_selection'],'source_revision':state['capture']['source_revision'],
+            'source_ids':files,'created_folder_keys':keys,'source_container_ids':layout['source_container_ids'],'instruction_ref':instruction_ref,
+            'source_metadata_ref':evidence_ref,'new_folder_count':len(missing),
+            'warnings':[{'source_id':x['source_id'],**w} for x in state['checks'] if x['disposition']=='READY' for w in x.get('warnings',[])],
+            'subtree_coverage_version':state['source'].get('subtree_coverage_version')}
+        save_new(run_dir/'prepared.json',output);return output
 
 
 class RevisionGuard:

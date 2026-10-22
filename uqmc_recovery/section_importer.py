@@ -780,9 +780,11 @@ def _hybrid_profile(journal, projection, members, operations, boundary, metadata
             return agent_parent_context(state)
         return normalize(state)
     normalized = {sid: normalize_entry(sid, state) for sid, state in metadata_by_id.items()}
+    from .destination_recovery import load_created_folder_proofs_for_path
+    recovered = load_created_folder_proofs_for_path(journal, section_path)
     rebuilt = build_hybrid_preparation(original, section_path=section_path,
         section_id=projection["section_id"], workbook_id=projection["workbook_id"],
-        metadata_by_id=normalized, destination_paths=paths,
+        metadata_by_id=normalized, destination_paths=paths, recovered_folders=recovered,
         destination_path_evidence_ref=projection["destination_path_evidence_ref"],
         native_conversion_refs={ref: operation["native_display_conversion_ref"]
             for ref, operation in operations.items() if operation.get("native_display_conversion_ref")},
@@ -958,7 +960,8 @@ def import_section(journal, export, *, projection, owner_approval_ref, expected_
                 if op.action == "MOVE":
                     for source_id in descendants & set(members):
                         expected_ancestors[source_id].add(ref)
-            if observed_scope != set(members) | support:
+            recovered_descendants = set(projection.get("recovered_descendant_ids", [])) if projection["method_profile"] == "destination_hybrid" else set()
+            if observed_scope != set(members) | support | recovered_descendants:
                 scope_reason = "SECTION_MEMBERSHIP_NOT_PROVEN_BY_COMPLETE_SCOPE"
             elif any(expected_ancestors[source_id] != set(member["ancestor_move_operation_refs"]) for source_id, member in members.items()):
                 scope_reason = "SECTION_INHERITED_MAPPING_MISMATCH"

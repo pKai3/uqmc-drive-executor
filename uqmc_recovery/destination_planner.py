@@ -276,7 +276,7 @@ def _reusable(sid, states, routes, blocked):
     return proof, None
 
 
-def plan_destination(source, *, section_path, metadata_by_id, anchor_paths):
+def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, recovered_folders=None):
     """Return exact routes, proved reuse, and required destinations.
 
     ``anchor_paths`` contains independently verified existing destinations,
@@ -301,18 +301,6 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths):
         if states[sid].get('id') != sid:
             raise SafetyError('SOURCE_ID_MISMATCH:' + sid)
         groups.setdefault(sid, {})[record['action']] = record
-    if source.get('subtree_coverage_version') == 1:
-        # Known explicit routes elsewhere and exclusions stay outside this scope.
-        # A truly new live identity needs a refreshed inventory mapping, never a
-        # silent partial-success claim or a guessed destination.
-        known = {r['source_id'] for r in source['records'].values()} | blocked | set(source.get('coverage_source_ids', []))
-        for sid, actions in groups.items():
-            move = actions.get('MOVE')
-            if (states[sid]['mime_type'] == FOLDER and move
-                    and str(move['row'].get('Scope', '')).lower().startswith('whole subtree')):
-                unknown = {m['id'] for m in states[sid].get('subtree', {}).get('members', [])} - known
-                if unknown:
-                    raise SafetyError('WHOLE_SUBTREE_CHILD_MISSING_PROPOSAL_COVERAGE:' + sid + ':' + ','.join(sorted(unknown)))
     aliases = _folder_aliases(source, groups, states, section)
     canonical_path = lambda path: _canonical_folder_path(path, aliases)
     required = {section}
@@ -375,6 +363,62 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths):
         if (path in names and path not in explicit_folder_name_paths
                 and state['name'].strip() == path.rsplit('/', 1)[-1].strip()):
             names[path] = state['name']
+    # Creation receipts are structural destination evidence, never invented
+    # source proposal rows. Bind them to current required paths and exact live
+    # identity/placement before admitting them into subtree coverage/reuse.
+    recovered = {}
+    recovered_paths = {}
+    for sid, proof in (recovered_folders or {}).items():
+        creation_section=proof.get('creation_section_path',section)
+        if not (section==creation_section or section.startswith(creation_section+'/')):
+            raise SafetyError('RECOVERED_DESTINATION_APPROVAL_SCOPE_CONFLICT:'+sid)
+        expected_keys={'folder:'+digest({'section_path':creation_section,'logical_path':p}):p for p in required}
+        path = expected_keys.get(proof.get('logical_key'))
+        if path is None:
+            raise SafetyError('RECOVERED_DESTINATION_PATH_NO_LONGER_APPROVED:' + sid)
+        state = metadata_by_id.get(sid)
+        if (sid in groups or sid in blocked or not state or state.get('id') != sid
+                or state.get('mime_type') != FOLDER or state.get('trashed') is not False
+                or state.get('name') != proof['name'] or state.get('name') != names[path]
+                or state.get('parents') != [proof['parent_id']]
+                or state.get('appProperties', {}).get('uqmcFolderKey') != proof['stable_key']):
+            raise SafetyError('RECOVERED_DESTINATION_METADATA_CONFLICT:' + sid)
+        if path in recovered_paths and recovered_paths[path] != sid:
+            raise SafetyError('RECOVERED_DESTINATION_PATH_IDENTITY_CONFLICT:' + path)
+        if path in paths and paths[path] != sid:
+            raise SafetyError('RECOVERED_DESTINATION_PATH_IDENTITY_CONFLICT:' + path)
+        recovered_paths[path] = sid
+        recovered[sid] = copy.deepcopy(proof)
+        states[sid] = copy.deepcopy(state)
+        routes[sid] = {'path': path, 'parent_path': logical_parent(path), 'exact_name': names[path]}
+    for path, sid in recovered_paths.items():
+        parent_path = logical_parent(path)
+        parent_id = recovered[sid]['parent_id']
+        # A reused source parent may itself still await its approved move.
+        # Its logical route must nevertheless be exact, and final reuse below
+        # must retain that same parent identity at this path.
+        expected_parent = recovered_paths.get(parent_path, paths.get(parent_path))
+        if expected_parent is None:
+            parent_route = routes.get(parent_id, {})
+            if parent_route.get('path') == parent_path and states[parent_id]['mime_type'] == FOLDER:
+                expected_parent = parent_id
+        if parent_id != expected_parent:
+            raise SafetyError('RECOVERED_DESTINATION_PARENT_PATH_CONFLICT:' + sid)
+    paths.update(recovered_paths)
+    if source.get('subtree_coverage_version') == 1:
+        known = ({r['source_id'] for r in source['records'].values()} | blocked
+                 | set(source.get('coverage_source_ids', [])) | set(recovered))
+        conflicts = []
+        for sid, actions in groups.items():
+            move = actions.get('MOVE')
+            if (states[sid]['mime_type'] == FOLDER and move
+                    and str(move['row'].get('Scope', '')).lower().startswith('whole subtree')):
+                unknown = {m['id'] for m in states[sid].get('subtree', {}).get('members', [])} - known
+                if unknown:conflicts.append(sid + ':' + ','.join(sorted(unknown)))
+        # Surface every available conflict in this capture instead of another
+        # expensive user retry for each parent.
+        if conflicts:
+            raise SafetyError('WHOLE_SUBTREE_CHILD_MISSING_PROPOSAL_COVERAGE:' + ';'.join(conflicts))
     proofs, reasons = {}, {}
     folders = {sid for sid in groups if states[sid]['mime_type'] == FOLDER}
     for sid in sorted(folders):
@@ -419,16 +463,20 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths):
             raise SafetyError('DESTINATION_FOLDER_NAME_COLLISION:' + path)
         occupants[key] = path
     for sid, route in sorted(routes.items()):
-        if sid in folders:
+        if sid in folders or sid in recovered:
             continue
         key = (route['parent_path'], route['exact_name'])
         if key in occupants:
             raise SafetyError('DESTINATION_EXACT_NAME_COLLISION:' + sid + ':' + str(occupants[key]))
         occupants[key] = sid
+    for path,sid in recovered_paths.items():
+        if resolved.get(logical_parent(path)) != recovered[sid]['parent_id']:
+            raise SafetyError('RECOVERED_DESTINATION_PARENT_REBOUND:' + sid)
     missing = [{'logical_key': 'folder:' + digest({'section_path': section, 'logical_path': p}),
                 'logical_path': p, 'folder_name': names[p], 'parent_path': logical_parent(p), 'kind': 'NEW_FOLDER_REQUIRED'}
                for p in sorted(required - resolved.keys(), key=lambda p: (p.count('/'), p))]
-    return {'records': records, 'item_routes': routes, 'destination_paths': resolved,
+    return {'records': records, 'item_routes': {sid:routes[sid] for sid in groups}, 'destination_paths': resolved,
+            'recovered_destination_folders': recovered,
             'destination_folder_names': names, 'missing_folders': missing,
             'reused_folder_ids': sorted(reuse), 'folder_reuse_proofs': reuse,
             'source_container_ids': sorted(containers),
@@ -440,9 +488,9 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths):
 
 def build_hybrid_preparation(source, *, section_path, section_id, workbook_id, metadata_by_id,
                              destination_paths, destination_path_evidence_ref,
-                             native_conversion_refs=None, extension_corrections=None):
+                             native_conversion_refs=None, extension_corrections=None, recovered_folders=None):
     """Build importer-compatible field operations, preserving true dependencies."""
-    layout = plan_destination(source, section_path=section_path, metadata_by_id=metadata_by_id, anchor_paths=destination_paths)
+    layout = plan_destination(source, section_path=section_path, metadata_by_id=metadata_by_id, anchor_paths=destination_paths, recovered_folders=recovered_folders)
     if layout['missing_folders']:
         raise SafetyError('DESTINATION_CREATION_OR_MAPPING_REQUIRED')
     containers = set(layout['source_container_ids'])
@@ -455,7 +503,19 @@ def build_hybrid_preparation(source, *, section_path, section_id, workbook_id, m
         if 'MOVE' not in actions:
             actions['MOVE'] = destination_route_record(actions['RENAME'])
     targets = {sid: [layout['destination_paths'][layout['item_routes'][sid]['parent_path']]] for sid in groups}
-    ordered, deps = _order_groups(groups, states, targets)
+    # An incoming item must wait for the placement of moving ancestors even
+    # when its immediate destination is a generated, non-source container.
+    dependency_targets={sid:list(parents) for sid,parents in targets.items()}
+    for sid in groups:
+        parent_path=layout['item_routes'][sid]['parent_path']
+        while parent_path in layout['destination_paths']:
+            ancestor=layout['destination_paths'][parent_path]
+            if ancestor in groups and states[ancestor]['mime_type']==FOLDER:
+                if ancestor==sid:raise SafetyError('TARGET_FOLDER_CYCLE')
+                if ancestor not in dependency_targets[sid]:dependency_targets[sid].append(ancestor)
+            if not parent_path:break
+            parent_path=logical_parent(parent_path)
+    ordered, deps = _order_groups(groups, states, dependency_targets)
     operations, resolutions, last_ref = [], {}, {}
     for sid in ordered:
         previous = [last_ref[p] for p in sorted(deps[sid])]
@@ -488,7 +548,7 @@ def build_hybrid_preparation(source, *, section_path, section_id, workbook_id, m
     for folder in layout['reused_folder_ids']:
         move_ref = groups[folder]['MOVE']['reference']
         for child in layout['folder_reuse_proofs'][folder]['descendant_ids']:
-            inherited[child].append(move_ref)
+            if child in inherited:inherited[child].append(move_ref)
     revision = 'hybrid:' + digest({'input': source['input_sha256'], 'section': section_path,
                                    'destinations': layout['destination_paths'], 'operations': operations})
     projection = {'schema_version': 'uqmc.destination.section.v1', 'section_id': section_id,
@@ -504,6 +564,11 @@ def build_hybrid_preparation(source, *, section_path, section_id, workbook_id, m
                   'members': [{'source_id': sid, 'direct_operation_refs': sorted(o['reference'] for o in operations if o['source_id'] == sid),
                                'ancestor_move_operation_refs': sorted(inherited[sid])} for sid in sorted(groups)],
                   'operations': operations}
+    if layout['recovered_destination_folders']:
+        projection['recovered_destination_folders'] = layout['recovered_destination_folders']
+        projection['recovered_descendant_ids'] = sorted(set(layout['recovered_destination_folders']) & {
+            child for sid in groups if states[sid]['mime_type'] == FOLDER
+            for child in (m['id'] for m in states[sid]['subtree']['members'])})
     if source.get('subtree_coverage_version') == 1:
         projection['subtree_coverage_version'] = 1
     return {'projection': projection, 'resolutions': resolutions, 'selected_refs': [o['reference'] for o in operations],
