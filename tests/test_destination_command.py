@@ -263,7 +263,8 @@ class DestinationCommandTests(unittest.TestCase):
         self.assertEqual(result['publication']['state'],'PENDING')
         before=list(self.server.requests)
         result=self.run_command(apply=True,resume=True)
-        self.assertEqual(result['counts'],{'TARGET':2},result)
+        self.assertEqual(result['counts'],{},result)
+        self.assertEqual(result['skipped_completed_items'],2)
         self.assertEqual(self.server.requests,before)
         self.assertEqual(result['publication']['state'],'VERIFIED')
 

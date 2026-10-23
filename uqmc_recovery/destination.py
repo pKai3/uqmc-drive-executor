@@ -85,7 +85,7 @@ def semantic_selection(source, section):
 
 
 def validate_resume_scope(source,section,prepared,journal):
-    """Do not re-enable a stored batch after source authority was removed."""
+    """Match the frozen source and retain explicit local revocation checks."""
     records=journal.records()
     excluded=effective_blocked_sources(source)|{e['payload']['file_id'] for e in records if e['kind']=='EXCLUDED'}|retired_source_ids(records)
     refs={e['payload']['proposal_ref'] for e in records if e['kind']=='PROPOSAL_EXCLUDED'}
@@ -531,24 +531,25 @@ def freeze(config, section, journal, state, factory, run_dir, report, *, revisio
         save_new(run_dir/'prepared.json',output);return output
 
 
-class RevisionGuard:
-    def __init__(self,capture,revision,report,interval=30):
-        self.capture,self.revision,self.report,self.interval=capture,revision,report,interval
-        self.last=time.monotonic();self.lock=threading.Lock();self.reason=None;self.error=None;self.runner=None
-    def __call__(self,event):
-        self.report(event)
-        with self.lock:
-            if self.runner is None or self.reason or time.monotonic()-self.last<self.interval:return
-            self.last=time.monotonic()
-            try:
-                if self.capture._revision()!=self.revision:self.reason='WORKBOOK_CHANGED_REFRESH_REQUIRED'
-            except Exception as exc:
-                from .direct_transport import TransportError
-                self.reason='WORKBOOK_REVISION_CHECK_UNAVAILABLE'
-                self.error=(exc.as_dict() if isinstance(exc,TransportError) else
-                    {'code':'WORKBOOK_REVISION_UNAVAILABLE','error_class':type(exc).__name__})
-            if self.reason:
-                self.runner.stop_requested=True;self.report({'stage':'scheduling_stopped','reason':self.reason,'request_error':self.error})
+def frozen_workbook(journal, prepared, plan, *, workbook_id, section):
+    """Recover the hash-bound approved capture, never substitute a live sheet."""
+    from .section_importer import validate_section_authority
+    with journal.locked():
+        authority = validate_section_authority(journal, plan)
+        if (not authority or authority['section_id'] != prepared['section_id'] or
+                prepared['section_path'] != section or prepared['plan_sha256'] != plan.proposal_hash):
+            raise SafetyError('SAVED_SNAPSHOT_AUTHORITY_MISMATCH')
+        origin = journal.read_evidence(authority['section_manifest_ref'])
+        if authority.get('refresh_snapshot_ref'):
+            refreshed = journal.read_evidence(authority['refresh_snapshot_ref'])
+            capture = journal.read_evidence(refreshed['capture_ref'])
+        elif 'workbook_export' in origin:
+            capture = origin['workbook_export']
+        else:
+            capture = journal.read_evidence(origin['workbook_import_ref'])['workbook_export']
+        if capture.get('workbook_id') != workbook_id:
+            raise SafetyError('SAVED_SNAPSHOT_WORKBOOK_MISMATCH')
+        return copy.deepcopy(capture)
 
 
 def run_destination(config,section,*,apply=False,resume=False,rollback=None,publish_only=None,
@@ -578,19 +579,22 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
             drive=GooglePublicationDrive(factory({config['viewer_file_id']},{config['viewer_file_id']},set(),True),config['viewer_file_id'],apply=True)
             return resume_publication(publish_only,sheet_capture=capture_client,drive=drive,apply=True,
                                       server_sync=config.get('server_sync'))
-        capture=capture_client.capture();source=catalog(capture,expected_workbook_id=config['workbook_id'],include_subtree_coverage=True,subtree_section_path=section)
-        if not apply:atomic_json(Path(config['run_directory'])/(section_key(section)+'-preview-workbook.json'),capture)
-        if verify_completed is not None:
-            if apply or resume or rollback:raise SafetyError('COMPLETED_SAMPLE_IS_READ_ONLY')
-            return verify_completed_sample(config,section,journal,source,factory,registry,verify_completed)
+        if verify_completed is not None and (apply or resume or rollback):
+            raise SafetyError('COMPLETED_SAMPLE_IS_READ_ONLY')
         old=[r for r in registry.get('runs',[]) if r['section_path']==section]
         prepared=None
         if rollback or resume:
             matches=[r for r in old if not rollback or r['run_id']==rollback]
             if not matches:raise SafetyError('NO_SAVED_DESTINATION_RUN_FOR_RECOVERY')
             prepared=matches[-1]
-            if prepared.get('subtree_coverage_version') != 1:
-                source=catalog(capture,expected_workbook_id=config['workbook_id'])
+            if not apply:
+                return {'section':section,'preview_only':True,'saved_run_id':prepared['run_id'],
+                        'selected_identities':len(prepared['selected_source_ids'])}
+            plan=plan_from_json(json.loads(Path(prepared['plan_path']).read_text()))
+            if plan.proposal_hash!=prepared['plan_sha256']:raise SafetyError('SAVED_PLAN_HASH_MISMATCH')
+            capture=frozen_workbook(journal,prepared,plan,workbook_id=config['workbook_id'],section=section)
+            source=catalog(capture,expected_workbook_id=config['workbook_id'],
+                include_subtree_coverage=prepared.get('subtree_coverage_version')==1,subtree_section_path=section)
             if not rollback:
                 validate_resume_scope(source,section,prepared,journal)
                 if prepared.get('revision_manifest'):
@@ -599,6 +603,14 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
                     if revision_manifest and digest(read_manifest(revision_manifest,source,section,config['workbook_id']))!=digest(bound):
                         raise SafetyError('RESUME_REVISION_MANIFEST_CHANGED')
                 elif revision_manifest:raise SafetyError('SAVED_RUN_IS_NOT_REVISION')
+            report({'stage':'frozen_batch_loaded','run_id':plan.run_id,'plan_sha256':plan.proposal_hash,
+                    'source_revision':capture.get('source_revision')})
+        else:
+            capture=capture_client.capture()
+            source=catalog(capture,expected_workbook_id=config['workbook_id'],include_subtree_coverage=True,subtree_section_path=section)
+            if not apply:atomic_json(Path(config['run_directory'])/(section_key(section)+'-preview-workbook.json'),capture)
+        if verify_completed is not None:
+            return verify_completed_sample(config,section,journal,source,factory,registry,verify_completed)
         def publish_current():
             try:
                 if publisher is not None:return publisher(registry)
@@ -658,7 +670,7 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
             required &= retired_parent_ids(journal)
             if required:raise SafetyError('ROLLBACK_REQUIRES_RESTORE_TRASHED_PARENTS:'+','.join(sorted(required)))
 
-        # Re-authorize only the exact stored plan after fresh resume mapping check.
+        # Re-authorize only the exact stored plan and its original approved capture.
         if resume or rollback:
             with journal.locked():
                 saved=journal.read_evidence(prepared['source_metadata_ref'])['metadata']
@@ -666,8 +678,9 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
                 authorize(journal,plan,{s:normalize(v,parent_context=s not in mutation_ids) for s,v in saved.items() if s in prepared['allowed_ids']},
                     prepared['instruction_ref'],section_id=prepared['section_id'])
         def client():return factory(set(prepared['allowed_ids']),set(prepared['selected_source_ids']),set(prepared['excluded_ids']),True)
-        guard=RevisionGuard(capture_client,capture['source_revision'],report,config.get('revision_check_seconds',30))
-        runner=DesiredRunner(journal,plan,client(),audit_permissions=False,progress=guard);guard.runner=runner
+        # Dispatch follows the frozen approved snapshot. Later sheet edits are
+        # input to the next batch, not changes to this run's instructions.
+        runner=DesiredRunner(journal,plan,client(),audit_permissions=False,progress=report)
         previous={}
         if threading.current_thread() is threading.main_thread():
             for sig in (signal.SIGINT,signal.SIGTERM):previous[sig]=signal.signal(sig,lambda *_:setattr(runner,'stop_requested',True))
@@ -688,7 +701,7 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
                 raise SafetyError('BACKUP_VERIFICATION_FAILED')
         finished={'section':section,'run_id':plan.run_id,'counts':result['counts'],'journal_sequence':tip['seq'],
             'backup':str(backup),'result_path':result_path,'exports':exports,'elapsed_seconds':round(time.monotonic()-started,3),
-            'revision_stop_reason':guard.reason,'revision_check_error':guard.error,
+            'revision_stop_reason':None,'revision_check_error':None,'plan_consistency':'FROZEN_APPROVED_SNAPSHOT',
             'skipped_completed_items':result.get('skipped_completed_items',0),
             'retained_post_completion_conflicts':result.get('retained_post_completion_conflicts',[]),
             'warnings':prepared.get('warnings',[])}
@@ -714,7 +727,7 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
             try:
                 with timed_stage(report,'Clean up empty obsolete parents'):
                     finished['cleanup']=after_success(journal,prepared,registry,capture,factory,result=result,
-                        rollback=bool(rollback),guard_reason=guard.reason,current_revision=capture_client._revision,
+                        rollback=bool(rollback),guard_reason=None,current_revision=capture_client._revision,
                         protected_ids=set(config['anchor_paths'].values())|set(config.get('excluded_ids',[])),
                         new_tree_root_id=config.get('root_id'))
             except Exception as exc:

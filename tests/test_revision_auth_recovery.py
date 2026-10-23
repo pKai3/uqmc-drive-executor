@@ -4,11 +4,9 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from test_desired_transport import Service
 from uqmc_recovery.direct_transport import GoogleDriveTransport, TransportError, METADATA_SCOPE
-from uqmc_recovery.destination import RevisionGuard
 
 
 class RevisionAuthRecoveryTests(unittest.TestCase):
@@ -60,22 +58,6 @@ class RevisionAuthRecoveryTests(unittest.TestCase):
         self.assertTrue(all(http.timeout==15 for http in clients))
         self.assertTrue(credentials.valid)
         self.assertNotIn('private',str(self.log.call_args_list))
-
-    def test_revision_guard_reports_safe_auth_context_and_stops_once(self):
-        error=TransportError('AUTH_REQUEST_TIMEOUT',request='oauth.refresh',read_attempts=3)
-        capture=SimpleNamespace(_revision=Mock(side_effect=error));reports=[]
-        guard=RevisionGuard(capture,{'version':'1'},reports.append,interval=0)
-        guard.runner=SimpleNamespace(stop_requested=False)
-        guard({'event':'tick'});guard({'event':'tick'})
-        self.assertTrue(guard.runner.stop_requested);self.assertEqual(capture._revision.call_count,1)
-        stopped=[r for r in reports if r.get('stage')=='scheduling_stopped']
-        self.assertEqual(len(stopped),1);self.assertEqual(stopped[0]['request_error'],error.as_dict())
-
-    def test_revision_guard_does_not_print_arbitrary_exception_text(self):
-        reports=[];guard=RevisionGuard(SimpleNamespace(_revision=Mock(side_effect=ValueError('private-token-value'))),{},reports.append,interval=0)
-        guard.runner=SimpleNamespace(stop_requested=False);guard({'event':'tick'})
-        self.assertNotIn('private-token-value',json.dumps(reports))
-        self.assertEqual(guard.error['error_class'],'ValueError')
 
     def test_refresh_retryable_status_has_one_send_per_attempt_and_no_resource_write(self):
         import httplib2

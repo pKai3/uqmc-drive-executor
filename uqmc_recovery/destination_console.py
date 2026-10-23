@@ -130,6 +130,8 @@ class ConsoleReporter:
                 self.line(f"Request failed for {concise(value.get('source_id', 'item'))}: {concise(error.get('code', 'UNKNOWN'))}. Checking current state before retry.")
             elif stage == "read_retry":
                 self.line(f"Read retry {value.get('attempt', '?')}: {concise(value.get('method', 'read'))}; {concise(value.get('reason', ''))}.")
+            elif stage == "frozen_batch_loaded":
+                self.line("Using the saved approved batch; later sheet edits apply to the next batch.")
             elif stage == "resume_selection":
                 self.line(f"Resume: skipping {value.get('skipped_completed_items', 0)} previously verified items; {value.get('queued_items', 0)} unfinished items queued.")
                 for warning in value.get('retained_post_completion_conflicts', []):

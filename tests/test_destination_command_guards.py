@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from test_importer import append_row
 from uqmc_recovery.destination import (read_and_plan, run_destination, semantic_selection,
-    validate_resume_scope, section_key, RevisionGuard)
+    validate_resume_scope, section_key)
 from uqmc_recovery.importer import HEADERS, WORKBOOK_ID, catalog
 from uqmc_recovery.journal import Journal
 from uqmc_recovery.model import FOLDER, SafetyError, digest
@@ -87,13 +87,6 @@ class DestinationCommandGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(SafetyError,'PENDING_PROPOSAL_CHANGED'):
             validate_resume_scope(self.source(),'Club/Skills',saved,self.journal)
 
-    def test_resume_checks_authority_before_plan_loading_or_mutation_transport(self):
-        saved=self.prepared();self.unrelated_no()
-        Path(self.config['registry']).write_text(json.dumps({'sections':[],'runs':[saved]}))
-        with patch('uqmc_recovery.destination.plan_from_json',side_effect=AssertionError('must not reach plan')),self.assertRaisesRegex(SafetyError,'RESUME_SOURCE_AUTHORITY_REMOVED'):
-            run_destination(self.config,'Club/Skills',apply=True,resume=True,capture_client=Capture(self.export),factory=self.factory)
-        self.assertFalse(any(c['enabled'] for c in self.clients))
-
     def test_rollback_without_apply_is_only_saved_run_preview(self):
         saved=self.prepared();Path(self.config['registry']).write_text(json.dumps({'sections':[],'runs':[saved]}))
         with patch('uqmc_recovery.destination.authorize',side_effect=AssertionError('must not authorize')):
@@ -134,18 +127,6 @@ class DestinationCommandGuardTests(unittest.TestCase):
         result=read_and_plan(self.config,logical,self.journal,self.export,self.factory,{'sections':[]},lambda e:None)
         self.assertNotIn('other',result['layout']['destination_paths'].values())
         self.assertEqual([x['logical_key'] for x in result['layout']['missing_folders']],[key])
-
-    def test_revision_change_stops_scheduling_without_mutation_or_refresh(self):
-        capture=Capture(self.export);reported=[]
-        guard=RevisionGuard(capture,{'version':'previous'},reported.append,interval=0)
-        class Runner:stop_requested=False
-        guard.runner=Runner()
-        guard({'stage':'fixture_progress'})
-        self.assertTrue(guard.runner.stop_requested)
-        self.assertEqual(guard.reason,'WORKBOOK_CHANGED_REFRESH_REQUIRED')
-        self.assertEqual(capture.calls,0)
-        self.assertEqual(reported[-1]['stage'],'scheduling_stopped')
-
 
     def test_durable_excluded_proposal_is_filtered_before_metadata_read(self):
         self.journal.append('PROPOSAL_EXCLUDED',payload={'proposal_ref':'R-file'})

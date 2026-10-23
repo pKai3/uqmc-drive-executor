@@ -150,8 +150,7 @@ are not literal IDs to paste:
   "identity_basis": "private/identity-basis.json",
   "viewer_file_id": "<original Drive HTML file ID>",
   "accepted_inherited_access": true,
-  "workers": 10,
-  "revision_check_seconds": 30
+  "workers": 10
 }
 ```
 
@@ -180,11 +179,12 @@ original captured cells even when preparation took more than five minutes; it
 does not change the capture time, hash, or imported approval. The separate
 revision-check evidence expires five minutes after that request starts. A
 changed revision or failed read stops binding and requires a fresh batch.
-A lightweight remote revision guard checks at most once per configured interval
-(default 30 seconds) during progress and stops new dispatch when it detects a
-changed or unavailable revision. Edits can occur between these periodic checks;
-the guard is not an atomic lock on the sheet. Already dispatched requests finish readback and journal their outcomes;
-then refresh/reconcile the affected work before continuing.
+Once approved and frozen, the batch executes that immutable snapshot. There is
+no mid-run workbook polling or stop caused by later sheet revisions or unavailable
+revision reads. Later sheet edits apply when a new batch is prepared. The legacy
+`revision_check_seconds` configuration setting is ignored. File identity,
+current-state checks, durable intent/readback and explicit local approval
+revocations remain enforced; a frozen batch grants no authority outside its scope.
 
 Completed effects are joined by stable file ID and skipped. If a later proposal
 changes a completed name or destination, the command reports separate proposed
@@ -215,8 +215,10 @@ Resume the latest saved run for the same destination:
 
 `--resume` is a flag, not a run ID. It selects the latest registered run whose
 canonical destination matches. Without `--apply` it only reports that saved run.
-An execution-relevant proposal change blocks resume; reconcile the old requests
-before starting a fresh batch. Resume indexes the validated journal once and
+Resume loads the original hash-bound plan and workbook evidence from the saved
+approval, even if the live sheet has changed or is unavailable. It does not refresh
+or replace that batch. Use a new ordinary `--apply` batch to adopt later edits,
+after resolving any unfinished requests. Resume indexes the validated journal once and
 queues only unfinished effects. An exact saved, verified target is skipped without
 re-reading that completed file. Unresolved requests, partial effects, rollback
 history and genuine identity/location conflicts remain in the recovery queue;
@@ -230,8 +232,8 @@ rename to run again. Rollback still checks the original applied state and will
 reject later edits. A timeout never proves that no write happened; pending
 requests are reconciled before any retry.
 
-Revision-read failures now retain sanitized request, HTTP/OAuth error code and
-attempt count in the log and result. Transient credential-refresh failures get at
+Read failures retain sanitized request, HTTP/OAuth error code and attempt count.
+Transient credential-refresh failures get at
 most three attempts with bounded jitter, using a fresh connection for each attempt
 and the existing 15-second socket timeout. Permanent grant failures stop promptly.
 The socket timeout is not a strict wall-clock deadline for the whole batch.
@@ -252,6 +254,13 @@ by a later move-only run therefore stays renamed when that later run rolls back.
 New destination folders are not deleted.
 
 ## Publication recovery
+
+Publication reads the current sheet separately after saving execution results.
+Its narrow status writes still check current cells and preserve human proposal
+edits. Publication failure leaves the completed batch intact and retryable; it
+never changes the frozen migration instructions. Rearchitecture cleanup can be
+skipped when the sheet changes, protecting newly planned destinations; this does
+not cancel completed migration effects.
 
 A file can already have its approved name and immediate parent while that parent
 still awaits a planned rename or move. Such descendants remain pending in section
