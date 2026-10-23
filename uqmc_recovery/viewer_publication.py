@@ -565,11 +565,40 @@ function appendDestinationDetails(panel,n){
 '''
 
 
+HEADING_CSS = """
+/* UQMC collapsed migration heading */
+.execution-summary > details > summary{cursor:pointer;padding:8px 0}
+.execution-summary > details > summary h2{display:inline}
+.execution-summary > details > summary:focus-visible{outline:2px solid currentColor;outline-offset:4px}
+"""
+
+
+def heading_sections(data):
+    """Hide redundant completed cards only; retain the full tree and history.
+
+    Resolve aliases to nodes and walk actual parent links. A sibling sharing a
+    text prefix is not an ancestor, and pending revisions cannot hide children.
+    """
+    entries = [(sec, resolve_folder_path(data, sec['path']))
+               for sec in data['execution_sections']['sections']]
+    def complete(sec):
+        return sec['status'] == 'COMPLETED' and sec.get('proposal_status') != 'PENDING_REVISION'
+    completed_roots = {root['i'] for sec, root in entries if complete(sec)}
+    visible = []
+    for sec, root in entries:
+        parent = root['p']
+        while parent >= 0 and parent not in completed_roots:
+            parent = data['nodes'][parent]['p']
+        if not complete(sec) or parent < 0:
+            visible.append(sec)
+    return visible
+
+
 def render(source, data):
     packed = base64.b64encode(gzip.compress(json.dumps(data, ensure_ascii=False, separators=(',', ':')).encode(), mtime=0)).decode()
     source = TREE.sub(lambda m: m.group(1) + packed + m.group(3), source, count=1)
     cards = []
-    for sec in data['execution_sections']['sections']:
+    for sec in heading_sections(data):
         mode = ('Existing folder moved; its identity was preserved.' if sec['mode'] == 'REUSED_MOVED' else 'Existing destination folder reused in place.' if sec['mode'] == 'REUSED_EXISTING' else f"{sec['created_folder_count']} destination folders created; original source folders left in place.")
         retired_note = (f" {sec['retired_file_count']} retired (user-confirmed deleted; not migrated)."
                         if sec.get('retired_file_count') else '')
@@ -577,11 +606,13 @@ def render(source, data):
                          if sec.get('policy_excluded_file_count') else '')
         pending_note = (f" Proposed revision pending for {sec['proposal_pending_file_count']} files; counts below describe the previous verified layout." if sec.get('proposal_status') == 'PENDING_REVISION' else '')
         cards.append('<article class="migration-card"><h3>' + html.escape(sec['title']) + '</h3><p><strong>' + html.escape('Revision pending' if pending_note else sec['status'].title()) + '</strong>' + html.escape(pending_note) + ' · ' + str(sec['completed_file_count']) + '/' + str(sec['expected_file_count']) + ' active files verified.' + html.escape(retired_note + excluded_note) + '</p><p>' + html.escape(mode) + '</p><a target="_blank" rel="noopener noreferrer" href="' + html.escape(folder_link(sec['destination_url']), quote=True) + '">Open actual destination ↗</a></article>')
-    section = START + '<section class="execution-summary" aria-label="Migrated destination folders"><h2>Migrated destination folders</h2><p>Verified destination status from journal checkpoint ' + str(data['execution']['journal_sequence']) + '. Other folders show partial or not-started status in the tree. This is a static snapshot.</p><div class="migration-cards">' + ''.join(cards) + '</div></section>' + END
+    section = START + '<section class="execution-summary" aria-label="Migrated destination folders"><details class="migration-heading"><summary><h2>Migrated destination folders</h2></summary><p>Verified destination status from journal checkpoint ' + str(data['execution']['journal_sequence']) + '. Other folders show partial or not-started status in the tree. This is a static snapshot.</p><div class="migration-cards">' + ''.join(cards) + '</div></details></section>' + END
     if START in source:
         source = re.sub(re.escape(START) + '.*?' + re.escape(END), lambda _: section, source, flags=re.S)
     else:
         source = source.replace('<section class="execution-summary"', section + '<section class="execution-summary"', 1)
+    if '/* UQMC collapsed migration heading */' not in source:
+        source = source.replace('</style>', HEADING_CSS + '</style>', 1)
     if '/* UQMC destination execution overlay */' not in source:
         source = source.replace('</style>', CSS + '</style>', 1)
     if 'function folderMigrationBadge(' in source:
