@@ -66,7 +66,7 @@ class DestinationPreviewCacheTests(unittest.TestCase):
 
     def test_transient_read_stops_at_two_and_permanent_403_is_not_retried(self):
         original=self.server.factory
-        for code,status,expected in [('DRIVE_REQUEST_TIMEOUT',None,2),('DRIVE_HTTP_ERROR',403,1)]:
+        for code,status,expected,handled in [('DRIVE_REQUEST_TIMEOUT',None,2,None),('DRIVE_HTTP_ERROR',403,1,None),('DRIVE_REQUEST_TIMEOUT',None,1,3)]:
             with self.subTest(code=code,status=status):
                 attempts=[];self.progress.clear()
                 def factory(allowed,mutations,excluded,enabled,**kwargs):
@@ -75,7 +75,7 @@ class DestinationPreviewCacheTests(unittest.TestCase):
                     def fail(sid):
                         if sid=='old-parent':
                             attempts.append(sid)
-                            raise TransportError(code,status=status,request='files.list',item_id=sid)
+                            raise TransportError(code,status=status,request='files.list',item_id=sid,read_attempts=handled)
                         return listing(sid)
                     client.list_children=fail
                     return client

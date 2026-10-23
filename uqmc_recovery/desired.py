@@ -206,7 +206,7 @@ class DesiredRunner:
             try:
                 return fetch()
             except Exception as exc:
-                if not self.transient(exc) or attempt == self.max_attempts:
+                if getattr(exc, "read_attempts", None) is not None or not self.transient(exc) or attempt == self.max_attempts:
                     raise
                 self.backoff(attempt)
 

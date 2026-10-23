@@ -219,7 +219,7 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
             for attempt in (1,2):
                 try:return getattr(self.client,method)(sid)
                 except TransportError as exc:
-                    if attempt==2 or not exc.transient:raise
+                    if attempt==2 or exc.read_attempts is not None or not exc.transient:raise
                     report({'stage':'read_retry','method':method,'source_id':sid,'attempt':2,'reason':exc.code})
         def get_file(self,sid):return self.call('get_file',sid)
         def list_children(self,sid):return self.call('list_children',sid)

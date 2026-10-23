@@ -15,6 +15,11 @@ https://googleapis.dev/python/google-auth-httplib2/latest/google_auth_httplib2.h
 from __future__ import annotations
 
 import copy
+import errno
+import http.client
+import logging
+import random
+import time
 import json
 from pathlib import Path
 from urllib.parse import quote, quote_plus
@@ -27,6 +32,9 @@ FULL_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 METADATA_SCOPE = "https://www.googleapis.com/auth/drive.metadata"
 READONLY_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
 DEFAULT_REQUEST_TIMEOUT = 15
+READ_MAX_ATTEMPTS = 3
+_RETRYABLE_READS = frozenset({'files.get', 'files.list', 'about.get', 'permissions.list'})
+_LOG = logging.getLogger(__name__)
 FILE_FIELDS = (
     "id,name,mimeType,parents,modifiedTime,version,trashed,size,md5Checksum,"
     "owners,driveId,capabilities,permissions,shortcutDetails,appProperties,"
@@ -93,10 +101,11 @@ def _single_send_http_class(base):
 class TransportError(SafetyError):
     """Safe code plus bounded, redacted structured provider diagnostics."""
 
-    def __init__(self, code, *, status=None, outcome="NOT_DISPATCHED", request=None, item_id=None, provider_error=None):
+    def __init__(self, code, *, status=None, outcome="NOT_DISPATCHED", request=None, item_id=None, provider_error=None, read_attempts=None):
         self.code, self.status, self.outcome = code, status, outcome
         self.request, self.item_id = request, item_id
         self.provider_error = copy.deepcopy(provider_error)
+        self.read_attempts = read_attempts
         context = (":" + request if request else "") + (":" + item_id if item_id else "")
         super().__init__(code + (f":HTTP_{status}" if status is not None else "") + context)
 
@@ -106,6 +115,8 @@ class TransportError(SafetyError):
             result["request"] = self.request
         if self.item_id is not None:
             result["item_id"] = self.item_id
+        if self.read_attempts is not None:
+            result["read_attempts"] = self.read_attempts
         if self.provider_error:
             result["provider_error"] = copy.deepcopy(self.provider_error)
         return result
@@ -136,6 +147,24 @@ def _is_timeout(error):
             getattr(current, "__context__", None), *getattr(current, "args", ()))
             if isinstance(x, BaseException))
     return False
+
+
+
+def _transient_read(error, failure):
+    if failure.status is not None:
+        return failure.transient
+    if _is_timeout(error) or isinstance(error, (ConnectionError, http.client.BadStatusLine,
+                                               http.client.IncompleteRead, http.client.ResponseNotReady)):
+        return True
+    if isinstance(error, OSError) and error.errno in {
+            errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNABORTED, errno.ECONNREFUSED,
+            errno.EPIPE, errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH}:
+        return True
+    try:
+        from httplib2 import ServerNotFoundError
+    except ImportError:
+        return False
+    return isinstance(error, ServerNotFoundError)
 
 
 def _is_rate_limit_403(error, status):
@@ -274,21 +303,39 @@ class GoogleDriveTransport:
             raise TransportError("AUTH_REFRESH_FAILED") from None
 
     def _read(self, factory, *, request, item_id=None):
+        # Authentication/factory errors and unlisted operations never enter the
+        # safe-read backoff loop. Writes still have their separate single send.
         self._ready(item_id=item_id)
-        try:
-            # Surface timeouts/refusals promptly. Only the HTTP stale-socket
-            # GET/HEAD retry is allowed below this layer; no request backoff.
-            result = factory().execute(num_retries=0)
-        except Exception as error:
-            raise _failure(error, dispatched=False, request=request, item_id=item_id, secret_values=self._secret_values) from None
-        if not isinstance(result, dict):
-            raise TransportError("INVALID_DRIVE_RESPONSE", outcome="READ_FAILED")
-        return result
+        managed = request in _RETRYABLE_READS
+        attempts = READ_MAX_ATTEMPTS if managed else 1
+        for attempt in range(1, attempts + 1):
+            call = factory()
+            try:
+                result = call.execute(num_retries=0)
+            except Exception as error:
+                failure = _failure(error, dispatched=False, request=request,
+                    item_id=item_id, secret_values=self._secret_values)
+                if managed:
+                    # Outer preflight/runner loops must not multiply this budget,
+                    # including when this policy rejects a non-network failure.
+                    failure.read_attempts = attempt
+                if attempt == attempts or not _transient_read(error, failure):
+                    raise failure from None
+                delay = random.uniform(2 ** (attempt - 1), 2 ** attempt)
+                _LOG.warning('Retrying %s%s after %s; attempt %d/%d in %.2fs',
+                    request, ':' + item_id if item_id else '', failure.code,
+                    attempt + 1, attempts, delay)
+                time.sleep(delay)
+                continue
+            if not isinstance(result, dict):
+                raise TransportError('INVALID_DRIVE_RESPONSE', outcome='READ_FAILED')
+            return result
 
     def get_file(self, file_id):
         file_id = self._guard(file_id)
         response_headers = {}
         def request():
+            response_headers.clear()  # Never retain an ETag from a failed read.
             value = self.service.files().get(
                 fileId=file_id, fields=self.file_fields, supportsAllDrives=True)
             if hasattr(value, "add_response_callback"):

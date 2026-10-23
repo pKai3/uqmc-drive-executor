@@ -344,10 +344,18 @@ retransfer. Do not delete receipts to bypass a conflict or stale-publication gua
 The runner uses ten workers by default, independent HTTP transports, serialized
 durable journal writes and one process writer lock. Folder dependencies and
 same-name collision guards constrain parallel work. Each HTTP request has the
-existing 15-second socket timeout per attempt. A stale-socket GET/HEAD may
-retry once; writes still allow only one transport send. This is not a strict wall-clock deadline for
-a complete multi-request item or batch. Transient retries are bounded and follow
-fresh reads. Cancellation stops new dispatch while retaining in-flight outcomes.
+existing 15-second socket timeout per attempt. Drive metadata/account reads and
+individual listing pages get at most three attempts on transient transport errors,
+408/429/500/502/503/504, or structured rate-limit 403s. Backoff is 1–2 seconds,
+then 2–4 seconds (jittered); retry messages include request/item context. Permission
+denials, 404s, invalid responses and authentication failures are not retried by
+this policy. Failed pages retry without repeating already completed pages.
+The existing stale-socket GET/HEAD retry can send twice per attempt, so the
+upper bound is six network sends per read/page, not a strict 45-second deadline.
+Outer preflight/runner loops do not multiply this budget. Writes still allow
+only one transport send; ambiguous outcomes require fresh-state reconciliation
+before any runner retry. Cancellation stops new dispatch while retaining
+in-flight outcomes.
 
 Drive clients outside this program are not locked. Fresh checks reduce races but
 are not an atomic compare-and-swap guarantee; the program does not claim

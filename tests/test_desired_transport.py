@@ -60,6 +60,12 @@ def transport(*values, apply=True, headers=None, secret_values=None):
 
 
 class DesiredTransportTests(unittest.TestCase):
+    def setUp(self):
+        sleeper=patch('uqmc_recovery.direct_transport.time.sleep')
+        sleeper.start();self.addCleanup(sleeper.stop)
+        logger=patch('uqmc_recovery.direct_transport._LOG.warning')
+        logger.start();self.addCleanup(logger.stop)
+
     def test_permission_audit_off_uses_narrow_metadata_and_never_lists_grants(self):
         service = Service({"id": "file-a"}, {"id": "file-a"})
         t = GoogleDriveTransport(service, apply=True, allowed_ids={"file-a"}, audit_permissions=False)
@@ -112,7 +118,7 @@ class DesiredTransportTests(unittest.TestCase):
             self.assertEqual(args["q"], "'parent-a' in parents and trashed = false")
         self.assertEqual([call["retries"] for call in service.executions], [0, 0])
 
-    def test_real_client_loader_wires_15_seconds_and_surfaces_timeout_without_replay(self):
+    def test_real_client_loader_wires_15_seconds_with_bounded_reads_and_no_write_replay(self):
         try:
             from google.oauth2.credentials import Credentials
         except ImportError:
@@ -146,7 +152,7 @@ class DesiredTransportTests(unittest.TestCase):
                     self.assertEqual(error.outcome, outcome)
                     self.assertTrue(error.transient)
                     self.assertNotIn("private provider text", str(error))
-                    self.assertEqual(network.call_count, 1)
+                    self.assertEqual(network.call_count, 1 if request == "files.update" else 3)
 
     def test_wrapped_auth_timeout_retains_context_without_dispatch(self):
         def refresh():
@@ -251,7 +257,8 @@ class DesiredTransportTests(unittest.TestCase):
                     body = {"error": {"code": 403, "message": "provider secret",
                         "errors": [{"reason": reason, "message": "provider secret"} for reason in reasons]}}
                     error = HttpError(httplib2.Response({"status": "403"}), json.dumps(body).encode(), uri="https://secret.invalid")
-                    t, service = transport(error, secret_values=lambda: ("provider secret",))
+                    attempts = 3 if transient and not write else 1
+                    t, service = transport(*([error] * attempts), secret_values=lambda: ("provider secret",))
                     with self.assertRaises(TransportError) as caught:
                         if write:
                             t.update_metadata({"fileId": "file-a", "name": "approved.pdf"})
@@ -264,8 +271,8 @@ class DesiredTransportTests(unittest.TestCase):
                     self.assertEqual(actual.outcome, "UNKNOWN" if write else "READ_FAILED")
                     self.assertNotIn("secret", str(actual))
                     self.assertNotIn("secret", json.dumps(actual.as_dict()))
-                    self.assertEqual(len(service.executions), 1)
-                    self.assertEqual(service.executions[0]["retries"], 0)
+                    self.assertEqual(len(service.executions), attempts)
+                    self.assertTrue(all(x["retries"] == 0 for x in service.executions))
 
     def test_rate_limit_classification_does_not_guess_from_text_or_malformed_body(self):
         bodies = (b"rateLimitExceeded", b"not-json", b"[]", b'{"error": []}',
