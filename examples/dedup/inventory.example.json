@@ -1,0 +1,186 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "source": "fixture-export",
+    "reference": "Synthetic metadata fixture only",
+    "captured_at": "2026-10-21T00:00:00Z"
+  },
+  "scope": {
+    "label": "Synthetic example root; not a live Drive inventory",
+    "complete": false
+  },
+  "files": [
+    {
+      "id": "synthetic-binary-a",
+      "name": "Synthetic evidence.pdf",
+      "mimeType": "application/pdf",
+      "version": "1",
+      "parents": [
+        "synthetic-root"
+      ],
+      "current_scope": "Synthetic example root",
+      "labels": [
+        "audit"
+      ],
+      "size": "33",
+      "sha256Checksum": "6853d480d82a5e46cb88bd618cf220df7bde91ce3fba29507dd43f9bb490842b"
+    },
+    {
+      "id": "synthetic-binary-b",
+      "name": "Copy of Synthetic evidence.pdf",
+      "mimeType": "application/pdf",
+      "version": "1",
+      "parents": [
+        "synthetic-root"
+      ],
+      "current_scope": "Synthetic example root",
+      "labels": [
+        "working"
+      ],
+      "size": "33",
+      "sha256Checksum": "6853d480d82a5e46cb88bd618cf220df7bde91ce3fba29507dd43f9bb490842b"
+    },
+    {
+      "id": "synthetic-trip-a",
+      "name": "Trip plan",
+      "mimeType": "application/vnd.google-apps.document",
+      "version": "1",
+      "parents": [
+        "synthetic-trip-weekend-a"
+      ],
+      "current_scope": "Synthetic weekend A",
+      "labels": [
+        "repeated-trip-plan"
+      ]
+    },
+    {
+      "id": "synthetic-trip-b",
+      "name": "Trip plan",
+      "mimeType": "application/vnd.google-apps.document",
+      "version": "1",
+      "parents": [
+        "synthetic-trip-weekend-b"
+      ],
+      "current_scope": "Synthetic weekend B",
+      "labels": [
+        "repeated-trip-plan"
+      ]
+    },
+    {
+      "id": "synthetic-native-a",
+      "name": "Synthetic annual report",
+      "mimeType": "application/vnd.google-apps.document",
+      "version": "1",
+      "parents": [
+        "synthetic-root"
+      ],
+      "current_scope": "Synthetic example root",
+      "labels": [
+        "certified"
+      ]
+    },
+    {
+      "id": "synthetic-native-b",
+      "name": "Copy of Synthetic annual report",
+      "mimeType": "application/vnd.google-apps.document",
+      "version": "1",
+      "parents": [
+        "synthetic-root"
+      ],
+      "current_scope": "Synthetic example root",
+      "labels": [
+        "working"
+      ]
+    },
+    {
+      "id": "synthetic-shortcut-a",
+      "name": "Link to Synthetic annual report",
+      "mimeType": "application/vnd.google-apps.shortcut",
+      "version": "1",
+      "parents": [
+        "synthetic-root"
+      ],
+      "current_scope": "Synthetic example root",
+      "labels": [],
+      "shortcutDetails": {
+        "targetId": "synthetic-native-a"
+      }
+    },
+    {
+      "id": "synthetic-shortcut-b",
+      "name": "Another link to Synthetic annual report",
+      "mimeType": "application/vnd.google-apps.shortcut",
+      "version": "1",
+      "parents": [
+        "synthetic-root"
+      ],
+      "current_scope": "Synthetic example root",
+      "labels": [],
+      "shortcutDetails": {
+        "targetId": "synthetic-native-a"
+      }
+    },
+    {
+      "id": "synthetic-link-a",
+      "name": "Synthetic reference A",
+      "mimeType": "application/vnd.google-apps.document",
+      "version": "1",
+      "parents": [
+        "synthetic-root"
+      ],
+      "current_scope": "Synthetic example root",
+      "labels": [],
+      "webViewLink": "https://drive.google.com/file/d/synthetic-linked-target/view"
+    },
+    {
+      "id": "synthetic-link-b",
+      "name": "Synthetic reference B",
+      "mimeType": "application/vnd.google-apps.document",
+      "version": "1",
+      "parents": [
+        "synthetic-root"
+      ],
+      "current_scope": "Synthetic example root",
+      "labels": [],
+      "webViewLink": "https://drive.google.com/file/d/synthetic-linked-target/view"
+    },
+    {
+      "id": "synthetic-withdrawn",
+      "name": "Synthetic excluded item",
+      "mimeType": "application/vnd.google-apps.document",
+      "version": "1",
+      "parents": [
+        "synthetic-root"
+      ],
+      "current_scope": "Synthetic example root",
+      "labels": []
+    },
+    {
+      "id": "synthetic-withdrawn-shortcut",
+      "name": "Link to synthetic excluded item",
+      "mimeType": "application/vnd.google-apps.shortcut",
+      "version": "1",
+      "parents": [
+        "synthetic-root"
+      ],
+      "current_scope": "Synthetic example root",
+      "labels": [],
+      "shortcutDetails": {
+        "targetId": "synthetic-withdrawn"
+      }
+    },
+    {
+      "id": "synthetic-native-a",
+      "name": "Synthetic annual report",
+      "mimeType": "application/vnd.google-apps.document",
+      "version": "1",
+      "parents": [
+        "synthetic-root"
+      ],
+      "current_scope": "Synthetic example root",
+      "labels": [
+        "certified"
+      ]
+    }
+  ]
+}

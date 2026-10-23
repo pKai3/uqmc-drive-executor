@@ -6,6 +6,7 @@
 /journals/
 /backups/
 /receipts/
+/reports/
 /exports/
 /artifacts/
 /test-artifacts/
@@ -14,6 +15,13 @@
 *.sqlite*
 *.db
 *.log
+
+# Offline deduplication runtime inputs and reports, wherever they are written.
+*.dedup-inventory.json
+*.dedup-hashes.json
+*.dedup-ignore.json
+*.dedup-report.json
+*.dedup-report.csv
 
 # Credentials and local configuration.
 /secrets/

@@ -4,6 +4,21 @@ The current standalone workflow is [Run one destination section](docs/DESTINATIO
 
 The sections below retain the original fixture and agent-handoff interfaces. Their disabled-live defaults and legacy retry rules do not describe the current destination CLI; use the destination guide for preview, apply, resume, explicit rollback and publication recovery.
 
+## Offline duplicate review
+
+The independent [deduplication report CLI](docs/deduplication.md) compares exported
+metadata and optional supplied hashes without contacting Drive or reading document
+bodies. It separates trusted binary checksum matches, name/content candidates and
+identity references, requires a private exclusion policy, and writes private JSON
+and CSV reports. Native-file exports never establish full equivalence; every
+finding requires manual review and preserves distinct version and usage context.
+
+```sh
+python3 -m uqmc_recovery.dedup --inventory examples/dedup/inventory.example.json --ignore-config examples/dedup/ignore.example.json --hashes examples/dedup/hashes.example.json --output-dir private/dedup-demo
+```
+
+This example uses synthetic data only. Use a new output directory for each run.
+
 ## Run locally
 
 Python 3.11+ and the standard library are sufficient; no installation or network is required.

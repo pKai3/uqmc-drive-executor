@@ -1,0 +1,11 @@
+{
+  "excluded_ids": [],
+  "withdrawn_ids": [
+    "synthetic-withdrawn"
+  ],
+  "denied_source_ids": [],
+  "trusted_checksum_sources": [
+    "fixture-export",
+    "fixture-hashes"
+  ]
+}
