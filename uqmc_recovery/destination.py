@@ -534,7 +534,7 @@ def freeze(config, section, journal, state, factory, run_dir, report, *, revisio
 class RevisionGuard:
     def __init__(self,capture,revision,report,interval=30):
         self.capture,self.revision,self.report,self.interval=capture,revision,report,interval
-        self.last=time.monotonic();self.lock=threading.Lock();self.reason=None;self.runner=None
+        self.last=time.monotonic();self.lock=threading.Lock();self.reason=None;self.error=None;self.runner=None
     def __call__(self,event):
         self.report(event)
         with self.lock:
@@ -542,9 +542,13 @@ class RevisionGuard:
             self.last=time.monotonic()
             try:
                 if self.capture._revision()!=self.revision:self.reason='WORKBOOK_CHANGED_REFRESH_REQUIRED'
-            except Exception:self.reason='WORKBOOK_REVISION_CHECK_UNAVAILABLE'
+            except Exception as exc:
+                from .direct_transport import TransportError
+                self.reason='WORKBOOK_REVISION_CHECK_UNAVAILABLE'
+                self.error=(exc.as_dict() if isinstance(exc,TransportError) else
+                    {'code':'WORKBOOK_REVISION_UNAVAILABLE','error_class':type(exc).__name__})
             if self.reason:
-                self.runner.stop_requested=True;self.report({'stage':'scheduling_stopped','reason':self.reason})
+                self.runner.stop_requested=True;self.report({'stage':'scheduling_stopped','reason':self.reason,'request_error':self.error})
 
 
 def run_destination(config,section,*,apply=False,resume=False,rollback=None,publish_only=None,
@@ -668,7 +672,7 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
         if threading.current_thread() is threading.main_thread():
             for sig in (signal.SIGINT,signal.SIGTERM):previous[sig]=signal.signal(sig,lambda *_:setattr(runner,'stop_requested',True))
         try:result=runner.run(apply=True,confirm_plan_sha256=plan.proposal_hash,source_ids=prepared['selected_source_ids'],
-            limit=len(prepared['selected_source_ids']),workers=config.get('workers',10),transport_factory=client,rollback=bool(rollback))
+            limit=len(prepared['selected_source_ids']),workers=config.get('workers',10),transport_factory=client,rollback=bool(rollback),resume=resume)
         finally:
             for sig,handler in previous.items():signal.signal(sig,handler)
         with timed_stage(report,'Save result and status exports'), journal.locked():
@@ -684,7 +688,10 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
                 raise SafetyError('BACKUP_VERIFICATION_FAILED')
         finished={'section':section,'run_id':plan.run_id,'counts':result['counts'],'journal_sequence':tip['seq'],
             'backup':str(backup),'result_path':result_path,'exports':exports,'elapsed_seconds':round(time.monotonic()-started,3),
-            'revision_stop_reason':guard.reason,'warnings':prepared.get('warnings',[])}
+            'revision_stop_reason':guard.reason,'revision_check_error':guard.error,
+            'skipped_completed_items':result.get('skipped_completed_items',0),
+            'retained_post_completion_conflicts':result.get('retained_post_completion_conflicts',[]),
+            'warnings':prepared.get('warnings',[])}
         # Registry updates are private; failed publication never restarts actions.
         entry=next((x for x in registry['sections'] if x.get('proposal_path',x.get('publication_spec',{}).get('proposal_path'))==section),None)
         if entry is None:entry={};registry['sections'].append(entry)

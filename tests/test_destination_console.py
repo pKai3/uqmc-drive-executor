@@ -186,3 +186,17 @@ class DestinationConsoleTests(unittest.TestCase):
 
 
 if __name__=='__main__':unittest.main()
+
+class ResumeConsoleTests(unittest.TestCase):
+    reporter = DestinationConsoleTests.reporter
+    def test_resume_and_revision_error_are_concise_and_actionable(self):
+        r=self.reporter()
+        r.progress({'stage':'resume_selection','skipped_completed_items':12,'queued_items':3,
+            'retained_post_completion_conflicts':[{'source_id':'fixture','display_name':'Register',
+                'fields':['modifiedTime','size']}]})
+        r.progress({'stage':'scheduling_stopped','reason':'WORKBOOK_REVISION_CHECK_UNAVAILABLE',
+            'request_error':{'code':'AUTH_REFRESH_HTTP_ERROR','request':'oauth.refresh','status':503,'read_attempts':3}})
+        text=self.out.getvalue()
+        self.assertIn('skipping 12 previously verified items; 3 unfinished items queued',text)
+        self.assertIn('Register; modifiedTime, size. No repeat mutation.',text)
+        self.assertIn('AUTH_REFRESH_HTTP_ERROR; oauth.refresh; HTTP 503; attempts 3',text)

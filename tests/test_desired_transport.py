@@ -163,7 +163,8 @@ class DesiredTransportTests(unittest.TestCase):
         with self.assertRaises(TransportError) as caught:
             t.update_metadata({"fileId": "file-a", "name": "approved.pdf"})
         self.assertEqual(caught.exception.as_dict(), {"code": "AUTH_REQUEST_TIMEOUT", "status": None,
-            "outcome": "NOT_DISPATCHED", "request": "oauth.refresh", "item_id": "file-a"})
+            "outcome": "NOT_DISPATCHED", "request": "oauth.refresh", "item_id": "file-a",
+            "provider_error": {"error_class": "RuntimeError"}, "read_attempts": 3})
         self.assertNotIn("secret", str(caught.exception))
         self.assertEqual(service.requests, [])
 

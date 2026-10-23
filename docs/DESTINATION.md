@@ -216,11 +216,26 @@ Resume the latest saved run for the same destination:
 `--resume` is a flag, not a run ID. It selects the latest registered run whose
 canonical destination matches. Without `--apply` it only reports that saved run.
 An execution-relevant proposal change blocks resume; reconcile the old requests
-before starting a fresh batch. Resume rechecks current state and preserves the
-frozen history. It skips verified
-completed effects, reconciles interrupted calls and never treats a timeout as
-proof that no write happened. A known original name is a known current state,
-even while the historical request outcome remains uncertain.
+before starting a fresh batch. Resume indexes the validated journal once and
+queues only unfinished effects. An exact saved, verified target is skipped without
+re-reading that completed file. Unresolved requests, partial effects, rollback
+history and genuine identity/location conflicts remain in the recovery queue;
+unfinished writes still receive fresh checks. The summary reports skipped and
+queued counts separately. This preserves historical completion, not a claim that
+all previously completed files were verified again today.
+
+Later content/modification observations on an already completed effect remain in
+the journal and status as conflicts/warnings; they do not cause its old move or
+rename to run again. Rollback still checks the original applied state and will
+reject later edits. A timeout never proves that no write happened; pending
+requests are reconciled before any retry.
+
+Revision-read failures now retain sanitized request, HTTP/OAuth error code and
+attempt count in the log and result. Transient credential-refresh failures get at
+most three attempts with bounded jitter, using a fresh connection for each attempt
+and the existing 15-second socket timeout. Permanent grant failures stop promptly.
+The socket timeout is not a strict wall-clock deadline for the whole batch.
+Resource writes still have their own single-send and outcome-reconciliation rules.
 
 Rollback is explicit and never automatic. It restores the recorded before name
 and parents only while current state matches the recorded applied state. A manual
@@ -237,6 +252,11 @@ by a later move-only run therefore stays renamed when that later run rolls back.
 New destination folders are not deleted.
 
 ## Publication recovery
+
+A file can already have its approved name and immediate parent while that parent
+still awaits a planned rename or move. Such descendants remain pending in section
+completion counts until the entire containing path is verified. Their historical
+file effects remain visible; this does not prevent publishing honest partial status.
 
 Action results are durable before publication. A spreadsheet or HTML publication
 failure does not make a verified migration fail and must not cause another file

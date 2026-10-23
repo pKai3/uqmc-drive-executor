@@ -93,12 +93,12 @@ class SafeReadRetryTests(unittest.TestCase):
         with self.assertRaises(ValueError):t.get_file('file-a')
         self.assertEqual(s.get.call_count,1);self.sleep.assert_not_called()
 
-    def test_auth_failure_never_reaches_read_loop(self):
+    def test_transient_auth_failure_retries_boundedly_before_read_loop(self):
         t,s=self.transport({'id':'file-a'})
         t._refresh_credentials=Mock(side_effect=TimeoutError())
         with self.assertRaisesRegex(TransportError,'AUTH_REQUEST_TIMEOUT'):t.get_file('file-a')
-        self.assertEqual(t._refresh_credentials.call_count,1)
-        self.assertEqual(s.requests,[]);self.sleep.assert_not_called()
+        self.assertEqual(t._refresh_credentials.call_count,3)
+        self.assertEqual(s.requests,[]);self.assertEqual(self.sleep.call_count,2)
 
     def test_write_timeout_or_rate_limit_remains_one_dispatch(self):
         for error in (TimeoutError(),http_error(403,'rateLimitExceeded'),http_error(503)):

@@ -129,3 +129,58 @@ class NoopDestinationPublicationTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class PendingContainerPublicationTests(NoopDestinationPublicationTests):
+    def test_pending_container_rename_keeps_child_history_without_false_completion(self):
+        self.prepare_nested(folder_target={'name':'Renamed Nested'})
+        data=viewer.unpack(self.f.drive.content.decode())
+        child=copy.deepcopy(data['nodes'][1]);child.update(i=2,p=1,n='Nested',id='nested')
+        data['nodes'][2].update(i=3,p=2);data['nodes'][3]['i']=4
+        data['nodes'].insert(2,child);data['roots']['retained']=[4]
+        bundle=self.bundle();section=bundle['sections']['sections'][0]
+        self.assertEqual(section['completed_file_count'],0)
+        self.assertEqual(section['remaining_file_count'],1)
+        self.assertEqual(section['verified_file_ids'],[])
+        record=next(x for x in bundle['workbook']['items'] if x['source_id']=='source-one')
+        self.assertEqual(record['move']['effect'],'APPLIED')
+        before=copy.deepcopy(self.f.j.events)
+        viewer.integrate(data,bundle)
+        self.assertEqual(self.f.j.events,before)
+        self.assertNotEqual(data['execution_sections']['sections'][0]['status'],'COMPLETED')
+
+    def test_verified_child_creation_under_pending_parent_does_not_abort_renderer(self):
+        self.prepare_nested(folder_target={'name':'Renamed Nested'})
+        j=self.f.j
+        raw={'id':'created-child','name':'Presentations','parents':['nested'],
+             'mime_type':'application/vnd.google-apps.folder'}
+        authority={'decision':'APPROVED','folders':[{'key':'logical-child','name':'Presentations'}]}
+        j.append('REQUIRED_FOLDER_VERIFIED','create-child',payload={
+            'section_id':'section','key':'logical-child','file_id':'created-child',
+            'name':'Presentations','parent_id':'nested',
+            'authority_ref':j.evidence(authority),'observed_ref':j.evidence(raw)})
+        self.spec['destination_ids'].append('created-child')
+        self.spec['destination_paths']['created-child']='Root/Section/Nested/Presentations'
+        data=viewer.unpack(self.f.drive.content.decode())
+        nested=copy.deepcopy(data['nodes'][1]);nested.update(i=2,p=1,n='Nested',id='nested')
+        data['nodes'][2].update(i=3,p=2);data['nodes'][3]['i']=4
+        data['nodes'].insert(2,nested);data['roots']['retained']=[4]
+        bundle=self.bundle();section=bundle['sections']['sections'][0]
+        self.assertEqual(set(section['pending_destination_ids']),{'nested','created-child'})
+        self.assertEqual(section['created_folder_ids'],['created-child'])
+        self.assertEqual(section['completed_file_count'],0)
+        viewer.integrate(data,bundle)
+        self.assertEqual(data['nodes'][2]['migration_summary']['status'],'DESTINATION_PENDING')
+        # The explicit pending proof is required; arbitrary broken graphs still fail.
+        del section['pending_destination_ids']
+        with self.assertRaisesRegex(ValueError,'CREATED_DESTINATION_GRAPH_INCOMPLETE'):
+            viewer.integrate(data,bundle)
+
+    def test_pending_unknown_identity_remains_rejected(self):
+        self.prepare_nested(folder_target={'name':'Renamed Nested'})
+        bundle=self.bundle();section=bundle['sections']['sections'][0]
+        section['pending_destination_ids']=['not-allowlisted']
+        data=viewer.unpack(self.f.drive.content.decode())
+        nested=copy.deepcopy(data['nodes'][1]);nested.update(i=4,p=1,n='Nested',id='nested')
+        data['nodes'].append(nested)
+        with self.assertRaisesRegex(ValueError,'INVALID_PENDING_DESTINATION_PROOF'):
+            viewer.integrate(data,bundle)

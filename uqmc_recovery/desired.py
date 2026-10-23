@@ -26,6 +26,7 @@ from .model import FOLDER, SafetyError, digest, validate_extension_evidence, val
 from .projection import HEADERS
 from .section_importer import validate_section_authority
 from .run_authority import RunAuthority
+from .desired_history import DesiredHistory
 from .importer import retired_source_ids
 from .shortcut_policy import is_shortcut, excluded_shortcut_ids, guard_shortcut_mutation, REASON as SHORTCUT_REASON
 
@@ -141,6 +142,7 @@ class DesiredRunner:
             raise SafetyError("MAX_ATTEMPTS_MUST_BE_1_TO_5")
         self.journal, self.plan, self.transport = journal, _RunPlan(plan), transport
         self.plan_sha256 = self.plan.proposal_hash
+        self._history = DesiredHistory(journal, self.plan_sha256)
         self._run_authority = None
         if type(audit_permissions) is not bool:
             raise SafetyError("EXPLICIT_PERMISSION_AUDIT_BOOLEAN_REQUIRED")
@@ -214,9 +216,7 @@ class DesiredRunner:
         return self.read_retry(lambda: self.transport.list_children(parent_id))
 
     def events(self, source_id=None):
-        return [r for r in self.journal.records() if r["kind"].startswith("DESIRED_")
-                and r["payload"].get("plan_sha256") == self.plan_sha256
-                and (source_id is None or r["payload"].get("source_id") == source_id)]
+        return self._history.events(source_id)
 
     def record(self, kind, item, *, direction="FORWARD", attempt=0, **payload):
         return self.journal.append("DESIRED_" + kind,
@@ -855,8 +855,64 @@ class DesiredRunner:
                         **{k: v for k, v in result.items() if k != "source_id"})
             return result
 
+    def resume_partition(self, selected):
+        """Skip recorded full effects, never infer completion from a starting name.
+
+        Later content/modification observations remain warnings and journal
+        conflicts, not new writes or rewritten rollback baselines. Unresolved
+        requests, partial effects, rollback and identity/location drift stay in
+        the recovery queue with the original strict checks.
+        """
+        pending, completed, warnings = [], [], []
+        for item in selected:
+            sid = item['source_id']
+            active = self.latest_change(item)
+            if (not active or item['historical_uncertain_operation_ids'] or
+                    self.pending(item, 'FORWARD') or self.pending(item, 'ROLLBACK')):
+                pending.append(item)
+                continue
+            applied = self.journal.read_evidence(active['payload']['applied_ref'])
+            if core(applied) != item['target'] or applied.get('trashed') is True:
+                pending.append(item)
+                continue
+            later = [e for e in self.events(sid) if e['seq'] > active['seq']]
+            comparisons = [e for e in later if e['kind'] == 'DESIRED_STATE_COMPARISON'
+                           and e['payload'].get('outcome') == 'CONFLICT']
+            safe_comparisons = []
+            for event in comparisons:
+                payload = event['payload']
+                differences = payload.get('differences', {})
+                if (payload.get('stage') == 'RECORDED_APPLIED' and differences
+                        and set(differences) <= {'version', 'modifiedTime', 'size'}
+                        and payload.get('observed_ref')):
+                    observed = self.journal.read_evidence(payload['observed_ref'])
+                    if core(observed) == item['target'] and observed.get('trashed') is not True:
+                        safe_comparisons.append(event)
+            safe_stop_reasons = {e['payload']['reason'] for e in safe_comparisons}
+            unsafe = len(safe_comparisons) != len(comparisons)
+            for event in later:
+                payload = event['payload']
+                if event['kind'] == 'DESIRED_STOPPED' and not (
+                        payload.get('state') == 'CONFLICT' and payload.get('reason') in safe_stop_reasons):
+                    unsafe = True
+                if event['kind'] == 'DESIRED_OBSERVED':
+                    ref = payload.get('observed_ref')
+                    if payload.get('state') != 'TARGET' or not ref or core(self.journal.read_evidence(ref)) != item['target']:
+                        unsafe = True
+            if unsafe:
+                pending.append(item)
+                continue
+            completed.append(sid)
+            for event in safe_comparisons:
+                warnings.append({'source_id': sid, 'display_name': item['target']['name'],
+                    'reason': 'POST_COMPLETION_METADATA_CHANGE_RETAINED',
+                    'comparison_event_id': event['event_id'],
+                    'fields': sorted(event['payload']['differences']),
+                    'historical_completion_event_id': active['event_id']})
+        return pending, completed, warnings
+
     def run(self, *, apply=False, confirm_plan_sha256=None, limit=999, rollback=False,
-            workers=1, transport_factory=None, source_ids=None):
+            workers=1, transport_factory=None, source_ids=None, resume=False):
         if not apply or not self.transport.apply_enabled or confirm_plan_sha256 != self.plan_sha256:
             raise SafetyError("EXPLICIT_APPLY_AND_EXACT_PLAN_HASH_REQUIRED")
         if type(workers) is not int or not 1 <= workers <= 32 or type(limit) is not int or limit < 1:
@@ -873,6 +929,12 @@ class DesiredRunner:
             raise SafetyError("DUPLICATE_CONCURRENT_SOURCE_ID")
         with self.journal.shared_locked(), self.authority_session():
             self.authority()
+            requested_items = len(selected)
+            skipped, retained_conflicts = [], []
+            if resume and not rollback:
+                selected, skipped, retained_conflicts = self.resume_partition(selected)
+                self.report_progress('resume_selection', skipped_completed_items=len(skipped),
+                    queued_items=len(selected), retained_post_completion_conflicts=retained_conflicts)
             backup = self.journal.root.parent / "backups"
             backup.mkdir(mode=0o700, parents=True, exist_ok=True)
             self.last_backup_path = None
@@ -883,7 +945,7 @@ class DesiredRunner:
                 "dependencies": {i["source_id"]: i["dependencies"] for i in selected}, "global_phases_removed": True,
                 "audit_permissions": self.audit_permissions, "workers": workers,
                 "selected_source_ids": [i["source_id"] for i in selected], "maximum_new_changes": limit})
-            output, satisfied, changed = [], set(), 0
+            output, satisfied, changed = [], set(skipped), 0
             selected_ids = {i["source_id"] for i in selected}
             dependencies = {i["source_id"]: set(i["dependencies"]) for i in selected}
             if rollback:
@@ -932,7 +994,7 @@ class DesiredRunner:
                             self.unchanged(before, observed, moving=core(before)["parents"] != target["parents"])
                             self.applied(item, before, observed, attempt["payload"], None, recovered=True)
                 # Subset runs observe outside dependencies; never add them to mutation scope.
-                external = set().union(*dependencies.values()) - selected_ids if dependencies else set()
+                external = set().union(*dependencies.values()) - selected_ids - satisfied if dependencies else set()
                 if not rollback:
                     for source_id in sorted(external):
                         try:
@@ -996,7 +1058,9 @@ class DesiredRunner:
                     if fatal:
                         raise fatal
                 return self.summary(output, rollback=rollback, workers=workers,
-                    selected_items=len(selected), new_changes=changed)
+                    selected_items=len(selected), new_changes=changed, requested_items=requested_items,
+                    skipped_completed_items=len(skipped), skipped_completed_source_ids=skipped,
+                    retained_post_completion_conflicts=retained_conflicts)
             finally:
                 final_backup = backup / ("desired-after-" + str(uuid.uuid4()))
                 manifest = self.snapshot_backup(final_backup, "Final recovery backup")
@@ -1116,7 +1180,7 @@ def main(argv=None):
         signal.signal(signal.SIGINT, stop)
         signal.signal(signal.SIGTERM, stop)
         summary = runner.run(apply=args.apply, confirm_plan_sha256=args.confirm_plan_sha256, limit=args.limit, rollback=args.command == "rollback",
-            workers=args.workers, transport_factory=worker_transport, source_ids=selected_ids) if mutating else runner.preview(limit=args.limit)
+            workers=args.workers, transport_factory=worker_transport, source_ids=selected_ids, resume=args.command == "resume") if mutating else runner.preview(limit=args.limit)
         summary["authenticated_account"] = account
         print(json.dumps(summary))
         bad = {"CONFLICT", "UNAVAILABLE", "UNCERTAIN", "DEPENDENCY_BLOCKED"} | ({"NOT_APPLIED", "PARTIAL"} if mutating else set())

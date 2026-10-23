@@ -542,6 +542,31 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
               'parents':items[sid]['observed']['parent_ids'],
               'mime_type':items[sid]['observed']['mime_type']}==plan[sid]['target']) or
             matching_destination_observation(sid) is not None for sid in destination_ids)
+        # A file at its own target is not complete while its containing
+        # folder awaits an approved rename/move. Require a satisfied chain
+        # back to this section root; keep historical effects in the snapshot.
+        reachable = {dest} if root_ok else set()
+        pending_destinations = list(verified_destinations)
+        while pending_destinations:
+            advanced = []
+            for d in pending_destinations:
+                sid = d['id']
+                target_ok = (sid not in plan or
+                    (items[sid]['observed']['read_state'] == 'VERIFIED' and
+                     {'id': sid, 'name': items[sid]['observed']['exact_name'],
+                      'parents': items[sid]['observed']['parent_ids'],
+                      'mime_type': items[sid]['observed']['mime_type']} == plan[sid]['target']) or
+                    matching_destination_observation(sid) is not None)
+                if target_ok and (sid in reachable or
+                        (d.get('parent_ids') and set(d['parent_ids']) <= reachable)):
+                    reachable.add(sid)
+                    advanced.append(d)
+            if not advanced:
+                break
+            for d in advanced:
+                pending_destinations.remove(d)
+        verified = [sid for sid in verified if items[sid]['observed']['parent_ids']
+                    and set(items[sid]['observed']['parent_ids']) <= reachable]
         complete=(len(verified)==len(ids) and root_ok and all(s in created for s in required_created)
                   and destination_targets_satisfied
                   and set(destination_ids)<={d['id'] for d in verified_destinations})
@@ -552,6 +577,7 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
             'mode':spec['destination_mode'],'expected_file_count':len(ids),'completed_file_count':len(verified),
             'remaining_file_count':len(ids)-len(verified),'verified_at_utc':max(times) if times else None,
             'verified_file_ids':verified,'verified_destinations':verified_destinations,
+            'pending_destination_ids':[sid for sid in destination_ids if sid not in reachable],
             'retired_file_ids':retired_ids,'retired_file_count':len(retired_ids),
             'policy_excluded_file_ids':policy_ids,'policy_excluded_file_count':len(policy_ids),
             'created_destinations':[{**created[s], **({'path':spec['destination_paths'][s]} if s in spec.get('destination_paths',{}) else {})} for s in destination_ids if s in created],

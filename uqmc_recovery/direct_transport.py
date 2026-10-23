@@ -293,14 +293,46 @@ class GoogleDriveTransport:
         return value
 
     def _ready(self, *, item_id=None):
-        try:
-            self._refresh_credentials()
-        except TransportError:
-            raise
-        except Exception as error:
-            if _is_timeout(error):
-                raise TransportError("AUTH_REQUEST_TIMEOUT", request="oauth.refresh", item_id=item_id) from None
-            raise TransportError("AUTH_REFRESH_FAILED") from None
+        # Refresh happens before any resource request. Retry only transient
+        # authentication transport/provider failures; never replay a file write.
+        for attempt in range(1, READ_MAX_ATTEMPTS + 1):
+            try:
+                self._refresh_credentials()
+                return
+            except TransportError as error:
+                failure = error
+                transient = error.transient or error.code in {'AUTH_REFRESH_RETRY_REQUIRED', 'AUTH_REQUEST_TIMEOUT'}
+                if failure.request is None: failure.request = 'oauth.refresh'
+                if failure.item_id is None: failure.item_id = item_id
+            except Exception as error:
+                wrapped, seen = [error], set()
+                transient = bool(getattr(error, 'retryable', False))
+                while wrapped and len(seen) < 16:
+                    cause = wrapped.pop()
+                    if id(cause) in seen:
+                        continue
+                    seen.add(id(cause))
+                    transient |= _transient_read(cause, _failure(cause, dispatched=False))
+                    transient |= isinstance(cause, _ReplayBlocked)
+                    wrapped.extend(x for x in (getattr(cause, '__cause__', None),
+                        getattr(cause, '__context__', None), *getattr(cause, 'args', ()))
+                        if isinstance(x, BaseException))
+                code = 'AUTH_REQUEST_TIMEOUT' if _is_timeout(error) else 'AUTH_REFRESH_FAILED'
+                details = {'error_class': type(error).__name__}
+                for value in getattr(error, 'args', ()):
+                    if isinstance(value, dict) and value.get('error') in {
+                            'invalid_grant', 'invalid_client', 'unauthorized_client',
+                            'temporarily_unavailable', 'server_error'}:
+                        details['oauth_error'] = value['error']
+                failure = TransportError(code, request='oauth.refresh', item_id=item_id,
+                    provider_error=details)
+            failure.read_attempts = attempt
+            if not transient or attempt == READ_MAX_ATTEMPTS:
+                raise failure from None
+            delay = random.uniform(2 ** (attempt - 1), 2 ** attempt)
+            _LOG.warning('Retrying oauth.refresh after %s; attempt %d/%d in %.2fs',
+                failure.code, attempt + 1, READ_MAX_ATTEMPTS, delay)
+            time.sleep(delay)
 
     def _read(self, factory, *, request, item_id=None):
         # Authentication/factory errors and unlisted operations never enter the
@@ -620,7 +652,27 @@ class GoogleDriveTransport:
             if not credentials.valid:
                 if not credentials.refresh_token:
                     raise TransportError("EXPLICIT_GOOGLE_AUTHORIZATION_REQUIRED")
-                credentials.refresh(google_auth_httplib2.Request(raw_http))
+                # The token endpoint may have been idle for an hour. Use a
+                # fresh bounded connection, and prevent SDK retries multiplying
+                # our explicit three-attempt refresh budget.
+                refresh_http = _single_send_http_class(httplib2.Http)(timeout=timeout)
+                refresh_http.follow_redirects = False
+                request = google_auth_httplib2.Request(refresh_http)
+                sent = False
+                def once(*args, **kwargs):
+                    nonlocal sent
+                    if sent:
+                        raise TransportError('AUTH_REFRESH_RETRY_REQUIRED', request='oauth.refresh')
+                    sent = True
+                    response = request(*args, **kwargs)
+                    if response.status in {408, 429, 500, 502, 503, 504}:
+                        raise TransportError('AUTH_REFRESH_HTTP_ERROR', status=response.status,
+                                             request='oauth.refresh')
+                    return response
+                try:
+                    credentials.refresh(once)
+                finally:
+                    refresh_http.close()
                 if not credentials.valid:
                     raise TransportError("AUTH_REFRESH_FAILED")
             scopes = set(credentials.granted_scopes or credentials.scopes or ())

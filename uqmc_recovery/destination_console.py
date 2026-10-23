@@ -130,8 +130,19 @@ class ConsoleReporter:
                 self.line(f"Request failed for {concise(value.get('source_id', 'item'))}: {concise(error.get('code', 'UNKNOWN'))}. Checking current state before retry.")
             elif stage == "read_retry":
                 self.line(f"Read retry {value.get('attempt', '?')}: {concise(value.get('method', 'read'))}; {concise(value.get('reason', ''))}.")
+            elif stage == "resume_selection":
+                self.line(f"Resume: skipping {value.get('skipped_completed_items', 0)} previously verified items; {value.get('queued_items', 0)} unfinished items queued.")
+                for warning in value.get('retained_post_completion_conflicts', []):
+                    self.line("Preserved later metadata observation: " + concise(warning.get('display_name', warning['source_id'])) +
+                              "; " + ", ".join(warning.get('fields', [])) + ". No repeat mutation.")
             elif stage == "scheduling_stopped":
                 self.line("Scheduling stopped: " + concise(value.get("reason", "unknown reason")))
+                error = value.get('request_error') or {}
+                if error:
+                    self.line("Revision check: " + concise(error.get('code', 'UNKNOWN')) +
+                              "; " + concise(error.get('request', 'metadata read')) +
+                              (f"; HTTP {error['status']}" if error.get('status') is not None else '') +
+                              (f"; attempts {error['read_attempts']}" if error.get('read_attempts') else ''))
             elif stage == "execution_finished":
                 self.line(f"Execution saved: {counts_text(value.get('counts'))}; checkpoint {value.get('journal_sequence', '?')}.")
                 self.line("Publishing verified status and viewer (local HTML → configured server → Drive)…")

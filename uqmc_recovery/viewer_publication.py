@@ -411,7 +411,8 @@ def integrate(data, bundle):
         'retained_source_folder_ids','created_folder_ids','created_folder_count',
         'created_destinations','rename_effects','direct_move_effects','inherited_locations',
         'source_folder_status_basis','verified_at_utc','verified_file_ids','verified_destinations',
-        'retired_file_ids','retired_file_count','policy_excluded_file_ids','policy_excluded_file_count'}
+        'retired_file_ids','retired_file_count','policy_excluded_file_ids','policy_excluded_file_count',
+        'pending_destination_ids'}
     destination_fields = {'id','name','parent_ids','verified_at_utc','destination_link','path','mode'}
     sections = {k: copy.deepcopy(v) for k,v in bundle['sections'].items()
                 if k in {'schema_version','snapshot_id','generated_at_utc','journal_sequence',
@@ -457,6 +458,8 @@ def integrate(data, bundle):
         if not n['f'] and n.get('id') in retired_files:
             n['retired'] = True
     completed_files = set()
+    pending_folders = set()
+    known_folder_ids = {n.get('id') for n in nodes if n['f'] and n.get('id')}
     retained = set()
     for section in sections['sections']:
         root = resolve_folder_path(data, section['path'])
@@ -501,6 +504,15 @@ def integrate(data, bundle):
         retained.update(section.get('retained_source_folder_ids', []))
         destinations = {x['id']: x for x in section.get('created_destinations', [])}
         destinations.update({x['id']: x for x in section.get('verified_destinations', [])})
+        pending = section.get('pending_destination_ids', [])
+        if (len(pending) != len(set(pending)) or
+                not set(pending) <= known_folder_ids | set(destinations) or
+                (pending and section['status'] == 'COMPLETED')):
+            raise ValueError('INVALID_PENDING_DESTINATION_PROOF')
+        # Creation history is retained even if a later parent rename/move is
+        # pending. Only target-satisfied chains enter the verified location graph.
+        pending_folders.update(pending)
+        destinations = {sid: d for sid, d in destinations.items() if sid not in pending}
         destination_paths = {section['destination_id']: path}
         unresolved = set(destinations) - set(destination_paths)
         while unresolved:
@@ -543,6 +555,8 @@ def integrate(data, bundle):
         total, done, retired_count, excluded_count = counts[n['i']]
         if n['s'] == 'retained':
             state = 'SOURCE_RETAINED' if n.get('id') in retained else 'NOT_TRACKED'
+        elif (n.get('destination_overlay', {}).get('destination_id') or n.get('id')) in pending_folders:
+            state = 'DESTINATION_PENDING'
         elif done and done == total or (not total and n.get('destination_overlay')):
             state = 'COMPLETE'
         elif done:
@@ -618,7 +632,7 @@ CSS = '''\n/* UQMC destination execution overlay */
 JS_HELPER = '''
 function folderMigrationBadge(n){
  const v=n.migration_summary;if(!v)return null;
- const text={COMPLETE:'Destination complete',PARTIAL:'Partially migrated',NOT_STARTED:'Not started · no tracked completion',SOURCE_RETAINED:'Source folder retained',NOT_TRACKED:'Source context · not tracked',REVISION_PENDING:'Proposed revision pending',CURRENT_CONTAINER_RETAINED:'Existing empty folder retained'}[v.status];
+ const text={COMPLETE:'Destination complete',PARTIAL:'Partially migrated',NOT_STARTED:'Not started · no tracked completion',SOURCE_RETAINED:'Source folder retained',NOT_TRACKED:'Source context · not tracked',REVISION_PENDING:'Proposed revision pending',DESTINATION_PENDING:'Container rename/move or verification pending',CURRENT_CONTAINER_RETAINED:'Existing empty folder retained'}[v.status];
  const cls=v.status==='COMPLETE'?'migration-complete':v.status==='PARTIAL'?'migration-partial':'migration-pending';
  const b=badge(text+(v.file_count&&['COMPLETE','PARTIAL'].includes(v.status)?' · '+v.completed_file_count+'/'+v.file_count+' files':''),cls);
  b.title='Verified destination-section completion at this snapshot. Not started means no tracked completion, not a claim about current live location.';
