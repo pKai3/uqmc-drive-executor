@@ -394,6 +394,37 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
         recovered[sid] = copy.deepcopy(proof)
         states[sid] = copy.deepcopy(state)
         routes[sid] = {'path': path, 'parent_path': logical_parent(path), 'exact_name': names[path]}
+    def bind_existing_parent(path, sid):
+        # Creation may have stopped before DESTINATION_VERIFIED was written for
+        # an existing parent. Recover that parent from its recorded child ID and
+        # fresh exact metadata/listings, walking only to an established anchor.
+        if path in paths or path in recovered_paths:
+            return (recovered_paths.get(path, paths.get(path)) == sid)
+        if path not in required or sid in groups or sid in blocked or sid in paths.values():
+            return False
+        state = metadata_by_id.get(sid, {})
+        parents = state.get('parents')
+        if (state.get('id') != sid or state.get('mime_type') != FOLDER
+                or state.get('trashed') is not False or state.get('name') != names[path]
+                or not isinstance(parents, list) or len(parents) != 1):
+            return False
+        parent_path, parent_id = logical_parent(path), parents[0]
+        if not bind_existing_parent(parent_path, parent_id):
+            return False
+        subtree = metadata_by_id.get(parent_id, {}).get('subtree', {})
+        if subtree.get('complete') is not True:
+            return False
+        matches = [m for m in subtree.get('members', [])
+                   if m.get('parents') == [parent_id]
+                   and isinstance(m.get('name'), str)
+                   and m['name'].rstrip() == names[path].rstrip()]
+        if (len(matches) != 1 or matches[0].get('id') != sid
+                or matches[0].get('name') != names[path]
+                or matches[0].get('mime_type', matches[0].get('mimeType')) != FOLDER):
+            return False
+        paths[path] = sid
+        return True
+
     for path, sid in recovered_paths.items():
         parent_path = logical_parent(path)
         parent_id = recovered[sid]['parent_id']
@@ -404,6 +435,8 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
         if expected_parent is None:
             parent_route = routes.get(parent_id, {})
             if parent_route.get('path') == parent_path and states[parent_id]['mime_type'] == FOLDER:
+                expected_parent = parent_id
+            elif bind_existing_parent(parent_path, parent_id):
                 expected_parent = parent_id
         if parent_id != expected_parent:
             raise SafetyError('RECOVERED_DESTINATION_PARENT_PATH_CONFLICT:' + sid)

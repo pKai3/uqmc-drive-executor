@@ -41,6 +41,47 @@ class CreatedDestinationRecoveryTests(unittest.TestCase):
         order=[x['fileId'] for x in f.server.requests]
         self.assertLess(order.index('source-root'),order.index('incoming'))
 
+    def interrupted_creation_before_parent_path_record(self):
+        from uqmc_recovery.folder_creation import prepare_required_folders
+        from uqmc_recovery.direct_transport import TransportError
+        f=self.fixture();f.mixed()
+        f.server.drive.files['existing']=fixture.raw('existing','Skills',['club'],True)
+        def interrupted(*args,**kwargs):
+            prepare_required_folders(*args,**kwargs)
+            raise TransportError('DRIVE_REQUEST_TIMEOUT',request='files.list')
+        with patch('uqmc_recovery.folder_creation.prepare_required_folders',side_effect=interrupted):
+            with self.assertRaisesRegex(TransportError,'DRIVE_REQUEST_TIMEOUT'):
+                f.run_command(apply=True)
+        self.assertEqual(len(f.server.created),1)
+        self.assertEqual(f.server.requests,[])
+        self.assertFalse(any(e['kind']=='DESTINATION_VERIFIED'
+                             for e in Journal(f.config['store']).records()))
+        return f
+
+    def test_verified_child_recovers_existing_parent_before_path_record(self):
+        f=self.interrupted_creation_before_parent_path_record()
+        child=f.server.created[0];before=copy.deepcopy(f.server.drive.files)
+        preview=f.run_command()
+        self.assertEqual(preview['blockers'],[])
+        self.assertEqual(preview['missing_folders'],[])
+        self.assertEqual(f.server.drive.files,before)
+        result=f.run_command(apply=True)
+        self.assertEqual(result['counts'],{'APPLIED':2},result)
+        self.assertEqual(f.server.created,[child])
+        self.assertEqual(f.server.drive.files[child]['parents'],['existing'])
+        self.assertEqual(f.server.drive.files['incoming']['parents'],[child])
+
+    def test_unrecorded_parent_recovery_rejects_changed_name_parent_and_collision(self):
+        for change in ('name','parent','collision'):
+            with self.subTest(change=change):
+                f=self.interrupted_creation_before_parent_path_record()
+                if change=='name':f.server.drive.files['existing']['name']='Changed'
+                elif change=='parent':f.server.drive.files['existing']['parents']=['old-parent']
+                else:f.server.drive.files['duplicate']=fixture.raw('duplicate','Skills',['club'],True)
+                with self.assertRaisesRegex(SafetyError,'RECOVERED_DESTINATION_PARENT_PATH_CONFLICT'):
+                    f.run_command()
+                self.assertEqual(f.server.requests,[])
+
     def test_first_preparation_includes_own_created_child_in_scope_without_source_row(self):
         f=self.fixture();result=f.run_command(apply=True)
         self.assertEqual(result['counts'],{'APPLIED':3},result)
