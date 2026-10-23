@@ -76,3 +76,14 @@ sealed target ID, name, parent IDs, MIME type and registry path. This fallback
 cannot replace a later uncertain or conflicting action result. Verified child
 files can therefore be displayed beneath a reused no-op folder without inventing
 a folder move or weakening destination verification.
+
+An explicitly approved new viewer identity can be registered in the private
+identity-basis file's optional `viewer_registrations` list. Each entry binds
+`source_id`, `rename_id`, `original_name`, `current_display_name` and a nonempty
+`approval_reference`. Add that exact ID to `source_ids`, increment the basis
+version, and recompute its count and sorted newline-separated ID hash. The
+publisher requires one matching fresh Proposed Renames row and an unambiguous
+existing destination. It adds only the explicitly registered identity; worksheet
+presence alone never widens disclosure. Registration does not mark work complete,
+change the execution journal or publish anything by itself. Retain the prior
+basis and approval evidence privately. Existing registered nodes are reused.

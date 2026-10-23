@@ -54,6 +54,54 @@ def resolve_folder_path(data, value):
     return node
 
 
+def register_proposal_files(data, workbook, identity_basis):
+    """Materialize only explicitly approved additions to the viewer identity basis.
+
+    Being present in a spreadsheet is not disclosure approval. Each new identity
+    needs a private registration bound to its stable ID, rename row and original
+    title. Existing disclosed nodes keep their history; refresh_proposal handles
+    current targets and rebuilds tree ordering/counts after this function.
+    """
+    from .projection import _identity_coverage
+    _identity_coverage(identity_basis, identity_basis['source_ids'])
+    registrations = identity_basis.get('viewer_registrations', [])
+    allowed = set(identity_basis['source_ids'])
+    rows = workbook.get('sheets', workbook.get('matrices', {}))['Proposed Renames']
+    records = [dict(zip(rows[0], row)) for row in rows[1:]]
+    seen, added = set(), []
+    for registration in registrations:
+        sid = registration.get('source_id')
+        required = ('source_id', 'rename_id', 'original_name', 'current_display_name', 'approval_reference')
+        if (any(not isinstance(registration.get(k), str) or not registration[k] for k in required)
+                or sid not in allowed or sid in seen):
+            raise ValueError('VIEWER_REGISTRATION_INVALID')
+        seen.add(sid)
+        existing = [n for n in data['nodes'] if n.get('id') == sid]
+        if existing:
+            if len(existing) != 1 or existing[0]['f'] or existing[0]['s'] != 'destination':
+                raise ValueError('VIEWER_REGISTRATION_ID_CONFLICT')
+            continue
+        matches = [r for r in records if r.get('Source ID') == sid]
+        if len(matches) != 1:
+            raise ValueError('VIEWER_REGISTRATION_ROW_NOT_UNIQUE')
+        row = matches[0]
+        if (row.get('Rename ID') != registration['rename_id']
+                or row.get('Current name + type suffix') != registration['current_display_name']
+                or not row.get('Proposed name + type suffix')):
+            raise ValueError('VIEWER_REGISTRATION_ROW_MISMATCH')
+        parent = resolve_folder_path(data, row['Proposed destination folder'])
+        data['nodes'].append(dict(i=len(data['nodes']), p=parent['i'], s='destination',
+            n=row['Proposed name + type suffix'], o=registration['original_name'],
+            f=False, id=sid, u='', context_id='', t=[registration['rename_id']],
+            note='', rank='', changed=True, review=False, shortcut=False,
+            assessment='Proposed rename', assistant_pending=False,
+            requires_user_naming_decision=False, keep_basis=None, necessity_rationale='',
+            cleanup=None, archive_exempt=False, duplicate=None, collision=None, c=[],
+            total=0, changedTotal=1, reviewTotal=0))
+        added.append(sid)
+    return added
+
+
 def proposed_folder_updates(data, workbook, *, folder_revisions=()):
     """Map display-only folder revisions from current sheet targets and stable IDs.
 

@@ -234,6 +234,7 @@ def freeze_publication(config, registry, *, journal, fresh_workbook, drive):
         basis = _load(basis)
     metadata, source = _read_viewer(drive, config['viewer_file_id'])
     data = viewer.unpack(source.decode('utf-8'))
+    registered = viewer.register_proposal_files(data, fresh_workbook, basis)
     from .shortcut_policy import excluded_shortcut_ids
     shortcut_ids = excluded_shortcut_ids(journal.records())
     for node in data['nodes']:
@@ -243,6 +244,7 @@ def freeze_publication(config, registry, *, journal, fresh_workbook, drive):
     workbook.setdefault('exported_at_utc', workbook.get('captured_at_utc', _now()))
     revisions = viewer.proposed_folder_updates(data, workbook, folder_revisions=revision_folder_updates(journal))
     report = viewer.refresh_proposal(data, workbook, folder_revisions=revisions)
+    report['registered_source_ids'] = registered
     specs = display_section_specs(registry, data, basis['source_ids'])
     bundle = build_publication(journal, allowed_source_ids=basis['source_ids'],
         identity_basis=basis, sections=specs)
