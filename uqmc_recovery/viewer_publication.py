@@ -74,6 +74,29 @@ def proposed_folder_updates(data, workbook, *, folder_revisions=()):
         if not sid or not name or not parent: continue
         if sid in targets: raise ValueError('DUPLICATE_PROPOSAL_SOURCE')
         targets[sid] = (parent.rstrip('/') + '/' + name, parent, name)
+    # Keep-name folder moves have an explicit manifest mapping but need no
+    # rename row. Use that stable-ID mapping for display, never infer a move
+    # merely from children or introduce an undisclosed source identity.
+    from .importer import subtree_coverage_scope
+    matrices = workbook.get('sheets', workbook.get('matrices', {}))
+    manifest = matrices.get('Move Manifest', [])
+    known_folders = {n['id']: n for n in nodes
+                     if n['f'] and n['s'] == 'destination' and n.get('id')}
+    manifest_targets = {}
+    for row in manifest[1:]:
+        record = dict(zip(manifest[0], row))
+        sid = record.get('Source ID')
+        n = known_folders.get(sid)
+        if n is None or sid in targets or not subtree_coverage_scope(record.get('Scope')):
+            continue
+        path = record.get('Exact target path')
+        name = n['n']
+        if not isinstance(path, str) or not path.endswith('/' + name):
+            raise ValueError('MANIFEST_FOLDER_TARGET_NAME_MISMATCH:' + sid)
+        target = (path, path[:-len('/' + name)], name)
+        if sid in manifest_targets and manifest_targets[sid] != target:
+            raise ValueError('AMBIGUOUS_MANIFEST_FOLDER_TARGET:' + sid)
+        manifest_targets[sid] = target
     frozen = {r['source_id']: r for r in folder_revisions}
     result = {}
     for n in nodes:
@@ -81,7 +104,7 @@ def proposed_folder_updates(data, workbook, *, folder_revisions=()):
         sid = n.get('destination_overlay', {}).get('destination_id') or n.get('id')
         if not sid: continue
         current = '/'.join(paths[n['i']])
-        target = targets.get(n.get('id'))
+        target = targets.get(n.get('id')) or manifest_targets.get(n.get('id'))
         if target:
             path, _, name = target
         elif n.get('destination_overlay'):
