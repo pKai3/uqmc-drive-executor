@@ -257,13 +257,16 @@ Server sync is disabled unless the optional project configuration below enables 
 
 ## Optional mounted-share server sync
 
-The default is off. To use the existing mounted share, set only these optional
-keys in the ignored project configuration; the destination must already exist:
+The default is off. Pin the existing server/share in the ignored project
+configuration. The viewer subdirectory must already exist on that share:
 
 ```json
 "server_sync": {
   "enabled": true,
-  "destination_directory": "/absolute/path/to/existing/mounted/share"
+  "destination_directory": "/Volumes/SHARE/viewer",
+  "mount_point": "/Volumes/SHARE",
+  "smb_url": "smb://SERVER/SHARE",
+  "auto_mount": true
 }
 ```
 
@@ -271,8 +274,24 @@ The publication command builds and validates `viewer.html` once in its private
 publication directory. It attempts spreadsheet delivery independently, then syncs
 that exact local artifact to the share's fixed `index.html`, verifies its SHA-256,
 and only then uploads the same bytes to the original Drive HTML file. It never
-uses Drive Desktop as the server source. No new credentials, SSH integration or
-mount creation are involved. The existing standalone shell script remains usable.
+uses Drive Desktop as the server source. No credentials are stored. The existing
+standalone shell script remains usable.
+
+With `auto_mount: true`, publication makes at most one guest mount attempt if
+that exact SMB mount is absent. It uses the macOS `mount volume` command with no
+user/password arguments, a 15-second Apple event timeout and a 20-second process
+limit. The actual mount table must confirm the configured server, share and
+mount point before any server file access. A directory merely named `/Volumes/SHARE`
+is insufficient. Userinfo is stripped from OS mount records and forbidden in
+configuration. The check is repeated before transfer and readback. No working
+share is unmounted, and no launch daemon or persistent credential is created.
+
+If guest access fails or requires login, publication stays pending with an
+explicit mount error; mount the share yourself before retrying publication. The
+program does not open a credential setup flow or change access. `--check` never
+mounts. Existing verified stages and migration history are retained. The missing-
+share path is covered by mocks; only the existing mounted identity was checked
+live, without deliberately disconnecting it.
 
 The transfer uses `rsync -c --progress -- SOURCE DEST/index.html` as an argument
 array, without a shell. Default rsync temporary-file/rename behavior is retained;
@@ -282,7 +301,7 @@ rsync on timeout, then checks the destination hash. Filesystem access to an
 unresponsive mounted share can still block at the OS level; the subprocess limit
 is not a deadline for every filesystem operation or the whole publication.
 
-A missing share, invalid/empty/unsealed HTML, symlink target or destination,
+An unverified or mismatched share, invalid/empty/unsealed HTML, symlink target or destination,
 changed server preimage or newer verified publication blocks replacement. The
 program creates no destination directory. One project lock serializes transfers.
 A small private target-wide index records intent before transfer and verification

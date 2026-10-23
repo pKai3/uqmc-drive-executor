@@ -1,6 +1,7 @@
 """Optional checksum-verified sync of one frozen viewer to an existing local share.
 
-No Google API, migration, SSH, shell, mount creation or credentials are involved.
+No Google API, migration, SSH, shell or stored credentials are involved.
+An explicitly configured SMB share may be mounted through the OS as a guest.
 The public artifact is copied before Drive HTML delivery by the publication hook.
 Receipts remain private alongside the frozen publication, never on the server.
 """
@@ -18,6 +19,7 @@ import stat
 import subprocess
 
 from .destination_publication import _load, _now, _save
+from .smb_mount import ensure_mount
 
 
 RECEIPT_VERSION = 'uqmc.server-sync.v1'
@@ -103,6 +105,7 @@ def sync_publication(directory, config=None, *, apply=False, confirm_transfer_st
         configured = config.get('destination_directory')
         if not isinstance(configured, str) or not configured or not Path(configured).is_absolute():
             raise ValueError('SERVER_SYNC_DESTINATION_DIRECTORY_REQUIRED')
+        ensure_mount(config, apply=apply)
         destination = Path(configured)
         if destination.is_symlink():
             raise ValueError('SERVER_SYNC_DESTINATION_SYMLINK')
@@ -133,6 +136,7 @@ def sync_publication(directory, config=None, *, apply=False, confirm_transfer_st
                               datetime.fromisoformat(previous_delivery['publication_created_at_utc']))
             if order <= previous_order and previous_delivery['source_sha256'] != source_hash:
                 raise ValueError('SERVER_SYNC_STALE_PUBLICATION')
+        ensure_mount(config, apply=False)
         observed_hash = _destination_hash(target)
         if previous_delivery and previous_delivery.get('state') in {'ATTEMPTED', 'UNCERTAIN'}:
             same_delivery = (previous_delivery['snapshot_id'] == snapshot and
@@ -200,6 +204,7 @@ def sync_publication(directory, config=None, *, apply=False, confirm_transfer_st
                 _destination_hash(target) != observed_hash):
             return record('CONFLICT', reason='SERVER_SYNC_DESTINATION_CHANGED',
                           attempt=attempt, before_sha256=observed_hash)
+        ensure_mount(config, apply=False)
         record('ATTEMPTED', attempt=attempt, before_sha256=observed_hash,
                prior_transfer_confirmed_stopped=bool(confirm_transfer_stopped))
         failure = None
@@ -221,6 +226,7 @@ def sync_publication(directory, config=None, *, apply=False, confirm_transfer_st
         except Exception as exc:
             failure = _error(exc)
         try:
+            ensure_mount(config, apply=False)
             after_hash = _destination_hash(target)
         except Exception as exc:
             return record('UNCERTAIN', attempt=attempt, before_sha256=observed_hash,
