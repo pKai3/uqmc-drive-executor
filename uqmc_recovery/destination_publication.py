@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+from time import sleep
 
 from .publication_projection import build_publication
 from .projection import validate_snapshot
@@ -107,18 +108,31 @@ def _metadata_identity(raw, file_id):
     return {k: copy.deepcopy(raw[k]) for k in ('id', 'name', 'parents', 'mimeType', 'trashed')}
 
 
+VIEWER_SETTLE_SECONDS = 3
+VIEWER_READ_ATTEMPTS = 3
+
+
 def _read_viewer(drive, file_id):
-    before = drive.metadata(file_id)
-    content = drive.download(file_id)
-    after = drive.metadata(file_id)
-    identity = _metadata_identity(before, file_id)
-    if identity != _metadata_identity(after, file_id):
-        raise ValueError('VIEWER_CHANGED_DURING_READ')
-    if before.get('version') != after.get('version'):
-        raise ValueError('VIEWER_VERSION_CHANGED_DURING_READ')
-    if not isinstance(content, bytes):
-        raise ValueError('VIEWER_DOWNLOAD_NOT_BYTES')
-    return identity, content
+    """Allow bounded version settling; never retry a write or accept identity drift."""
+    identity = None
+    for attempt in range(VIEWER_READ_ATTEMPTS):
+        before = drive.metadata(file_id)
+        current_identity = _metadata_identity(before, file_id)
+        if identity is None:
+            identity = current_identity
+        elif current_identity != identity:
+            raise ValueError('VIEWER_CHANGED_DURING_READ')
+        content = drive.download(file_id)
+        after = drive.metadata(file_id)
+        if identity != _metadata_identity(after, file_id):
+            raise ValueError('VIEWER_CHANGED_DURING_READ')
+        if not isinstance(content, bytes):
+            raise ValueError('VIEWER_DOWNLOAD_NOT_BYTES')
+        if before.get('version') == after.get('version'):
+            return identity, content
+        if attempt + 1 < VIEWER_READ_ATTEMPTS:
+            sleep(VIEWER_SETTLE_SECONDS)
+    raise ValueError('VIEWER_VERSION_CHANGED_DURING_READ')
 
 
 def display_section_specs(registry, data, allowed_source_ids):
@@ -384,6 +398,9 @@ def resume_publication(directory, *, sheet_capture, drive, apply=False, server_s
                             drive.replace_content(fid, target)
                         except Exception as exc:
                             write_error = type(exc).__name__
+                        # Even a lost upload response can precede remote metadata
+                        # settling. Keep ATTEMPTED durable; retry only readback.
+                        sleep(VIEWER_SETTLE_SECONDS)
                         identity, observed = _read_viewer(drive, fid)
                         if identity != receipt['viewer_identity']:
                             receipt[kind] = {'state': 'CONFLICT', 'reason': 'VIEWER_IDENTITY_CHANGED'}

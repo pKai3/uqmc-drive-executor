@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from test_projection import MemoryJournal
 from test_sheet_publication import FakeSheets, Request
@@ -68,6 +69,7 @@ class FakeDrive:
 
 class DestinationPublicationTests(unittest.TestCase):
     def setUp(self):
+        sleeper=patch.object(p,'sleep');self.sleep=sleeper.start();self.addCleanup(sleeper.stop)
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.j,self.registry,html,self.sheet,self.workbook=fixture()
         self.drive=FakeDrive(html)

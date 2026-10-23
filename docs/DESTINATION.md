@@ -536,3 +536,14 @@ without erasing retirement history. Restored parents are not trashed again by th
 same cleanup run. A changed name/parent or unavailable identity stays blocked.
 Google normally permanently deletes items after 30 days in Trash, so recoverable
 trashing is not an indefinite backup. Retain the private journal/evidence backups.
+
+### Drive HTML settling during publication
+
+After the one content upload attempt, verification waits 3 seconds before reading
+Drive metadata/content/metadata. If only the version counter changes during that
+read, it repeats the read at most twice, 3 seconds apart. Stable reads have no
+extra delay. Total intentional waiting after an upload is at most 9 seconds;
+network requests retain the existing 15-second socket timeout. A stable exact
+content match is still required. Identity changes or different content remain
+conflicts, and persistent version changes leave publication uncertain. These
+read retries never re-upload HTML or replay migration.
