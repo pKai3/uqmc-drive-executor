@@ -16,6 +16,7 @@ import uuid
 
 from .journal import _validate, canonical, digest
 from .importer import retired_source_ids
+from .shortcut_policy import excluded_shortcut_ids
 from .projection import build_projections, validate_snapshot, _ordered_plan_operations
 
 FOLDER = 'application/vnd.google-apps.folder'
@@ -379,6 +380,17 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
             item['location']['effect']='NONE'
     excluded, recoverable_excluded, private_excluded = _publication_exclusions(records)
     retired = retired_source_ids(records)
+    policy_excluded = excluded_shortcut_ids(records)
+    from .revision_cleanup import retired_parents
+    retired_folders = retired_parents(journal)
+    for source in policy_excluded:
+        if source in items:
+            items[source]['reason_codes'] = list(dict.fromkeys([
+                *items[source]['reason_codes'], 'POLICY_EXCLUDED', 'USER_EXCLUDED_SHORTCUT']))
+    for source in retired_folders:
+        if source in items:
+            items[source]['reason_codes'] = list(dict.fromkeys([
+                *items[source]['reason_codes'], 'RETIRED_EMPTY_FOLDER', 'VERIFIED_TRASHED']))
     section_rows=[]; allowed=set(allowed_source_ids)-private_excluded
     for source in recoverable_excluded:
         item = items.get(source)
@@ -421,7 +433,8 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
         if len(ids)!=len(set(ids)) or not set(ids)<=allowed or not set(spec.get('source_folder_ids_left_in_place',[]))<=allowed:
             raise ValueError('SECTION_IDENTITIES_NOT_PUBLIC_ALLOWLISTED')
         retired_ids = sorted(set(ids) & retired)
-        ids = [sid for sid in ids if sid not in retired]
+        policy_ids = sorted(set(ids) & policy_excluded)
+        ids = [sid for sid in ids if sid not in retired | policy_excluded]
         if spec['destination_mode'] not in {'REUSED_MOVED','REUSED_EXISTING','CREATED'}:
             raise ValueError('Unknown destination mode')
         def matching_destination_observation(sid):
@@ -492,6 +505,7 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
             'remaining_file_count':len(ids)-len(verified),'verified_at_utc':max(times) if times else None,
             'verified_file_ids':verified,'verified_destinations':verified_destinations,
             'retired_file_ids':retired_ids,'retired_file_count':len(retired_ids),
+            'policy_excluded_file_ids':policy_ids,'policy_excluded_file_count':len(policy_ids),
             'created_destinations':[{**created[s], **({'path':spec['destination_paths'][s]} if s in spec.get('destination_paths',{}) else {})} for s in destination_ids if s in created],
             'retained_source_folder_ids':spec.get('source_folder_ids_left_in_place',[]),
             'created_folder_ids':[s for s in destination_ids if s in created],
@@ -521,7 +535,10 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
     log['rows'].sort(key=lambda r:event_order[r[0]])
     overlay={'schema_version':'uqmc.execution.sections.v1','snapshot_id':None,'journal_sequence':workbook['journal_sequence'],
              'journal_tip_sha256':workbook['journal_tip_sha256'],'generated_at_utc':workbook['generated_at_utc'],
-             'basis':'verified_journal_readback','other_sections':'NOT_TRACKED','sections':section_rows}
+             'basis':'verified_journal_readback','other_sections':'NOT_TRACKED','sections':section_rows,
+             'retired_empty_folders':[{'source_id':sid, 'verified_at_utc':proof['at'],
+                 'reason_code':'VERIFIED_EMPTY_PARENT_TRASHED'} for sid,proof in sorted(retired_folders.items())
+                 if sid in allowed or sid in created]}
     stable=lambda x:{k:v for k,v in x.items() if k not in {'snapshot_id','generated_at_utc'}}
     snapshot_id=str(uuid.uuid5(uuid.NAMESPACE_URL,'uqmc.publication.v1:'+digest(canonical([stable(workbook),stable(html),stable(log),stable(overlay)]))))
     for obj in (workbook,html,log,overlay):obj['snapshot_id']=snapshot_id

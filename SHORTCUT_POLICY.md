@@ -6,8 +6,8 @@ Fresh workbook imports use the verified MIME column. Live metadata supplies a se
 
 The private journal records `PLAN_EXCLUDED` / `USER_EXCLUDED_SHORTCUT` once per known ID. This is a policy disposition, not deletion or a success result. Private desired status exposes `scope_dispositions`; `active_scope_status` removes excluded IDs from both the denominator and verified numerator while preserving the underlying historical records.
 
-## Publication limitation
+## Publication
 
-The current shared viewer contract supports confirmed-deletion retirement, but has no policy-exclusion disposition. Shortcuts must not be called deleted or marked newly applied. Until that contract and viewer support are authorized and implemented, publication stops before writes with `SHORTCUT_POLICY_PUBLICATION_REQUIRES_SUPPORTED_DISPOSITION`. Saved-publication retry through the destination CLI is also held when policy exclusions are recorded. Local migration and recovery records remain available; no existing public artifact is silently altered.
+Shared snapshots retain historical shortcut effects and add `POLICY_EXCLUDED` / `USER_EXCLUDED_SHORTCUT` reason codes. Sections remove policy-excluded IDs from both active and verified counts. The viewer labels excluded shortcuts explicitly; spreadsheet execution columns show the policy disposition. Neither surface calls them deleted or newly applied. Retired empty folders use a separate verified-trash disposition and are hidden only when no active/protected descendants remain. All original identities and journal history remain available.
 
 No Drive permission listing, sharing edit, ownership transfer, shortcut deletion or reversal is part of this policy.

@@ -128,11 +128,13 @@ class ShortcutPolicyTests(unittest.TestCase):
         self.assertEqual(len(result['excluded_ids']),2)
         self.assertTrue(result['historical_effects_preserved'])
 
-    def test_unsupported_public_disposition_stops_before_network_or_writes(self):
-        with tempfile.TemporaryDirectory() as directory:
-            journal = Journal(directory)
-            persist_shortcut_exclusions(journal,{'shortcut_ids':['link'],'records':{}})
-            drive = Mock()
-            with self.assertRaisesRegex(ValueError,'SHORTCUT_POLICY_PUBLICATION_REQUIRES_SUPPORTED_DISPOSITION'):
-                freeze_publication({}, {}, journal=journal, fresh_workbook={}, drive=drive)
-            self.assertEqual(drive.mock_calls,[])
+    def test_policy_publication_preserves_unknown_original_effect(self):
+        from test_publication_projection import PublicationTests
+        fixture=PublicationTests(methodName='runTest'); fixture.setUp()
+        fixture.j.append('PLAN_EXCLUDED', payload={'file_id':'untouched',
+            'mime_type':SHORTCUT_MIME,'reason_code':REASON})
+        bundle=fixture.publish()
+        item=fixture.item(bundle,'untouched')
+        self.assertIn('POLICY_EXCLUDED',item['reason_codes'])
+        self.assertEqual(item['move']['effect'],'NOT_TRACKED')
+        self.assertEqual(item['observed']['read_state'],'NEVER_VERIFIED')

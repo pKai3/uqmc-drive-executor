@@ -571,9 +571,6 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
         report({'stage':'account_verified','account':account['emailAddress']})
         if publish_only:
             if not apply:raise SafetyError('PUBLICATION_RETRY_REQUIRES_APPLY')
-            from .shortcut_policy import excluded_shortcut_ids
-            if excluded_shortcut_ids(journal.records()):
-                raise SafetyError('SHORTCUT_POLICY_PUBLICATION_REQUIRES_SUPPORTED_DISPOSITION')
             drive=GooglePublicationDrive(factory({config['viewer_file_id']},{config['viewer_file_id']},set(),True),config['viewer_file_id'],apply=True)
             return resume_publication(publish_only,sheet_capture=capture_client,drive=drive,apply=True,
                                       server_sync=config.get('server_sync'))

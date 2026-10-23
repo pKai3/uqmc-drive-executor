@@ -85,13 +85,13 @@ def proposed_folder_updates(data, workbook, *, folder_revisions=()):
         if target:
             path, _, name = target
         elif n.get('destination_overlay'):
-            direct = [c for c in children.get(n['i'], []) if not c['f'] and not c.get('retired')]
+            direct = [c for c in children.get(n['i'], []) if not c['f'] and not c.get('retired') and not c.get('policy_excluded')]
             if not direct or any(c.get('id') not in targets for c in direct): continue
             parents = {targets[c['id']][1] for c in direct}
             if len(parents) != 1: continue
             path = next(iter(parents)); name = path.rsplit('/', 1)[-1]
             prefix = paths[n['i']]
-            descendants = [c for c in nodes if not c['f'] and not c.get('retired')
+            descendants = [c for c in nodes if not c['f'] and not c.get('retired') and not c.get('policy_excluded')
                            and paths[c['i']][:len(prefix)] == prefix]
             if any(c.get('id') not in targets or path_parts(targets[c['id']][1]) !=
                    path_parts(path) + paths[c['i']][len(prefix):-1] for c in descendants): continue
@@ -137,7 +137,7 @@ def mark_proposed_revision_status(data, revisions):
         elif inherited:
             n['pending_revision'] = {**inherited, 'inherited': True}
         else: n.pop('pending_revision', None)
-        active = not n['f'] and not n.get('retired')
+        active = not n['f'] and not n.get('retired') and not n.get('policy_excluded')
         if active and n.get('pending_revision'): pending_members.add(n['id'])
         counts[n['i']] = [int(active), int(active and n.get('id') in historical),
                           int(active and n.get('id') in pending_members), int(not n['f'] and bool(n.get('retired')))]
@@ -340,11 +340,13 @@ def integrate(data, bundle):
         'retained_source_folder_ids','created_folder_ids','created_folder_count',
         'created_destinations','rename_effects','direct_move_effects','inherited_locations',
         'source_folder_status_basis','verified_at_utc','verified_file_ids','verified_destinations',
-        'retired_file_ids','retired_file_count'}
+        'retired_file_ids','retired_file_count','policy_excluded_file_ids','policy_excluded_file_count'}
     destination_fields = {'id','name','parent_ids','verified_at_utc','destination_link','path','mode'}
     sections = {k: copy.deepcopy(v) for k,v in bundle['sections'].items()
                 if k in {'schema_version','snapshot_id','generated_at_utc','journal_sequence',
                          'journal_tip_sha256','basis','other_sections'}}
+    sections['retired_empty_folders'] = [{k:proof[k] for k in ('source_id','verified_at_utc','reason_code')}
+        for proof in bundle['sections'].get('retired_empty_folders', [])]
     sections['sections'] = [{k: copy.deepcopy(v) for k,v in s.items() if k in section_fields}
                             for s in bundle['sections']['sections']]
     for section in sections['sections']:
@@ -373,9 +375,14 @@ def integrate(data, bundle):
             path_nodes.setdefault(paths[n['i']], []).append(n)
     retired_files = {sid for sid, item in items.items() if
         {'RETIRED', 'USER_CONFIRMED_DELETED', 'NOT_APPLIED'} <= set(item.get('reason_codes', []))}
+    policy_files = {sid for sid,item in items.items() if
+        {'POLICY_EXCLUDED','USER_EXCLUDED_SHORTCUT'} <= set(item.get('reason_codes', []))}
     for n in nodes:
         # Rebuilt only from the current journal projection; no stale HTML flag.
         n.pop('retired', None)
+        n.pop('policy_excluded', None)
+        if not n['f'] and n.get('id') in policy_files:
+            n['policy_excluded'] = True
         if not n['f'] and n.get('id') in retired_files:
             n['retired'] = True
     completed_files = set()
@@ -390,7 +397,12 @@ def integrate(data, bundle):
         if (len(retired) != len(set(retired)) or set(retired) != expected_retired or
                 section.get('retired_file_count', 0) != len(retired)):
             raise ValueError('SECTION_RETIRED_MEMBERSHIP_MISMATCH')
-        members = [n for n in members if n['id'] not in retired_files]
+        excluded = section.get('policy_excluded_file_ids', [])
+        expected_excluded = {n['id'] for n in members} & policy_files
+        if (len(excluded) != len(set(excluded)) or set(excluded) != expected_excluded or
+                section.get('policy_excluded_file_count', 0) != len(excluded)):
+            raise ValueError('SECTION_POLICY_EXCLUSION_MEMBERSHIP_MISMATCH')
+        members = [n for n in members if n['id'] not in retired_files | policy_files]
         if len(members) != section['expected_file_count']:
             raise ValueError('SECTION_MEMBERSHIP_COUNT_MISMATCH:' + section['section_id'])
         if section['status'] == 'COMPLETED' and section['completed_file_count'] != len(members):
@@ -446,17 +458,18 @@ def integrate(data, bundle):
             d = destinations[fid]
             matches[0]['destination_overlay'] = {'destination_id': fid, 'destination_url': folder_link(d['destination_link']), 'mode': d.get('mode','CREATED'), 'section_id': section['section_id']}
 
-    counts = {n['i']: [int(not n['f'] and n.get('id') not in retired_files),
+    counts = {n['i']: [int(not n['f'] and n.get('id') not in retired_files | policy_files),
         int(not n['f'] and n.get('id') in completed_files),
-        int(not n['f'] and n.get('id') in retired_files)] for n in nodes}
+        int(not n['f'] and n.get('id') in retired_files),
+        int(not n['f'] and n.get('id') in policy_files)] for n in nodes}
     for n in reversed(nodes):
         if n['p'] >= 0:
-            for k in (0, 1, 2):
+            for k in (0, 1, 2, 3):
                 counts[n['p']][k] += counts[n['i']][k]
     for n in nodes:
         if not n['f']:
             continue
-        total, done, retired_count = counts[n['i']]
+        total, done, retired_count, excluded_count = counts[n['i']]
         if n['s'] == 'retained':
             state = 'SOURCE_RETAINED' if n.get('id') in retained else 'NOT_TRACKED'
         elif done and done == total or (not total and n.get('destination_overlay')):
@@ -465,10 +478,63 @@ def integrate(data, bundle):
             state = 'PARTIAL'
         else:
             state = 'NOT_STARTED'
-        n['migration_summary'] = {'status': state, 'file_count': total, 'completed_file_count': done, 'retired_file_count': retired_count, 'source_retained': n.get('id') in retained}
+        n['migration_summary'] = {'status': state, 'file_count': total, 'completed_file_count': done, 'retired_file_count': retired_count, 'policy_excluded_file_count': excluded_count, 'source_retained': n.get('id') in retained}
     data['execution'] = public
     data['execution_sections'] = sections
+    mark_retired_empty_folders(data)
     data['notes'] = [re.sub(r'This remains a proposal; no source moves or renames have been executed\.', 'The tree combines the current proposal with the separately verified execution snapshot below; untracked records remain proposals.', x) for x in data['notes']]
+
+
+def mark_retired_empty_folders(data, workbook=None):
+    """Hide only proved retired branches with no active or protected descendants."""
+    nodes = data['nodes']; sections = data.get('execution_sections', {})
+    proofs = sections.get('retired_empty_folders', [])
+    if any(p.get('reason_code') != 'VERIFIED_EMPTY_PARENT_TRASHED' or not p.get('verified_at_utc') for p in proofs):
+        raise ValueError('INVALID_RETIRED_EMPTY_FOLDER_DISPOSITION')
+    retired = {p['source_id'] for p in proofs}
+    if len(retired) != len(proofs): raise ValueError('DUPLICATE_RETIRED_EMPTY_FOLDER')
+    protected = {s['destination_id'] for s in sections.get('sections', [])}
+    protected |= {d['id'] for s in sections.get('sections', [])
+                  for d in s.get('created_destinations', []) + s.get('verified_destinations', [])}
+    planned_paths = set()
+    paths = {}; by_id = {n.get('id'):n for n in nodes if n.get('id')}
+    for n in nodes:
+        paths[n['i']] = (paths[n['p']] if n['p'] >= 0 else ()) + (n['n'].strip(),)
+    if workbook is not None:
+        rows = workbook.get('sheets', workbook.get('matrices', {}))['Proposed Renames']
+        ix = {k:rows[0].index(k) for k in ('Source ID','Proposed name + type suffix','Proposed destination folder')}
+        for row in rows[1:]:
+            if len(row) <= max(ix.values()): continue
+            n = by_id.get(row[ix['Source ID']])
+            if not n or n.get('retired') or n.get('policy_excluded'): continue
+            parent = path_parts(row[ix['Proposed destination folder']])
+            if not parent: continue
+            planned_paths.add(parent)
+            if n['f'] and row[ix['Proposed name + type suffix']]:
+                planned_paths.add(parent + (row[ix['Proposed name + type suffix']].strip(),))
+    children = {}
+    for n in nodes:
+        n.pop('viewer_hidden', None); n.pop('retired_empty_parent', None)
+        children.setdefault(n['p'], []).append(n['i'])
+    def identity(n):
+        return n.get('destination_overlay', {}).get('destination_id') or n.get('id') or n.get('context_id')
+    def safe_branch(index):
+        n = nodes[index]; sid = identity(n)
+        if (n.get('pending_revision') or sid in protected or
+                any(path[:len(paths[index])] == paths[index] for path in planned_paths)): return False
+        if not n['f']: return bool(n.get('retired'))
+        # Anonymous presentation contexts are not physical folder identities.
+        if sid and sid not in retired: return False
+        return all(safe_branch(child) for child in children.get(index, []))
+    def hide(index):
+        nodes[index]['viewer_hidden'] = True
+        for child in children.get(index, []): hide(child)
+    hidden = []
+    for n in nodes:
+        if n['f'] and identity(n) in retired and safe_branch(n['i']):
+            n['retired_empty_parent'] = True; hide(n['i']); hidden.append(identity(n))
+    data['retired_empty_folder_display'] = {'hidden_ids':sorted(set(hidden)),
+        'retained_conflict_ids':sorted(retired - set(hidden)), 'basis':'verified_trash_history'}
 
 
 CSS = '''\n/* UQMC destination execution overlay */
@@ -507,8 +573,10 @@ def render(source, data):
         mode = ('Existing folder moved; its identity was preserved.' if sec['mode'] == 'REUSED_MOVED' else 'Existing destination folder reused in place.' if sec['mode'] == 'REUSED_EXISTING' else f"{sec['created_folder_count']} destination folders created; original source folders left in place.")
         retired_note = (f" {sec['retired_file_count']} retired (user-confirmed deleted; not migrated)."
                         if sec.get('retired_file_count') else '')
+        excluded_note = (f" {sec['policy_excluded_file_count']} shortcuts excluded from migration; history retained."
+                         if sec.get('policy_excluded_file_count') else '')
         pending_note = (f" Proposed revision pending for {sec['proposal_pending_file_count']} files; counts below describe the previous verified layout." if sec.get('proposal_status') == 'PENDING_REVISION' else '')
-        cards.append('<article class="migration-card"><h3>' + html.escape(sec['title']) + '</h3><p><strong>' + html.escape('Revision pending' if pending_note else sec['status'].title()) + '</strong>' + html.escape(pending_note) + ' · ' + str(sec['completed_file_count']) + '/' + str(sec['expected_file_count']) + ' active files verified.' + html.escape(retired_note) + '</p><p>' + html.escape(mode) + '</p><a target="_blank" rel="noopener noreferrer" href="' + html.escape(folder_link(sec['destination_url']), quote=True) + '">Open actual destination ↗</a></article>')
+        cards.append('<article class="migration-card"><h3>' + html.escape(sec['title']) + '</h3><p><strong>' + html.escape('Revision pending' if pending_note else sec['status'].title()) + '</strong>' + html.escape(pending_note) + ' · ' + str(sec['completed_file_count']) + '/' + str(sec['expected_file_count']) + ' active files verified.' + html.escape(retired_note + excluded_note) + '</p><p>' + html.escape(mode) + '</p><a target="_blank" rel="noopener noreferrer" href="' + html.escape(folder_link(sec['destination_url']), quote=True) + '">Open actual destination ↗</a></article>')
     section = START + '<section class="execution-summary" aria-label="Migrated destination folders"><h2>Migrated destination folders</h2><p>Verified destination status from journal checkpoint ' + str(data['execution']['journal_sequence']) + '. Other folders show partial or not-started status in the tree. This is a static snapshot.</p><div class="migration-cards">' + ''.join(cards) + '</div></section>' + END
     if START in source:
         source = re.sub(re.escape(START) + '.*?' + re.escape(END), lambda _: section, source, flags=re.S)
@@ -534,6 +602,14 @@ def render(source, data):
     retirement_badge = "if(n.retired){const r=el('div','execution-badges');r.append(badge('Retired · user-confirmed deleted · not migrated','migration-pending'));return r;}"
     if retirement_badge not in source:
         source = source.replace('function executionBadges(n){', 'function executionBadges(n){' + retirement_badge, 1)
+    exclusion_badge = "if(n.policy_excluded){const r=el('div','execution-badges');r.append(badge('Excluded shortcut · historical effects retained','migration-pending'));return r;}"
+    if exclusion_badge not in source:
+        source = source.replace('function executionBadges(n){', 'function executionBadges(n){' + exclusion_badge, 1)
+    source = source.replace("const nodePair=n=>({folders:n.f?1:0,files:n.f?0:1,contexts:n.f&&!n.id?1:0});",
+        "const nodePair=n=>n.viewer_hidden||n.policy_excluded?zeroPair():({folders:n.f?1:0,files:n.f?0:1,contexts:n.f&&!n.id?1:0});", 1)
+    source = source.replace('match=N.map(n=>{const found=', 'match=N.map(n=>{if(n.viewer_hidden)return false;const found=', 1)
+    source = source.replace('const n=N[i];if(active&&!visible[i])return;', 'const n=N[i];if(n.viewer_hidden)return;if(active&&!visible[i])return;', 1)
+    source = source.replace('const children=n.c.filter(c=>!active||visible[c])', 'const children=n.c.filter(c=>!N[c].viewer_hidden&&(!active||visible[c]))', 1)
     source = source.replace('Drive links open originals; IDs stay in Details.', 'Destination links open verified migrated folders; source links and IDs remain in Details.')
     source = source.replace('The proposed reorganisation has not been executed. This viewer makes no changes. Drive links open the source item, even when a new name is proposed.', 'Completed destination sections and verified execution progress are shown below. This viewer makes no changes. Destination links open verified folders; source links remain in Details.')
     source = source.replace('Synthetic grouping folders have no execution status.', 'Grouping folders show destination completion separately from source actions.')

@@ -213,21 +213,17 @@ def revision_folder_updates(journal):
 
 def freeze_publication(config, registry, *, journal, fresh_workbook, drive):
     """Read remote HTML; freeze private artifacts without any remote writes."""
-    from .shortcut_policy import excluded_shortcut_ids, SHORTCUT_MIME
-    excluded = excluded_shortcut_ids(journal.records())
-    coverage = fresh_workbook.get('sheets', {}).get('Rename Coverage', [])
-    if coverage:
-        headers = coverage[0]
-        if 'Verified MIME type' in headers and 'Source ID' in headers:
-            mi, si = headers.index('Verified MIME type'), headers.index('Source ID')
-            excluded |= {row[si] for row in coverage[1:] if len(row) > max(mi, si) and row[mi] == SHORTCUT_MIME}
-    if excluded:
-        raise ValueError('SHORTCUT_POLICY_PUBLICATION_REQUIRES_SUPPORTED_DISPOSITION')
+    from .revision_cleanup import filter_registry
+    registry = filter_registry(journal, registry)
     basis = config['identity_basis']
     if isinstance(basis, (str, Path)):
         basis = _load(basis)
     metadata, source = _read_viewer(drive, config['viewer_file_id'])
     data = viewer.unpack(source.decode('utf-8'))
+    from .shortcut_policy import excluded_shortcut_ids
+    shortcut_ids = excluded_shortcut_ids(journal.records())
+    for node in data['nodes']:
+        node['policy_excluded'] = node.get('id') in shortcut_ids
     identities = {n['id'] for n in data['nodes'] if n.get('id')}
     workbook = copy.deepcopy(fresh_workbook)
     workbook.setdefault('exported_at_utc', workbook.get('captured_at_utc', _now()))
@@ -259,6 +255,7 @@ def freeze_publication(config, registry, *, journal, fresh_workbook, drive):
             viewer.mark_proposed_revision_status(data, revisions)
             report['current_proposal_layout'] = proposed_report
             report['proposal_revision_summary'] = data['proposal_revision_summary']
+        viewer.mark_retired_empty_folders(data, workbook)
         if {n['id'] for n in data['nodes'] if n.get('id')} != identities:
             raise ValueError('PUBLIC_SOURCE_IDENTITIES_CHANGED')
         target = viewer.render(source.decode('utf-8'), data).encode('utf-8')
