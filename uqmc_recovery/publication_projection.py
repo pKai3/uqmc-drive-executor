@@ -195,6 +195,47 @@ def _publication_exclusions(records):
     return excluded, recoverable - private, private
 
 
+def _carried_folder_observations(journal, observations):
+    """Rebase an unchanged child's logical path only through verified revision ancestry.
+
+    The child's exact preflight metadata and prior observation must agree. A
+    parent move does not invent a child move or a newer child readback timestamp.
+    """
+    from .destination_publication import revision_folder_updates
+    verified = {r['source_id']: r for r in revision_folder_updates(journal) if r['verified']}
+    records = journal.records(); latest = {}
+    for event in records:
+        if _desired_state(event): latest[event['payload'].get('source_id')] = event['seq']
+    result = dict(observations)
+    for event in records:
+        if event['kind'] != 'DESTINATION_REVISION_FROZEN': continue
+        payload = event['payload']; evidence = journal.read_evidence(payload['manifest_ref'])
+        raw = journal.read_evidence(evidence['source_metadata_ref'])['metadata']
+        prior = {sid:path for path,sid in evidence['prior_destination_paths'].items()}
+        target = {sid:path for path,sid in evidence['destination_paths'].items()}
+        moved = {i['source_id']:i for i in evidence['manifest']['items']}
+        for sid, path in target.items():
+            key = (payload['section_id'],sid); old = result.get(key); current = raw.get(sid)
+            if sid in moved or old is None or not current or latest.get(sid,0) > event['seq']: continue
+            core = _core(current)
+            if (current.get('trashed') is not False or core['mime_type'] != FOLDER or
+                    old['path'] != prior.get(sid) or
+                    core != {'id':sid,'name':old['name'],'parents':sorted(old['parent_ids']),'mime_type':FOLDER}): continue
+            ancestor = sid; seen = set(); matched = False
+            while ancestor not in seen:
+                seen.add(ancestor); metadata = raw.get(ancestor)
+                if not metadata or len(metadata.get('parents',[])) != 1: break
+                ancestor = metadata['parents'][0]
+                if ancestor in moved:
+                    move = moved[ancestor]; proof = verified.get(ancestor)
+                    matched = bool(proof and proof['target_path'] == move['target_path'] and
+                        prior[sid].startswith(move['before_path'] + '/') and
+                        path == move['target_path'] + prior[sid][len(move['before_path']):])
+                    break
+            if matched: result[key] = {**old, 'path':path}
+    return result
+
+
 def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(), verified_source_links=None):
     """Return workbook/html strict snapshots, private operation_log, and sections.
 
@@ -420,6 +461,7 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
             'verified_at_utc':event['at'],'mode':'REUSED_EXISTING',
             'destination_link':'https://drive.google.com/drive/folders/'+core['id'],
             'path':p['proposal_path']}
+    destination_observations = _carried_folder_observations(journal, destination_observations)
     for spec in sections:
         ids=spec['source_ids']; dest=spec['destination_id']
         hashes=spec.get('plan_sha256s',[spec.get('plan_sha256')])
