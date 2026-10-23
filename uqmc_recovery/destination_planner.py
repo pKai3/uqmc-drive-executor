@@ -406,8 +406,11 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
             raise SafetyError('RECOVERED_DESTINATION_PARENT_PATH_CONFLICT:' + sid)
     paths.update(recovered_paths)
     if source.get('subtree_coverage_version') == 1:
+        outside = {sid for sid, targets in source.get('coverage_target_paths', {}).items()
+                   if targets and all(target and not _inside(canonical_path(target), section)
+                                      for target in targets)}
         known = ({r['source_id'] for r in source['records'].values()} | blocked
-                 | set(source.get('coverage_source_ids', [])) | set(recovered))
+                 | outside | set(recovered))
         conflicts = []
         for sid, actions in groups.items():
             move = actions.get('MOVE')

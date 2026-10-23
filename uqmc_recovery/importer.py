@@ -7,6 +7,7 @@ It contains no network calls and never opens a Drive file.
 from __future__ import annotations
 
 import copy
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -173,30 +174,47 @@ def subtree_coverage_scope(scope):
     return None
 
 
-def _subtree_coverage_records(records, coverage, section_path=None):
+def _partition_root_matches(row, root):
+    reference = _text(row.get('Manifest item / root reference')).strip()
+    item, proposal = root['Manifest item'], root['Proposal ID']
+    if reference == item:
+        return True
+    # DESC identifies the inventory row, not its enclosing source subtree.
+    # Only the supported, exact parent assertion supplies that missing link.
+    return (re.fullmatch(r'DESC-[A-Za-z0-9_-]+', reference) is not None
+            and row.get('Assessment scope') ==
+            f'Descendant of {item} under {proposal}; name assessment only, not an additional move')
+
+
+def _subtree_coverage_records(records, coverage, section_path=None, *, excluded_ids=()):
     """Bind unlisted Keep-name identities to an explicit source-ID subtree row.
 
     Coverage is an inventory, not independent approval. A unique enclosing
-    manifest row supplies move authority. Partition coverage must also name
-    that exact manifest item. Explicit item routes always win.
+    manifest row supplies move authority. Partition coverage must name that
+    exact parent directly or through its explicit DESC assessment scope.
+    Explicit item routes always win; inventory presence alone is not binding.
     """
     explicit_ids = {r['source_id'] for r in records.values()}
     roots = [r for r in records.values() if r['action'] == 'MOVE' and r['source_id']
              and subtree_coverage_scope(r['row'].get('Scope'))]
-    additions = {}
+    additions, unbound = {}, []
     for row in coverage:
         sid = _text(row.get('Source ID')).strip()
-        if not sid or sid in explicit_ids or _text(row.get('Assessment')).strip().lower() != 'keep name':
+        if not sid or sid in explicit_ids or sid in excluded_ids or _text(row.get('Assessment')).strip().lower() != 'keep name':
             continue
         pid = _text(row.get('Move proposal')).strip()
         target = _text(row.get('Existing proposed target'))
         if section_path and not target.startswith(section_path + '/'):
             continue
-        matches = [r for r in roots if r['row']['Proposal ID'] == pid
-                   and target.startswith(_text(r['row'].get('Exact target path')) + '/')
+        enclosing = [r for r in roots
+                     if target.startswith(_text(r['row'].get('Exact target path')) + '/')]
+        matches = [r for r in enclosing if r['row']['Proposal ID'] == pid
                    and (subtree_coverage_scope(r['row'].get('Scope')) != 'exact_partition'
-                        or _text(row.get('Manifest item / root reference')).strip() == r['row']['Manifest item'])]
+                        or _partition_root_matches(row, r['row']))]
         if not matches:
+            if enclosing:
+                unbound.append(f"{sid}:Rename Coverage row {row.get('_row', '?')}:"
+                               f"expected one of {','.join(sorted(r['reference'] for r in enclosing))}")
             continue
         longest = max(len(r['row']['Exact target path']) for r in matches)
         matches = [r for r in matches if len(r['row']['Exact target path']) == longest]
@@ -233,6 +251,8 @@ def _subtree_coverage_records(records, coverage, section_path=None):
                     'Scope': 'Whole-subtree covered descendant', 'Origin coverage row': copy.deepcopy(row)},
             'row_sha256': digest({'derivation': 'WHOLE_SUBTREE_COVERAGE_V1',
                                   'root_row_sha256': parent['row_sha256'], 'coverage_row': row})}
+    if unbound:
+        raise SafetyError('UNBOUND_SUBTREE_COVERAGE:' + ';'.join(unbound))
     return additions
 
 
@@ -291,10 +311,19 @@ def catalog(export, *, expected_workbook_id=WORKBOOK_ID, include_subtree_coverag
             source_id = _text(row["Source ID"]).strip()
             if source_id:
                 excluded.add(source_id)
+    coverage_targets = {}
     if include_subtree_coverage:
-        result.update(_subtree_coverage_records(result, rows_by_tab["Rename Coverage"], subtree_section_path))
+        result.update(_subtree_coverage_records(result, rows_by_tab["Rename Coverage"], subtree_section_path,
+                                               excluded_ids=excluded | set(retired_records)))
+        for row in rows_by_tab['Rename Coverage']:
+            sid = _text(row.get('Source ID')).strip()
+            if sid:
+                coverage_targets.setdefault(sid, set()).add(_text(row.get('Existing proposed target')))
     return {**({'subtree_coverage_version': 1,
                 'coverage_source_ids': sorted({_text(r.get('Source ID')).strip() for r in rows_by_tab['Rename Coverage'] if _text(r.get('Source ID')).strip()}),
+                # Outside-section routes explain retained passengers, but never
+                # grant move authority or excuse an unbound in-section child.
+                'coverage_target_paths': {sid: sorted(paths) for sid, paths in coverage_targets.items()},
                 # Preserve exact same-ID inventory evidence for logical folder aliases.
                 # This does not alter proposal rows, row hashes, or move authority.
                 'folder_rename_coverage': [copy.deepcopy(r) for r in rows_by_tab['Rename Coverage']

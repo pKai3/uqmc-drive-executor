@@ -67,7 +67,8 @@ class ExactPartitionCoverageTests(unittest.TestCase):
             with self.subTest(field=field, value=value):
                 self.setUp()
                 set_cell(self.export, 'Rename Coverage', 1, field, value)
-                self.assertEqual({r['source_id'] for r in self.derived()}, set(self.fixture.kept_ids[1:]))
+                with self.assertRaisesRegex(SafetyError, 'UNBOUND_SUBTREE_COVERAGE'):
+                    self.derived()
 
     def test_same_proposal_and_target_cannot_substitute_another_manifest_root(self):
         append_row(self.export, 'Move Manifest', {'Proposal ID': 'MOVE-MEDIA',
@@ -75,7 +76,8 @@ class ExactPartitionCoverageTests(unittest.TestCase):
             'Exact target path': fixtures.DESTINATION, 'Scope': SCOPE})
         self.assertEqual({r['whole_subtree_origin_source_id'] for r in self.derived()}, {'source-media'})
         set_cell(self.export, 'Move Manifest', 1, 'Source ID', '')
-        self.assertEqual(self.derived(), [])
+        with self.assertRaisesRegex(SafetyError, 'UNBOUND_SUBTREE_COVERAGE'):
+            self.derived()
 
     def test_only_supported_scope_and_exact_target_prefix_expand(self):
         for scope in ['Single item', 'Exact source-ID subtree partition', SCOPE + '; additional scope']:
@@ -119,16 +121,91 @@ class ExactPartitionCoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(SafetyError, 'CHILD_MISSING_PROPOSAL_COVERAGE'):
             self.fixture.plan()
 
-    def test_unbound_known_child_prevents_mixed_source_folder_reuse(self):
+    def test_unbound_known_child_cannot_silently_reduce_scope(self):
         set_cell(self.export, 'Rename Coverage', 1, 'Manifest item / root reference', 'ITEM-OTHER')
-        paths = {path: sid for path, sid in self.fixture.paths.items() if path != fixtures.DESTINATION}
-        result = plan_destination(catalog(self.export, include_subtree_coverage=True),
+        with self.assertRaisesRegex(SafetyError, 'UNBOUND_SUBTREE_COVERAGE:.*Rename Coverage row 2'):
+            self.fixture.plan()
+
+    def test_descendant_inventory_ref_binds_exact_parent_assertion(self):
+        for index in range(1, 8):
+            set_cell(self.export, 'Rename Coverage', index, 'Manifest item / root reference', 'DESC-' + str(index))
+            set_cell(self.export, 'Rename Coverage', index, 'Assessment scope',
+                     'Descendant of ITEM-MEDIA under MOVE-MEDIA; name assessment only, not an additional move')
+        before = copy.deepcopy(self.export)
+        prepared = self.fixture.prepare()
+        self.assertEqual(set(prepared['source_ids']), set(self.fixture.kept_ids))
+        self.assertTrue(all(op['action'] == 'MOVE' for op in prepared['projection']['operations']))
+        self.assertEqual(self.export, before)
+
+    def test_desc_ref_needs_exact_scope_proof_not_prefix_or_free_text(self):
+        for proof in ['', 'Descendant of ITEM-OTHER under MOVE-MEDIA; name assessment only, not an additional move',
+                      'Descendant of ITEM-MEDIA under MOVE-OTHER; name assessment only, not an additional move',
+                      'Descendant of ITEM-MEDIA under MOVE-MEDIA; name assessment only, not an additional move EXTRA',
+                      'See ITEM-MEDIA under MOVE-MEDIA']:
+            with self.subTest(proof=proof):
+                self.setUp()
+                set_cell(self.export, 'Rename Coverage', 1, 'Manifest item / root reference', 'DESC-child')
+                set_cell(self.export, 'Rename Coverage', 1, 'Assessment scope', proof)
+                with self.assertRaisesRegex(SafetyError, 'UNBOUND_SUBTREE_COVERAGE'):
+                    self.derived()
+
+    def test_withdrawn_coverage_cannot_block_or_reopen_via_bad_binding(self):
+        for field in ['Coverage basis', 'Rename necessity']:
+            with self.subTest(field=field):
+                self.setUp()
+                sid = self.fixture.kept_ids[0]
+                set_cell(self.export, 'Rename Coverage', 1, field, 'Withdrawn')
+                set_cell(self.export, 'Rename Coverage', 1, 'Manifest item / root reference', 'DESC-bad')
+                prepared = self.fixture.prepare()
+                self.assertEqual(set(prepared['source_ids']), set(self.fixture.kept_ids) - {sid})
+                self.assertNotIn(sid, self.fixture.plan()['item_routes'])
+
+    def test_all_unbound_rows_reported_together(self):
+        for index in [1, 3, 5]:
+            set_cell(self.export, 'Rename Coverage', index, 'Manifest item / root reference', 'DESC-missing')
+        with self.assertRaises(SafetyError) as raised:
+            self.derived()
+        for index in [0, 2, 4]:
+            self.assertIn(self.fixture.kept_ids[index], str(raised.exception))
+
+    def test_inventory_presence_cannot_hide_dropped_catalog_record(self):
+        source = catalog(self.export, include_subtree_coverage=True)
+        sid = self.fixture.kept_ids[0]
+        source['records'] = {ref: r for ref, r in source['records'].items() if r['source_id'] != sid}
+        self.assertIn(sid, source['coverage_source_ids'])
+        with self.assertRaisesRegex(SafetyError, 'CHILD_MISSING_PROPOSAL_COVERAGE:.*' + sid):
+            plan_destination(source, section_path=fixtures.SECTION,
+                             metadata_by_id=self.states, anchor_paths=self.fixture.paths)
+
+    def test_outside_inventory_route_stays_outside_without_source_folder_reuse(self):
+        sid = self.fixture.kept_ids[0]
+        set_cell(self.export, 'Rename Coverage', 1, 'Existing proposed target',
+                 'Club/Unrelated/' + self.states[sid]['name'])
+        paths = {p: i for p, i in self.fixture.paths.items() if p != fixtures.DESTINATION}
+        layout = plan_destination(catalog(self.export, include_subtree_coverage=True),
             section_path=fixtures.SECTION, metadata_by_id=self.states, anchor_paths=paths)
-        self.assertEqual(result['source_container_ids'], ['source-media'])
-        self.assertEqual(result['reused_folder_ids'], [])
-        self.assertNotIn(self.fixture.kept_ids[0], result['item_routes'])
-        self.assertEqual(result['source_container_reasons']['source-media'],
-                         'UNASSIGNED_OR_OUTSIDE_SECTION_PASSENGER')
+        self.assertNotIn(sid, layout['item_routes'])
+        self.assertIn('source-media', layout['source_container_ids'])
+
+    def test_thirty_five_desc_rows_are_all_prepared_without_renames(self):
+        fixture = fixtures.WholeSubtreeCoverageTests()
+        fixture.setUp()
+        selected = set(fixture.kept_ids[:35])
+        remove = set(fixture.kept_ids + fixture.explicit_ids) - selected
+        for sid in remove:
+            fixture.states.pop(sid)
+        fixture.states['source-media']['subtree']['members'] = [
+            m for m in fixture.states['source-media']['subtree']['members'] if m['id'] in selected]
+        fixture.export['sheets']['Proposed Renames'] = fixture.export['sheets']['Proposed Renames'][:2]
+        h = HEADERS['Rename Coverage']
+        fixture.export['sheets']['Rename Coverage'] = [list(h)] + [
+            row for row in fixture.export['sheets']['Rename Coverage'][1:] if row[h.index('Source ID')] in selected]
+        set_cell(fixture.export, 'Move Manifest', 1, 'Scope', SCOPE)
+        prepared = fixture.prepare()
+        self.assertEqual(set(prepared['source_ids']), selected)
+        ops = prepared['projection']['operations']
+        self.assertEqual(len(ops), 35)
+        self.assertTrue(all(op['action'] == 'MOVE' and op['target_parent_ids'] == ['destination-media'] for op in ops))
 
 
 if __name__ == '__main__':
