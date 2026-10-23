@@ -16,7 +16,7 @@ import uuid
 
 from .journal import _validate, canonical, digest
 from .importer import retired_source_ids
-from .shortcut_policy import excluded_shortcut_ids
+from .shortcut_policy import excluded_shortcut_ids, frozen_shortcut_exclusion_provenance
 from .projection import build_projections, validate_snapshot, _ordered_plan_operations
 
 FOLDER = 'application/vnd.google-apps.folder'
@@ -181,12 +181,15 @@ def _publication_exclusions(records):
     Any other exclusion for the same ID continues to prohibit public display.
     """
     excluded, recoverable, private = set(), set(), set()
+    derived = frozen_shortcut_exclusion_provenance(records)
     for event in records:
         if event['kind'] != 'EXCLUDED':
             continue
         payload = event['payload']
         source = payload.get('file_id')
         excluded.add(source)
+        if event['event_id'] in derived:
+            continue  # Still execution-excluded, with its earlier typed policy.
         if (payload.get('recoverable') is True and payload.get('effect') == 'NOT_APPLIED'
                 and payload.get('reason_code') == 'MISSING_OR_INACCESSIBLE'):
             recoverable.add(source)
@@ -424,8 +427,11 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
     policy_excluded = excluded_shortcut_ids(records)
     from .revision_cleanup import retired_parents
     retired_folders = retired_parents(journal)
+    derived_policy_ids = {p['file_id'] for p in frozen_shortcut_exclusion_provenance(records).values()}
     for source in policy_excluded:
         if source in items:
+            if source in derived_policy_ids and source not in private_excluded:
+                items[source]['reason_codes'] = [code for code in items[source]['reason_codes'] if code != 'WITHDRAWN']
             items[source]['reason_codes'] = list(dict.fromkeys([
                 *items[source]['reason_codes'], 'POLICY_EXCLUDED', 'USER_EXCLUDED_SHORTCUT']))
     for source in retired_folders:

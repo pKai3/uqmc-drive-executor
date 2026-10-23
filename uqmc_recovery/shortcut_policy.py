@@ -20,6 +20,28 @@ def excluded_shortcut_ids(records):
             and event["payload"].get("mime_type") == SHORTCUT_MIME}
 
 
+def frozen_shortcut_exclusion_provenance(records):
+    """Identify only legacy generated duplicates of an earlier typed policy.
+
+    The events are never rewritten. Exact generated payload shape and earlier
+    policy provenance distinguish this bug from an independent privacy decision.
+    Callers must still honor every other exclusion and the public allowlist.
+    """
+    prior, result = {}, {}
+    def ref(event):
+        return {key: event[key] for key in ('event_id', 'seq', 'hash')}
+    for event in records:
+        for sid in excluded_shortcut_ids([event]):
+            prior.setdefault(sid, event)
+        p = event.get('payload', {})
+        sid = p.get('file_id')
+        if (event.get('kind') == 'EXCLUDED' and sid in prior
+                and p == {'file_id': sid, 'reason_code': 'FROZEN_PLAN_EXCLUSION'}):
+            result[event['event_id']] = {'file_id': sid,
+                'policy_event': ref(prior[sid]), 'derived_exclusion_event': ref(event)}
+    return result
+
+
 def apply_shortcut_policy(source, metadata_by_id=None, records=()):
     """Catalog metadata and durable scope authority are additive, never privacy flags."""
     ids = set(source.get("shortcut_ids", [])) | excluded_shortcut_ids(records)

@@ -358,9 +358,15 @@ def register_agent_plan(journal, plan):
             validate_extension_evidence(journal, op)
         validate_rollback_links(journal, plan)
         records = journal.records()
-        excluded = {WITHDRAWN_ID} | set(plan.excluded_ids) | {r["payload"]["file_id"] for r in records if r["kind"] == "EXCLUDED"}
+        from .shortcut_policy import excluded_shortcut_ids
+        policy_excluded = excluded_shortcut_ids(records)
+        excluded = {WITHDRAWN_ID} | set(plan.excluded_ids) | policy_excluded | {r["payload"]["file_id"] for r in records if r["kind"] == "EXCLUDED"}
         excluded_refs = {r["payload"]["proposal_ref"] for r in records if r["kind"] == "PROPOSAL_EXCLUDED"}
         for item in plan.excluded_ids:
+            # Existing typed policy is already durable execution exclusion. Do
+            # not turn it into a generic privacy/withdrawal exclusion.
+            if item in policy_excluded:
+                continue
             if not any(r["kind"] == "EXCLUDED" and r["payload"]["file_id"] == item for r in records):
                 journal.append("EXCLUDED", payload={"file_id": item, "reason_code": "FROZEN_PLAN_EXCLUSION"})
         scope = set()
