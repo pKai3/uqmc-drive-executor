@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from .shortcut_policy import SHORTCUT_MIME, persist_shortcut_exclusions
 from .model import FOLDER, NATIVE, Operation, Plan, SafetyError, WITHDRAWN_ID, digest, snapshot, validate_extension_evidence
 
 # Live identity is supplied from ignored private configuration, never from a repo.
@@ -311,10 +312,16 @@ def catalog(export, *, expected_workbook_id=WORKBOOK_ID, include_subtree_coverag
             source_id = _text(row["Source ID"]).strip()
             if source_id:
                 excluded.add(source_id)
+    shortcut_evidence = {}
+    for row in rows_by_tab["Rename Coverage"]:
+        sid = _text(row.get("Source ID")).strip()
+        if sid and row.get("Verified MIME type") == SHORTCUT_MIME:
+            shortcut_evidence.setdefault(sid, []).append(copy.deepcopy(row))
+    shortcuts = set(shortcut_evidence)
     coverage_targets = {}
     if include_subtree_coverage:
         result.update(_subtree_coverage_records(result, rows_by_tab["Rename Coverage"], subtree_section_path,
-                                               excluded_ids=excluded | set(retired_records)))
+                                               excluded_ids=excluded | set(retired_records) | shortcuts))
         for row in rows_by_tab['Rename Coverage']:
             sid = _text(row.get('Source ID')).strip()
             if sid:
@@ -328,7 +335,8 @@ def catalog(export, *, expected_workbook_id=WORKBOOK_ID, include_subtree_coverag
                 # This does not alter proposal rows, row hashes, or move authority.
                 'folder_rename_coverage': [copy.deepcopy(r) for r in rows_by_tab['Rename Coverage']
                     if r.get('Verified MIME type') == FOLDER and _text(r.get('Rename proposal')).strip()]} if include_subtree_coverage else {}),
-            "input_sha256": input_hash, "records": result, "excluded_ids": sorted(excluded | set(retired_records)),
+            "input_sha256": input_hash, "records": result, "excluded_ids": sorted(excluded | set(retired_records) | shortcuts),
+            "shortcut_ids": sorted(shortcuts), "shortcut_evidence": shortcut_evidence,
             "private_excluded_ids": sorted(excluded), "retired_ids": sorted(retired_records), "retired_records": retired_records,
             "excluded_refs": sorted(excluded_refs), "redacted_tombstones": tombstones,
             "quarantined_tombstones": quarantined}
@@ -399,6 +407,7 @@ def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
             section_eligible_refs = _eligibility_refs(_section_eligibility, input_hash, selected, journal)
             source["records"].update(_eligibility_records(_section_eligibility))
         retired = persist_retirements(journal, source)
+        shortcut_ids = persist_shortcut_exclusions(journal, source)
         recorded_exclusions = {r["payload"]["file_id"] for r in journal.records() if r["kind"] == "EXCLUDED"}
         recorded_refs = {r["payload"]["proposal_ref"] for r in journal.records() if r["kind"] == "PROPOSAL_EXCLUDED"}
         for source_id in source["private_excluded_ids"]:
@@ -409,7 +418,7 @@ def import_workbook(journal, export, *, batch_id, selected_refs, metadata_by_id,
             if ref not in recorded_refs:
                 reason = "WORKBOOK_REDACTED_EXCLUSION" if ref in quarantine_refs else "WORKBOOK_DECISION_NO"
                 journal.append("PROPOSAL_EXCLUDED", payload={"proposal_ref": ref, "reason_code": reason, "input_sha256": input_hash})
-        excluded = set(source["excluded_ids"]) | recorded_exclusions | retired
+        excluded = set(source["excluded_ids"]) | recorded_exclusions | retired | shortcut_ids
         excluded_refs = set(source["excluded_refs"]) | recorded_refs
         rows, candidates = [], {}
         mutation_ids = {source["records"][ref]["source_id"] for ref in selected if ref in source["records"]}

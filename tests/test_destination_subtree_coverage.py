@@ -174,7 +174,7 @@ class WholeSubtreeCoverageTests(unittest.TestCase):
         self.assertEqual(ops[0]['target_parent_ids'], ['destination-media'])
         self.assertEqual(self.plan()['item_routes'][sid]['exact_name'], '2020')
 
-    def test_shortcut_display_suffix_absent_from_path_never_synthesizes_rename(self):
+    def test_shortcut_is_excluded_by_mime_and_source_container_stays(self):
         sid, mime, exact_name = self.kept_ids[0], 'application/vnd.google-apps.shortcut', 'Safety links'
         self.states[sid] = agent_snapshot({**metadata(sid, exact_name, mime, ['source-media']),
                                            'parents_complete': True})
@@ -188,11 +188,11 @@ class WholeSubtreeCoverageTests(unittest.TestCase):
                            'Verified MIME type': mime}.items():
             row[headers.index(key)] = value
         layout = self.plan()
-        self.assertEqual(layout['item_routes'][sid], {'parent_path': DESTINATION, 'exact_name': exact_name})
+        self.assertNotIn(sid, layout['item_routes'])
+        self.assertNotIn('source-media', layout['reused_folder_ids'])
         prepared = self.prepare()
         ops = [o for o in prepared['projection']['operations'] if o['source_id'] == sid]
-        self.assertEqual([o['action'] for o in ops], ['MOVE'])
-        self.assertEqual(ops[0]['target_parent_ids'], ['destination-media'])
+        self.assertEqual(ops, [])
 
     def test_excluded_whole_subtree_root_cannot_authorize_derived_children(self):
         source = catalog(self.export, include_subtree_coverage=True)

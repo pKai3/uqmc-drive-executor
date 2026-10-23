@@ -163,8 +163,12 @@ def proposal_original_name(rename_record, move_record, state):
 def read_and_plan(config, section, journal, capture, factory, registry, report, *, preview=False):
     from .importer import catalog
     source=catalog(capture,expected_workbook_id=config['workbook_id'],include_subtree_coverage=True,subtree_section_path=section)
+    from .shortcut_policy import apply_shortcut_policy, persist_shortcut_exclusions
+    history=journal.records()
+    apply_shortcut_policy(source,records=history)
     if not preview:
         persist_retirements(journal,source)
+        persist_shortcut_exclusions(journal,source)
     history=journal.records()
     from .destination_recovery import load_created_folder_proofs_for_path
     recovered=load_created_folder_proofs_for_path(journal,section)
@@ -249,6 +253,12 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
     live=recursive_selected(live)
     report({'stage':'verified_history_skipped','identities':len(cached),'remaining_live_identities':len(read_ids),'preview_cached_reads_available':reused_cache})
     raw,listings,metadata=live['raw'],live['listings'],live['metadata']
+    # A missing MIME in an old sheet must not allow a live-confirmed shortcut.
+    live_shortcuts=apply_shortcut_policy(source,metadata)
+    excluded.update(live_shortcuts)
+    ids-=live_shortcuts
+    records=[r for r in records if r['source_id'] not in live_shortcuts]
+    if not preview:persist_shortcut_exclusions(journal,source)
     def folder_read(method,sid):
         key=method+':'+sid
         if preview and key in cache:return copy.deepcopy(cache[key])
@@ -561,6 +571,9 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
         report({'stage':'account_verified','account':account['emailAddress']})
         if publish_only:
             if not apply:raise SafetyError('PUBLICATION_RETRY_REQUIRES_APPLY')
+            from .shortcut_policy import excluded_shortcut_ids
+            if excluded_shortcut_ids(journal.records()):
+                raise SafetyError('SHORTCUT_POLICY_PUBLICATION_REQUIRES_SUPPORTED_DISPOSITION')
             drive=GooglePublicationDrive(factory({config['viewer_file_id']},{config['viewer_file_id']},set(),True),config['viewer_file_id'],apply=True)
             return resume_publication(publish_only,sheet_capture=capture_client,drive=drive,apply=True,
                                       server_sync=config.get('server_sync'))

@@ -10,6 +10,7 @@ import copy
 from .agent_profile import agent_snapshot
 from .importer import destination_route_record, subtree_coverage_scope
 from .model import FOLDER, NATIVE, SafetyError, digest
+from .shortcut_policy import apply_shortcut_policy
 from .section_prepare import (_inside, _path, _record_path as nested_record_path, _order_groups,
                               exact_rename, select_records as nested_select_records)
 
@@ -288,6 +289,8 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
     """
     section = _path(section_path)
     anchor = logical_parent(section)
+    source = {**source, "shortcut_evidence": copy.deepcopy(source.get("shortcut_evidence", {}))}
+    apply_shortcut_policy(source, metadata_by_id)
     blocked = _blocked_ids(source)
     records = [r for r in select_destination_records(source, section) if r['source_id'] not in blocked]
     if not records:

@@ -213,6 +213,16 @@ def revision_folder_updates(journal):
 
 def freeze_publication(config, registry, *, journal, fresh_workbook, drive):
     """Read remote HTML; freeze private artifacts without any remote writes."""
+    from .shortcut_policy import excluded_shortcut_ids, SHORTCUT_MIME
+    excluded = excluded_shortcut_ids(journal.records())
+    coverage = fresh_workbook.get('sheets', {}).get('Rename Coverage', [])
+    if coverage:
+        headers = coverage[0]
+        if 'Verified MIME type' in headers and 'Source ID' in headers:
+            mi, si = headers.index('Verified MIME type'), headers.index('Source ID')
+            excluded |= {row[si] for row in coverage[1:] if len(row) > max(mi, si) and row[mi] == SHORTCUT_MIME}
+    if excluded:
+        raise ValueError('SHORTCUT_POLICY_PUBLICATION_REQUIRES_SUPPORTED_DISPOSITION')
     basis = config['identity_basis']
     if isinstance(basis, (str, Path)):
         basis = _load(basis)

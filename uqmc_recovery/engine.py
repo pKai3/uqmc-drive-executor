@@ -182,6 +182,8 @@ class Engine:
         return snapshot(op.before)
 
     def _preflight(self, op, before, excluded, approval=None):
+        from .shortcut_policy import guard_shortcut_mutation
+        guard_shortcut_mutation(before, op.target)
         check = self.adapter.preflight(op, before, excluded)
         if not check.get("complete") or not check.get("rollback_possible"):
             raise SafetyError("INCOMPLETE_PREFLIGHT")

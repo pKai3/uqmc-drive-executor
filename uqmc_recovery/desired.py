@@ -27,6 +27,7 @@ from .projection import HEADERS
 from .section_importer import validate_section_authority
 from .run_authority import RunAuthority
 from .importer import retired_source_ids
+from .shortcut_policy import is_shortcut, excluded_shortcut_ids, guard_shortcut_mutation, REASON as SHORTCUT_REASON
 
 
 VERIFIED = {"VERIFIED_APPLIED", "RECONCILED_AT_TARGET"}
@@ -69,8 +70,11 @@ def compile_items(plan, journal, *, validate_authority=True):
     if validate_authority:
         validate_section_authority(journal, plan)
     excluded = set(plan.excluded_ids) | {r["payload"]["file_id"] for r in records if r["kind"] == "EXCLUDED"} | retired_source_ids(records)
+    shortcuts = excluded_shortcut_ids(records)
     groups = {}
     for op in plan.ordered():
+        if is_shortcut(op.before) or op.file_id in shortcuts:
+            continue  # Historical outcomes remain; never replay or undo an excluded shortcut.
         if op.direction != "FORWARD" or op.action not in {"MOVE", "RENAME"}:
             raise SafetyError("FORWARD_MOVE_RENAME_PLAN_REQUIRED")
         if op.file_id in excluded or set(op.before["parents"]) & excluded or set(op.target.get("parents", [])) & excluded:
@@ -151,6 +155,9 @@ class DesiredRunner:
         self.last_backup_manifest = None
         self.items = compile_items(self.plan, journal, validate_authority=False)
         self.by_id = {i["source_id"]: i for i in self.items}
+        excluded = excluded_shortcut_ids(journal.records())
+        self.shortcut_ids = sorted({op.file_id for op in plan.operations
+                                   if is_shortcut(op.before) or op.file_id in excluded})
 
     @property
     def stop_requested(self):
@@ -427,6 +434,8 @@ class DesiredRunner:
             children = self.preview_read(preview_cache, "children", pid, self.children)
             members.extend(children)
             pending.extend(c["id"] for c in children if c["mimeType"] == FOLDER)
+        if target and any(is_shortcut(m) for m in members):
+            raise SafetyError("SHORTCUT_DESCENDANT_MUST_STAY_IN_PLACE")
         actual_ids = [m["id"] for m in members]
         if len(actual_ids) != len(set(actual_ids)) or set(actual_ids) != expected:
             raise SafetyError("FOLDER_MEMBERSHIP_DRIFT")
@@ -638,6 +647,7 @@ class DesiredRunner:
         return copy.deepcopy(cache[key])
 
     def preflight(self, item, before, target, *, rollback=False, preview_cache=None):
+        guard_shortcut_mutation(before, target)
         parents = {}
         if before["name"] != target["name"] and before.get("capabilities", {}).get("canRename") is False:
             raise SafetyError("SOURCE_CANNOT_RENAME")
@@ -997,6 +1007,8 @@ class DesiredRunner:
         return {"schema_version": "uqmc.desired.status.v1", "plan_sha256": self.plan_sha256,
             "generated_at_utc": utcnow(), "journal_sequence": len(self.journal.records()),
             "coverage": "items_observed_this_invocation", "total_plan_items": len(self.items),
+            "scope_dispositions": [{"source_id": sid, "disposition": "EXCLUDED", "reason_code": SHORTCUT_REASON,
+                                    "historical_effects_preserved": True} for sid in self.shortcut_ids],
             "processed_items": len(items), "unprocessed_items": len(self.items) - len(items),
             "counts": dict(Counter(i["state"] for i in items)), "items": items, "paused": self.stop_requested,
             "progress_output_failed": self.progress_output_failed, "audit_permissions": self.audit_permissions, **extra}

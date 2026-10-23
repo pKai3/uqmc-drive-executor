@@ -501,6 +501,9 @@ class ActionBridge:
         from .agent_profile import agent_snapshot, agent_semantic, adjust_descendant_renames
         from .model import validate_rollback_links
         op, plan_ref = self._frozen(plan, op_id)
+        from .shortcut_policy import guard_shortcut_mutation
+        guard_shortcut_mutation(op.before, op.target)
+        guard_shortcut_mutation(before, op.target)
         authority = self._agent_authority(plan, approval)
         validate_rollback_links(self.journal, plan)
         records = self.journal.records()
