@@ -163,6 +163,11 @@ class DesiredRunner:
     def report_progress(self, event, **value):
         with self._progress_gate:
             try:
+                # Presentation context only: do not invent an observed name or
+                # change an error/result persisted in the execution journal.
+                item = self.by_id.get(value.get("source_id"))
+                if item and event == "item_finished":
+                    value.setdefault("display_name", item["target"]["name"])
                 self.progress({"event": event, **value})
             except Exception:
                 # An output failure must not turn a verified action into a retry.

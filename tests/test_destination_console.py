@@ -35,6 +35,33 @@ class DestinationConsoleTests(unittest.TestCase):
         self.assertNotIn('private detail', text)
         self.assertNotIn('"counts"', text)
 
+    def test_runner_conflict_supplies_name_without_claiming_observation(self):
+        import copy
+        import threading
+        from uqmc_recovery.desired import DesiredRunner
+        r = self.reporter()
+        runner = object.__new__(DesiredRunner)
+        runner.by_id = {'fixture-shortcut': {'target': {'name': "Club Photos"}}}
+        runner._progress_gate = threading.RLock()
+        runner.progress = r.progress
+        runner.progress_output_failed = False
+        result = {'source_id': 'fixture-shortcut', 'state': 'CONFLICT',
+                  'reason': 'PROTECTED_METADATA_DRIFT'}
+        before = copy.deepcopy(result)
+        runner.report_progress('item_finished', completed_items=1, total_items=1, **result)
+        self.assertIn('1/1 conflict: Club Photos; PROTECTED_METADATA_DRIFT (ID: fixture-shortcut)',
+                      self.out.getvalue())
+        self.assertEqual(result, before)
+        self.assertNotIn('observed', result)
+
+    def test_conflict_observed_name_wins_over_planned_display_name(self):
+        r = self.reporter()
+        r.progress({'event': 'item_finished', 'state': 'CONFLICT',
+                    'completed_items': 1, 'total_items': 1, 'source_id': 'fixture',
+                    'observed': {'name': 'Actual current name'}, 'display_name': 'Planned name',
+                    'reason': 'CONCURRENT_CHANGE'})
+        self.assertIn('conflict: Actual current name; CONCURRENT_CHANGE (ID: fixture)', self.out.getvalue())
+
     def test_actual_nested_publication_result_shows_both_verified_stages(self):
         r=self.reporter()
         r.finish({'counts':{'APPLIED':320},'publication':{

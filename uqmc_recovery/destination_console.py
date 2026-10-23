@@ -117,10 +117,13 @@ class ConsoleReporter:
             elif stage == "item_finished":
                 state = value.get("state", "UNKNOWN")
                 self.counts[state] = self.counts.get(state, 0) + 1
-                name = (value.get("observed") or {}).get("name") or value.get("source_id", "item")
+                name = ((value.get("observed") or {}).get("name")
+                        or value.get("display_name") or value.get("source_id", "item"))
                 count = f"{value.get('completed_items', '?')}/{value.get('total_items', '?')}"
                 reason = value.get("reason", value.get("reason_code"))
                 suffix = "; " + concise(reason, 100) if reason else ""
+                if reason and value.get("source_id") and name != value["source_id"]:
+                    suffix += " (ID: " + concise(value["source_id"]) + ")"
                 self.line(f"{count} {state.lower().replace('_', ' ')}: {concise(name)}{suffix}")
             elif stage == "request_failed":
                 error = value.get("request_error") or {}
