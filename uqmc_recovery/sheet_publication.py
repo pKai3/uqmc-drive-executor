@@ -61,6 +61,8 @@ def read_existing(capture):
         if name in BASE_WIDTHS:width=min(width+3,p['gridProperties']['columnCount'])
         ranges.append(a1(name,0,0,p['gridProperties']['rowCount'],width));names.append(name)
     values=api.values().batchGet(spreadsheetId=wid,ranges=ranges,valueRenderOption='FORMULA').execute(num_retries=0)
+    if len(values.get('valueRanges',[]))!=len(names):
+        raise ValueError('INCOMPLETE_PUBLICATION_READBACK')
     matrices={name:v.get('values',[]) for name,v in zip(names,values['valueRanges'])}
     return {'metadata':metadata,'properties':properties,'ranges':ranges,'names':names,'matrices':matrices}
 
@@ -264,6 +266,32 @@ def build_sheet_plan(bundle,existing):
         'verified_renames':renames,'verified_direct_moves':moves,
         'existing_digest':seal(existing),'preserved_digest':seal({n:[pad(r,w) for r in matrices[n]] for n,w in BASE_WIDTHS.items()})}
 
+def readback_plan(capture,plan):
+    """Verify all saved writes using one bounded tab read, not per-row requests.
+
+    These same current matrices also prove original proposal cells/formulas are
+    unchanged. Missing cells remain mismatches; incomplete API responses fail.
+    """
+    after=read_existing(capture)
+    mismatches=[]
+    for change in plan['changes']:
+        match=re.fullmatch(r"'((?:[^']|'')+)'!([A-Z]+)([1-9][0-9]*):([A-Z]+)([1-9][0-9]*)",change['range'])
+        if not match:raise ValueError('INVALID_PUBLICATION_READBACK_RANGE')
+        name,left,top,right,bottom=match.groups();name=name.replace("''", "'")
+        def index(column):
+            value=0
+            for letter in column:value=value*26+ord(letter)-ord('A')+1
+            return value-1
+        start=index(left);end=index(right)+1;top=int(top)-1;bottom=int(bottom)
+        expected=[[v if v is not None else '' for v in row] for row in change['values']]
+        if len(expected)!=bottom-top or any(len(row)!=end-start for row in expected):
+            raise ValueError('INVALID_PUBLICATION_READBACK_SHAPE')
+        rows=after['matrices'].get(name,[])
+        actual=[pad(rows[n] if n<len(rows) else [],end)[start:end] for n in range(top,bottom)]
+        if actual!=expected:mismatches.append(change['range'])
+    preserved=seal({n:[pad(r,w) for r in after['matrices'][n]] for n,w in BASE_WIDTHS.items()})==plan['preserved_digest']
+    return mismatches,preserved
+
 def publish(capture,bundle,output,*,apply=False):
     output=Path(output);before=read_existing(capture);plan=build_sheet_plan(bundle,before)
     save(output/'prewrite.json',{'before':before,'plan':plan})
@@ -279,19 +307,7 @@ def publish(capture,bundle,output,*,apply=False):
     try:api.batchUpdate(spreadsheetId=wid,body={'requests':plan['requests']}).execute(num_retries=0)
     except Exception as exc:error=type(exc).__name__ # Never expose credential-bearing raw errors.
     # No blind replay: inspect all changed cells even after a timeout.
-    mismatches=[]
-    for start in range(0,len(plan['changes']),100):
-        chunk=plan['changes'][start:start+100]
-        observed=api.values().batchGet(spreadsheetId=wid,ranges=[c['range'] for c in chunk],valueRenderOption='FORMULA').execute(num_retries=0)
-        if len(observed.get('valueRanges',[]))!=len(chunk):
-            raise ValueError('INCOMPLETE_PUBLICATION_READBACK')
-        for change,result in zip(chunk,observed['valueRanges']):
-            rows=result.get('values',[]);expected=change['values'];width=len(expected[0])
-            actual=[pad(rows[n] if n<len(rows) else [],width) for n in range(len(expected))]
-            wanted=[[v if v is not None else '' for v in row] for row in expected]
-            if actual!=wanted:mismatches.append(change['range'])
-    after=read_existing(capture)
-    preserved=seal({n:[pad(r,w) for r in after['matrices'][n]] for n,w in BASE_WIDTHS.items()})==plan['preserved_digest']
+    mismatches,preserved=readback_plan(capture,plan)
     result=dict(summary,result='PUBLICATION_VERIFIED' if not mismatches and preserved else 'READBACK_CONFLICT',
         ranges=[c['range'] for c in plan['changes']],readback_mismatches=mismatches,
         proposal_values_and_formulas_preserved=preserved,write_error_class=error)

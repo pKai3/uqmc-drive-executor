@@ -10,7 +10,7 @@ from uqmc_recovery.importer import HEADERS as PROPOSAL_HEADERS
 from uqmc_recovery.projection import HEADERS, build_projections
 from uqmc_recovery.sheet_publication import (
     BASE_WIDTHS, STATUS_HEADERS, EXTRA_HEADERS, build_sheet_plan, read_existing,
-    publish, pad,
+    publish, pad, readback_plan, seal, a1,
 )
 
 
@@ -85,7 +85,7 @@ class FakeSheets:
                     rows.append(values)
                 while rows and not rows[-1]:rows.pop()
                 result.append({'range':address,'values':rows})
-            if self.drop_verification_range and self.updates and len(ranges)>5:result=result[:-1]
+            if self.drop_verification_range and self.updates:result=result[:-1]
             return {'valueRanges':result}
         return Request(run)
 
@@ -225,6 +225,34 @@ class SheetPublicationTests(unittest.TestCase):
             try:result=publish(self.capture,self.bundle,tmp,apply=True)
             except (ValueError,RuntimeError):return
         self.assertNotEqual(result['result'],'PUBLICATION_VERIFIED')
+
+    def test_large_checkpoint_verification_uses_one_values_read(self):
+        rows=[[f'item-{n}'] for n in range(1001)]
+        self.api.matrices['Execution Status']=self.api.matrices['Execution Status'][:6]+rows
+        self.api.properties['Execution Status']['gridProperties']['rowCount']=1007
+        plan={'changes':[{'range':a1('Execution Status',n+6,0,1,1),'values':[row]}
+                         for n,row in enumerate(rows)],
+              'preserved_digest':seal({n:[pad(r,w) for r in self.api.matrices[n]] for n,w in BASE_WIDTHS.items()})}
+        calls=[];original=self.api.batchGet
+        def counted(**kwargs):
+            calls.append(kwargs)
+            return original(**kwargs)
+        self.api.batchGet=counted
+        self.assertEqual(readback_plan(self.capture,plan),([],True))
+        self.assertEqual(len(calls),1)
+        self.assertEqual(len(calls[0]['ranges']),5)
+        self.assertEqual(self.api.updates,[])
+        self.api.matrices['Execution Status'][1006]=['changed-by-human']
+        self.assertEqual(readback_plan(self.capture,plan),(["'Execution Status'!A1007:A1007"],True))
+
+    def test_batched_readback_does_not_ignore_changed_proposal_or_incomplete_cells(self):
+        plan=self.plan()
+        with tempfile.TemporaryDirectory() as tmp:publish(self.capture,self.bundle,tmp,apply=True)
+        self.api.matrices['Proposed Renames'][1][4]='No'
+        self.api.matrices['Execution Status'][7][7]='different name'
+        mismatches,preserved=readback_plan(self.capture,plan)
+        self.assertIn("'Execution Status'!C8:S8",mismatches)
+        self.assertFalse(preserved)
 
     def test_retry_after_known_delivery_does_not_duplicate_log(self):
         with tempfile.TemporaryDirectory() as tmp:

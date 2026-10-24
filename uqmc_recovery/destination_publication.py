@@ -43,8 +43,14 @@ def _error(exc):
     # arbitrary Google exception text, URLs, headers or token-bearing messages.
     text = str(exc) if isinstance(exc, ValueError) else ''
     code = text.split(':', 1)[0]
-    return {'error_class': type(exc).__name__, **({'reason': code}
-            if re.fullmatch(r'[A-Z][A-Z0-9_]+', code) else {})}
+    result = {'error_class': type(exc).__name__, **({'reason': code}
+              if re.fullmatch(r'[A-Z][A-Z0-9_]+', code) else {})}
+    status = getattr(getattr(exc, 'resp', None), 'status', None)
+    if isinstance(status, int) and 100 <= status <= 599:
+        result['http_status'] = status
+        result.setdefault('reason', f'HTTP_{status}')
+    return result
+
 
 
 def _save(path, value):
@@ -301,26 +307,13 @@ def _artifacts(directory, receipt):
 
 def _sheet_readback_saved(capture, stage):
     """Recover a crash after remote success from the existing publisher preimage."""
-    from .sheet_publication import pad, read_existing, seal, BASE_WIDTHS
+    from .sheet_publication import readback_plan
     prewrite = stage / 'prewrite.json'
     if not prewrite.exists():
         return False
     plan = _load(prewrite)['plan']
-    api = capture.service.spreadsheets()
-    for start in range(0, len(plan['changes']), 100):
-        chunk = plan['changes'][start:start + 100]
-        response = api.values().batchGet(spreadsheetId=capture.workbook_id,
-            ranges=[c['range'] for c in chunk], valueRenderOption='FORMULA').execute(num_retries=0)
-        if len(response.get('valueRanges', [])) != len(chunk):
-            return False
-        for change, observed in zip(chunk, response['valueRanges']):
-            expected = [[v if v is not None else '' for v in row] for row in change['values']]
-            actual = observed.get('values', [])
-            actual = [pad(actual[n] if n < len(actual) else [], len(expected[0])) for n in range(len(expected))]
-            if actual != expected:
-                return False
-    current = read_existing(capture)
-    return seal({n: [pad(r, w) for r in current['matrices'][n]] for n, w in BASE_WIDTHS.items()}) == plan['preserved_digest']
+    mismatches, preserved = readback_plan(capture, plan)
+    return not mismatches and preserved
 
 
 def resume_publication(directory, *, sheet_capture, drive, apply=False, server_sync=None, sheet_only=False):

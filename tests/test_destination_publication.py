@@ -121,6 +121,12 @@ class DestinationPublicationTests(unittest.TestCase):
         self.assertEqual(repeated['sheet']['state'],'VERIFIED')
         self.assertEqual(len(self.sheet.updates),1)
 
+    def test_http_error_reports_status_without_sensitive_content(self):
+        exc=RuntimeError('Bearer PRIVATE_SECRET in https://private.invalid')
+        exc.resp=SimpleNamespace(status=429)
+        self.assertEqual(p._error(exc),{'error_class':'RuntimeError','http_status':429,'reason':'HTTP_429'})
+        self.assertNotIn('PRIVATE_SECRET',json.dumps(p._error(exc)))
+
     def test_html_response_loss_after_success_reconciles_without_retry(self):
         self.drive.fail='timeout';result=self.run_publish()
         self.assertEqual(result['html']['state'],'VERIFIED');self.assertEqual(len(self.drive.writes),1)
