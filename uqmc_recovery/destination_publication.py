@@ -323,9 +323,10 @@ def _sheet_readback_saved(capture, stage):
     return seal({n: [pad(r, w) for r in current['matrices'][n]] for n, w in BASE_WIDTHS.items()}) == plan['preserved_digest']
 
 
-def resume_publication(directory, *, sheet_capture, drive, apply=False, server_sync=None):
+def resume_publication(directory, *, sheet_capture, drive, apply=False, server_sync=None, sheet_only=False):
     """Retry only saved publication. Both stages reconcile before any dispatch.
 
+    sheet_only repairs the sheet receipt without touching server/Drive copies.
     Sheet conflicts/errors do not prevent an independent HTML attempt. Receipts
     retain stage state and sanitized exception class; raw credential-bearing
     exception text is never exported. There is no exactly-once claim: Drive and
@@ -345,8 +346,8 @@ def resume_publication(directory, *, sheet_capture, drive, apply=False, server_s
             return {'result': 'PREVIEW', 'snapshot_id': receipt['snapshot_id'],
                     'directory': str(directory), 'html_path': str(directory / 'viewer.html'),
                     'journal_sequence': receipt['journal_sequence']}
-        server_result = {'state': 'DISABLED'}
-        for kind in ('sheet', 'server', 'html'):
+        server_result = receipt.get('server_sync', {'state': 'DISABLED'}) if sheet_only else {'state': 'DISABLED'}
+        for kind in (('sheet',) if sheet_only else ('sheet', 'server', 'html')):
             if kind == 'server':
                 # The same frozen local bytes go to the mounted share first.
                 # Sheets remain independent; enabled server verification gates

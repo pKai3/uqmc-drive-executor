@@ -127,6 +127,51 @@ class SheetPublicationTests(unittest.TestCase):
         status=next(r['updateCells'] for r in plan['requests'] if r.get('updateCells',{}).get('range',{}).get('startRowIndex')==7)
         self.assertEqual(status['rows'][0]['values'][5]['userEnteredValue'],{'stringValue':'=KEEP_AS_LITERAL()'})
 
+    def test_new_registered_plan_identity_gets_status_row_without_changing_existing_links(self):
+        self.api.matrices['Execution Status'].pop()
+        self.api.properties['Execution Status']['gridProperties']['rowCount']=7
+        before=copy.deepcopy(self.api.matrices['Execution Status'][6])
+        with tempfile.TemporaryDirectory() as tmp:
+            result=publish(self.capture,self.bundle,tmp,apply=True)
+        self.assertEqual(result['result'],'PUBLICATION_VERIFIED')
+        self.assertEqual(result['added_status_source_ids'],['source-one'])
+        self.assertEqual(self.api.matrices['Execution Status'][6],before)
+        row=self.api.matrices['Execution Status'][7]
+        self.assertEqual(row[:2],['source-one','https://drive.google.com/file/d/source-one/view'])
+        self.assertEqual(row[3],'APPLIED')
+        self.assertEqual(row[7],'=KEEP_AS_LITERAL()')
+        self.assertEqual(self.api.properties['Execution Status']['gridProperties']['rowCount'],8)
+        formatting=[r['copyPaste'] for r in self.api.updates[0]['requests']
+                    if r.get('copyPaste',{}).get('destination',{}).get('sheetId')==self.api.properties['Execution Status']['sheetId']]
+        self.assertEqual(len(formatting),1)
+        self.assertEqual(formatting[0]['pasteType'],'PASTE_FORMAT')
+        self.assertTrue(result['proposal_values_and_formulas_preserved'])
+
+    def test_missing_status_identity_requires_current_plan_binding(self):
+        self.api.matrices['Execution Status'].pop()
+        self.api.matrices['Proposed Renames']=self.api.matrices['Proposed Renames'][:1]
+        self.api.matrices['Move Manifest']=self.api.matrices['Move Manifest'][:1]
+        with self.assertRaisesRegex(ValueError,'TRACKED_SOURCE_NOT_IN_CURRENT_PLAN:1'):
+            self.plan()
+        self.assertEqual(self.api.updates,[])
+
+    def test_missing_status_identity_can_match_manifest_without_rename(self):
+        self.api.matrices['Execution Status'].pop()
+        self.api.matrices['Proposed Renames']=self.api.matrices['Proposed Renames'][:1]
+        self.assertEqual(self.plan()['added_status_source_ids'],['source-one'])
+
+    def test_lost_response_and_retry_do_not_duplicate_appended_status(self):
+        self.api.matrices['Execution Status'].pop()
+        self.api.timeout_after_update=True
+        with tempfile.TemporaryDirectory() as tmp:
+            first=publish(self.capture,self.bundle,tmp,apply=True)
+            second=publish(self.capture,self.bundle,tmp,apply=True)
+        self.assertEqual(first['result'],'PUBLICATION_VERIFIED')
+        self.assertEqual(first['write_error_class'],'TimeoutError')
+        self.assertEqual(second['added_status_source_ids'],[])
+        self.assertEqual(sum(row[0]=='source-one' for row in self.api.matrices['Execution Status'][6:]),1)
+        self.assertEqual(len(self.api.matrices['Operation Log']),2)
+
     def test_existing_log_event_is_not_rewritten_or_duplicated(self):
         existing=copy.deepcopy(self.bundle['operation_log']['rows'][0]);existing[24]='Historical text'
         self.api.matrices['Operation Log'].append(existing)

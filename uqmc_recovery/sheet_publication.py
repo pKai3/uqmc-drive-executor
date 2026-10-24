@@ -11,6 +11,7 @@ from collections import defaultdict
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 
 from .projection import HEADERS as LOG_HEADERS, validate_snapshot
@@ -113,7 +114,32 @@ def build_sheet_plan(bundle,existing):
             if row[0] in source_rows:raise ValueError('DUPLICATE_STATUS_SOURCE')
             source_rows[row[0]]=n
     missing=set(tracked)-source_rows.keys()
-    if missing:raise ValueError('TRACKED_SOURCE_NOT_IN_STATUS:'+str(len(missing)))
+    # Newly registered identities need a status row too. Require both the
+    # validated publication snapshot and a current plan's stable-ID binding;
+    # never append arbitrary journal identities or infer IDs from display names.
+    plan_ids={pad(row,width)[column]
+        for name,width,column in (('Proposed Renames',18,16),('Move Manifest',12,11))
+        for row in matrices[name][1:] if pad(row,width)[column]}
+    if missing-plan_ids:
+        raise ValueError('TRACKED_SOURCE_NOT_IN_CURRENT_PLAN:'+str(len(missing-plan_ids)))
+    if any(not isinstance(sid,str) or sid=='root' or not re.fullmatch(r'[A-Za-z0-9_-]+',sid)
+           for sid in missing):
+        raise ValueError('INVALID_STATUS_SOURCE_ID')
+    added_status_source_ids=sorted(missing)
+    next_row=max(6,len(matrices['Execution Status']))
+    exemplar=max(source_rows.values(),default=None)
+    for sid in added_status_source_ids:
+        source_rows[sid]=next_row
+        write('Execution Status',next_row,0,[[sid,'https://drive.google.com/file/d/'+sid+'/view']])
+        if exemplar is not None:
+            sheet_id=props['Execution Status']['sheetId']
+            requests.append({'copyPaste':{
+                'source':{'sheetId':sheet_id,'startRowIndex':exemplar,'endRowIndex':exemplar+1,
+                          'startColumnIndex':0,'endColumnIndex':19},
+                'destination':{'sheetId':sheet_id,'startRowIndex':next_row,'endRowIndex':next_row+1,
+                               'startColumnIndex':0,'endColumnIndex':19},
+                'pasteType':'PASTE_FORMAT'}})
+        next_row+=1
     for sid,item in tracked.items():
         m,r,l,o=item['move'],item['rename'],item['location'],item['observed']
         opids=list(dict.fromkeys(m['operation_ids']+r['operation_ids']))
@@ -234,6 +260,7 @@ def build_sheet_plan(bundle,existing):
         [f'{snapshot["coverage"]["identity_count"]:,} source identities; {len(tracked)} tracked identities updated. Historical failures remain in the log; latest verified item effects are shown below. No global live reconciliation. Other rows retain their prior snapshot IDs.']])
     return {'snapshot_id':snapshot['snapshot_id'],'journal_sequence':snapshot['journal_sequence'],
         'requests':requests,'changes':changes,'tracked_rows':len(tracked),'new_log_rows':len(append),
+        'added_status_source_ids':added_status_source_ids,
         'verified_renames':renames,'verified_direct_moves':moves,
         'existing_digest':seal(existing),'preserved_digest':seal({n:[pad(r,w) for r in matrices[n]] for n,w in BASE_WIDTHS.items()})}
 

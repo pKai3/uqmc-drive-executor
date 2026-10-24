@@ -99,6 +99,28 @@ class DestinationPublicationTests(unittest.TestCase):
         self.assertEqual(len(self.drive.writes),1);self.assertEqual(len(self.sheet.updates),1)
         self.assertEqual(self.sheet.matrices['Proposed Moves'][1][10],'Yes')
         self.assertEqual(self.sheet.matrices['Proposed Renames'][1][5],'=IF(E2="Yes","Approved","")')
+    def test_sheet_only_recovery_appends_identity_and_preserves_other_delivery_receipts(self):
+        path=self.freeze()
+        receipt=p._load(path/'publication.json')
+        receipt['sheet']={'state':'UNCERTAIN','reason':'TRACKED_SOURCE_NOT_IN_STATUS'}
+        receipt['html']={'state':'VERIFIED','verified_at_utc':'2026-01-01T00:00:00Z'}
+        receipt['server_sync']={'state':'VERIFIED','sha256':'existing-server-hash'}
+        p._save(path/'publication.json',receipt)
+        self.sheet.matrices['Execution Status'].pop()
+        with patch('uqmc_recovery.server_sync.sync_publication',side_effect=AssertionError('server touched')):
+            result=p.resume_publication(path,sheet_capture=self.capture,drive=None,
+                apply=True,server_sync={'enabled':True},sheet_only=True)
+        self.assertEqual(result['result'],'PUBLICATION_VERIFIED')
+        self.assertEqual(result['sheet']['result']['added_status_source_ids'],['source-one'])
+        self.assertEqual(result['html'],receipt['html'])
+        self.assertEqual(result['server_sync'],receipt['server_sync'])
+        self.assertFalse(self.drive.writes)
+        # A repeat recovers the sheet receipt by readback, with no second write.
+        repeated=p.resume_publication(path,sheet_capture=self.capture,drive=None,
+            apply=True,server_sync={'enabled':True},sheet_only=True)
+        self.assertEqual(repeated['sheet']['state'],'VERIFIED')
+        self.assertEqual(len(self.sheet.updates),1)
+
     def test_html_response_loss_after_success_reconciles_without_retry(self):
         self.drive.fail='timeout';result=self.run_publish()
         self.assertEqual(result['html']['state'],'VERIFIED');self.assertEqual(len(self.drive.writes),1)
