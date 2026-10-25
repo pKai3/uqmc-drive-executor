@@ -231,6 +231,39 @@ def revision_folder_updates(journal):
     return list(result.values())
 
 
+def retained_reporting_evidence(directory, data):
+    """Retain current externally reconciled reporting with its original preimage.
+
+    A private receipt preserves full observations when the next public snapshot
+    redacts them. This never supplies migration authority or edits the journal.
+    """
+    marker=data.get('live_reconciliation') or {}
+    ids=marker.get('resolved_move_rename_conflicts',[])
+    if not ids:return None
+    if len(ids)!=len(set(ids)):raise ValueError('DUPLICATE_REPORTING_RECONCILIATION')
+    path=Path(directory)/'reporting-reconciliation.json'
+    if path.exists():
+        proof=_load(path)
+        if (set(ids)!={i['source_id'] for i in proof['items']} or
+                proof['base_journal_checkpoint']!=marker.get('base_journal_checkpoint') or
+                proof['verified_at_utc']!=marker.get('verified_at_utc')):
+            raise ValueError('REPORTING_RECONCILIATION_RECEIPT_CHANGED')
+        return proof
+    snapshot=data.get('execution',{})
+    if snapshot.get('journal_sequence')!=marker.get('base_journal_checkpoint'):
+        raise ValueError('REPORTING_RECONCILIATION_RECEIPT_REQUIRED')
+    items={i['source_id']:i for i in snapshot.get('items',[])}
+    if not set(ids)<=items.keys():raise ValueError('REPORTING_RECONCILIATION_ID_MISSING')
+    proof={'base_journal_checkpoint':marker['base_journal_checkpoint'],
+           'base_journal_tip_sha256':snapshot['journal_tip_sha256'],
+           'verified_at_utc':marker['verified_at_utc'],
+           'items':[copy.deepcopy(items[sid]) for sid in ids]}
+    # Validate against the journal projection before saving or using this proof.
+    # The complete desired-state projection is validated by build_publication
+    # immediately below. Persist only after that succeeds.
+    return proof
+
+
 def freeze_publication(config, registry, *, journal, fresh_workbook, drive):
     """Read remote HTML; freeze private artifacts without any remote writes."""
     from .revision_cleanup import filter_registry
@@ -252,8 +285,11 @@ def freeze_publication(config, registry, *, journal, fresh_workbook, drive):
     report = viewer.refresh_proposal(data, workbook, folder_revisions=revisions)
     report['registered_source_ids'] = registered
     specs = display_section_specs(registry, data, basis['source_ids'])
+    corrections = retained_reporting_evidence(config['publication_directory'], data)
     bundle = build_publication(journal, allowed_source_ids=basis['source_ids'],
-        identity_basis=basis, sections=specs)
+        identity_basis=basis, sections=specs, reporting_corrections=corrections)
+    if corrections:
+        _save(Path(config['publication_directory']) / 'reporting-reconciliation.json', corrections)
     snapshot = bundle['html']['snapshot_id']
     # Proposal edits may change HTML without changing journal snapshot. Include
     # proposal content in the delivery key; snapshot IDs still match sheet/HTML.

@@ -102,6 +102,23 @@ def register_proposal_files(data, workbook, identity_basis):
     return added
 
 
+def node_paths(data):
+    """Resolve parent links by node identity, including appended proposal folders."""
+    nodes={n['i']:n for n in data['nodes']}
+    if len(nodes)!=len(data['nodes']):raise ValueError('DUPLICATE_VIEWER_NODE_ID')
+    paths={};visiting=set()
+    def path(identity):
+        if identity in paths:return paths[identity]
+        if identity in visiting:raise ValueError('PROPOSAL_TREE_CYCLE')
+        if identity not in nodes:raise ValueError('PROPOSAL_PARENT_MISSING')
+        visiting.add(identity);n=nodes[identity]
+        paths[identity]=(path(n['p']) if n['p']>=0 else ())+(n['n'].strip(),)
+        visiting.remove(identity)
+        return paths[identity]
+    for identity in nodes:path(identity)
+    return paths
+
+
 def proposed_folder_updates(data, workbook, *, folder_revisions=()):
     """Map display-only folder revisions from current sheet targets and stable IDs.
 
@@ -109,10 +126,9 @@ def proposed_folder_updates(data, workbook, *, folder_revisions=()):
     file's explicit sheet target agrees with the same subtree transformation.
     This does not freeze a migration plan or confer execution approval.
     """
-    nodes = data['nodes']; paths = {}; children = {}
+    nodes = data['nodes']; paths = node_paths(data); children = {}
     for n in nodes:
         children.setdefault(n['p'], []).append(n)
-        paths[n['i']] = (paths[n['p']] if n['p'] >= 0 else ()) + (n['n'].strip(),)
     rows = workbook.get('sheets', workbook.get('matrices', {}))['Proposed Renames']
     ix = {k: rows[0].index(k) for k in ('Source ID', 'Proposed name + type suffix', 'Proposed destination folder')}
     targets = {}
@@ -238,7 +254,7 @@ def mark_proposed_revision_status(data, revisions):
             sec['proposal_pending_file_count'] = count
         else:
             sec.pop('proposal_status', None); sec.pop('proposal_pending_file_count', None)
-    data['proposal_revision_summary'] = {'pending_folder_count': len(pending),
+    data['proposal_revision_summary'] = {**data.get('proposal_revision_summary', {}), 'pending_folder_count': len(pending),
         'pending_file_count': len(pending_members), 'basis': 'current_sheet_display_only'}
 
 

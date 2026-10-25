@@ -239,7 +239,59 @@ def _carried_folder_observations(journal, observations):
     return result
 
 
-def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(), verified_source_links=None):
+def retain_reporting_observations(journal, items, proof):
+    """Carry an explicitly recorded live reporting correction, never a new action.
+
+    The original published preimage must still match and its journal prefix must
+    be intact. Later activity on this identity supersedes the correction. Full
+    evidence stays private; normal snapshot redaction still applies below.
+    """
+    if not proof:return
+    records=journal.records();base=proof.get('base_journal_checkpoint')
+    if (type(base) is not int or base<1 or base>len(records) or
+            records[base-1]['hash']!=proof.get('base_journal_tip_sha256')):
+        raise ValueError('REPORTING_RECONCILIATION_JOURNAL_MISMATCH')
+    verified=datetime.fromisoformat(proof['verified_at_utc'].replace('Z','+00:00'))
+    if verified.tzinfo is None or verified<datetime.fromisoformat(records[base-1]['at'].replace('Z','+00:00')):
+        raise ValueError('REPORTING_RECONCILIATION_TIME_INVALID')
+    later={e['payload'].get('source_id') or e['payload'].get('file_id') for e in records[base:]}
+    seen=set()
+    for correction in proof.get('items',[]):
+        sid=correction.get('source_id')
+        if sid in seen or sid not in items:raise ValueError('REPORTING_RECONCILIATION_ID_MISMATCH')
+        seen.add(sid)
+        if sid in later:continue
+        current=items[sid];prior=correction.get('prior_reporting_observation')
+        redacted=copy.deepcopy(current)
+        for field in ('exact_name','parent_ids','mime_type'):redacted['observed'][field]=None
+        if redacted!=prior:raise ValueError('REPORTING_RECONCILIATION_PREIMAGE_MISMATCH')
+        observed=correction.get('observed',{})
+        if (observed.get('read_state')!='VERIFIED' or not observed.get('exact_name') or
+                not observed.get('parent_ids') or not observed.get('mime_type') or
+                observed.get('metadata_verified_at_utc')!=proof.get('verified_at_utc')):
+            raise ValueError('REPORTING_RECONCILIATION_OBSERVATION_REQUIRED')
+        if (current['observed']['exact_name']!=observed['exact_name'] or
+                current['observed']['parent_ids']!=observed['parent_ids'] or
+                current['observed']['mime_type']!=observed['mime_type']):
+            raise ValueError('REPORTING_RECONCILIATION_TARGET_CHANGED')
+        for field in ('move','rename'):
+            effect=correction.get(field,{})
+            if (effect.get('effect')!='APPLIED' or effect.get('last_event_state')!='VERIFIED_APPLIED' or
+                    effect.get('operation_ids')!=current[field]['operation_ids'] or
+                    effect.get('verified_at_utc')!=proof['verified_at_utc']):
+                raise ValueError('REPORTING_RECONCILIATION_EFFECT_MISMATCH')
+        # Every corrected effect must have a historical successful readback.
+        applied=[e for e in records[:base] if e['kind']=='DESIRED_APPLIED' and
+                 e['payload'].get('source_id')==sid and e['payload'].get('observed_ref')]
+        if not applied:raise ValueError('REPORTING_RECONCILIATION_COMPLETION_REQUIRED')
+        successful=_core(journal.read_evidence(applied[-1]['payload']['observed_ref']))
+        if successful!={'id':sid,'name':observed['exact_name'],'parents':sorted(observed['parent_ids']),
+                        'mime_type':observed['mime_type']}:
+            raise ValueError('REPORTING_RECONCILIATION_TARGET_CHANGED')
+        items[sid]={key:copy.deepcopy(correction[key]) for key in current}
+
+
+def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(), verified_source_links=None, reporting_corrections=None):
     """Return workbook/html strict snapshots, private operation_log, and sections.
 
     sections entries: section_id, title, proposal_path, plan_sha256, source_ids
@@ -411,6 +463,7 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
         for label in ('move', 'rename'):
             item[label].update(effect='UNCHANGED', verified_at_utc=at)
         observed_raw[source] = _core(raw)
+    retain_reporting_observations(journal, items, reporting_corrections)
     for source,item in items.items():
         ancestors=sorted(set(item['location']['ancestor_move_operation_ids']) | inherited.get(source,set()))
         item['location']['ancestor_move_operation_ids']=ancestors
@@ -604,6 +657,7 @@ def build_publication(journal, *, allowed_source_ids, identity_basis, sections=(
         if op['related_forward_operation_id'] not in public_ops: op['related_forward_operation_id']=None
     for item in html['items']:
         for field in ('exact_name','parent_ids','mime_type'): item['observed'][field]=None
+        item['location']['verified_path']=None
         item['location']['ancestor_move_operation_ids']=[x for x in item['location']['ancestor_move_operation_ids'] if x in public_ops]
     event_order={e['event_id']:e['seq'] for e in records}
     log['rows'].sort(key=lambda r:event_order[r[0]])
