@@ -22,6 +22,11 @@ HEADERS = {
     "Proposed Renames": ["Rename necessity (guide)", "Current name + type suffix", "Proposed name + type suffix", "Necessity rationale (assistant)", "Decision (Yes/No)", "Review state", "Proposed destination folder", "Current source path", "Evidence / rationale", "Checks before execution", "Document date / year", "Evidence confidence", "Type code", "Rename ID", "Move proposal ID", "Manifest item", "Source ID", "Verified on"],
     "Rename Coverage": ["Rename necessity", "Assessment", "Current name + type suffix", "Proposed name / retained name", "Necessity rationale (assistant)", "Rename proposal", "Source link", "Existing proposed target", "Evidence / rationale", "Remaining checks", "Item kind", "Assessment scope", "Move proposal", "Manifest item / root reference", "Source ID", "Verified MIME type", "Verified on", "Coverage basis"],
 }
+# Optional in historical frozen captures; new captures include this identity map.
+# These rows bind destination context, never grant extra source operations.
+OPTIONAL_HEADERS = {"Destination Folder Names": ["Proposal ID", "Current folder name", "Proposed folder name",
+    "Destination folder path", "Decision (Yes/No)", "Review state", "Source folder ID",
+    "Open existing folder", "Necessity", "Checks / rationale"]}
 WITHDRAWN_VALUES = {"excluded", "withdrawn"}
 RETIRED_MARKER = "[RETIRED: USER_CONFIRMED_DELETED]"
 REDACTED_EXCLUSION_LABELS = {
@@ -50,7 +55,7 @@ def _rows(export, tab):
     if not isinstance(matrix, list) or not matrix or not isinstance(matrix[0], list):
         raise SafetyError("MISSING_WORKBOOK_RANGE:" + tab)
     headers = matrix[0]
-    if len(headers) != len(set(headers)) or not set(HEADERS[tab]) <= set(headers):
+    if len(headers) != len(set(headers)) or not set((HEADERS | OPTIONAL_HEADERS)[tab]) <= set(headers):
         raise SafetyError("WORKBOOK_HEADER_MISMATCH:" + tab)
     if any(not isinstance(h, str) for h in headers) or "_row" in headers:
         raise SafetyError("INVALID_WORKBOOK_HEADER")
@@ -70,13 +75,14 @@ def workbook_fingerprint(export, *, expected_workbook_id=WORKBOOK_ID):
     """Hash exact selected source ranges, including decisions, excluding fetch timestamp."""
     if not expected_workbook_id or export.get("workbook_id") != expected_workbook_id:
         raise SafetyError("WRONG_WORKBOOK")
-    if set(export.get("sheets", {})) != set(HEADERS):
+    tabs=set(export.get("sheets", {}))
+    if not set(HEADERS)<=tabs or tabs-set(HEADERS | OPTIONAL_HEADERS):
         raise SafetyError("WORKBOOK_SCOPE_INCOMPLETE")
-    if any(export.get("complete", {}).get(tab) is not True for tab in HEADERS):
+    if any(export.get("complete", {}).get(tab) is not True for tab in tabs):
         raise SafetyError("WORKBOOK_RANGE_NOT_COMPLETE")
     if not export.get("exported_at_utc"):
         raise SafetyError("WORKBOOK_CAPTURE_TIME_REQUIRED")
-    for tab in HEADERS:
+    for tab in tabs:
         _rows(export, tab)
     return digest({"workbook_id": export["workbook_id"], "sheets": export["sheets"], "complete": export["complete"]})
 
@@ -260,6 +266,8 @@ def _subtree_coverage_records(records, coverage, section_path=None, *, excluded_
 def catalog(export, *, expected_workbook_id=WORKBOOK_ID, include_subtree_coverage=False, subtree_section_path=None):
     """Find explicit source-ID proposal records without retrieving source metadata."""
     input_hash = workbook_fingerprint(export, expected_workbook_id=expected_workbook_id)
+    from .destination_mapping import destination_mappings
+    mappings=destination_mappings(_rows(export, "Destination Folder Names")) if "Destination Folder Names" in export['sheets'] else {}
     tombstones, quarantined = [], []
     rows_by_tab = {tab: _catalog_rows(export, tab, tombstones, quarantined) for tab in HEADERS}
     moves = _index(rows_by_tab["Proposed Moves"], "Proposal ID")
@@ -335,6 +343,7 @@ def catalog(export, *, expected_workbook_id=WORKBOOK_ID, include_subtree_coverag
                 # This does not alter proposal rows, row hashes, or move authority.
                 'folder_rename_coverage': [copy.deepcopy(r) for r in rows_by_tab['Rename Coverage']
                     if r.get('Verified MIME type') == FOLDER and _text(r.get('Rename proposal')).strip()]} if include_subtree_coverage else {}),
+            "destination_folder_mappings": mappings,
             "input_sha256": input_hash, "records": result, "excluded_ids": sorted(excluded | set(retired_records) | shortcuts),
             "shortcut_ids": sorted(shortcuts), "shortcut_evidence": shortcut_evidence,
             "private_excluded_ids": sorted(excluded), "retired_ids": sorted(retired_records), "retired_records": retired_records,

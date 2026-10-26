@@ -285,14 +285,29 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
     # A top-level anchor with a configured project root still proves placement.
     anchor_requires_parent=bool(start and '/' not in start and config.get('root_id'))
     folder(sid,parent_context=sid not in ids and not anchor_requires_parent)
-    if start and raw[sid]['name'].strip()!=start.rsplit('/',1)[-1].strip():raise SafetyError('PROJECT_ANCHOR_NAME_DRIFT:'+start)
+    anchor_mapping=source.get('destination_folder_mappings',{}).get(start)
+    if anchor_mapping:
+        from .destination_mapping import verify_mapping
+        parent_path=logical_parent(start)
+        parent_id=known.get(parent_path) or source.get('destination_folder_mappings',{}).get(parent_path,{}).get('source_id') or (config.get('root_id') if not parent_path else None)
+        verify_mapping(anchor_mapping,metadata[sid],parent_id)
+    elif start and raw[sid]['name'].strip()!=start.rsplit('/',1)[-1].strip():raise SafetyError('PROJECT_ANCHOR_NAME_DRIFT:'+start)
     if start and '/' not in start and config.get('root_id') and raw[sid]['parents']!=[config['root_id']]:
         raise SafetyError('PROJECT_ANCHOR_PARENT_DRIFT:'+start)
     path=start
     for segment in anchor[len(start):].strip('/').split('/') if anchor!=start else []:
-        matches=[c for c in listings[sid] if c['name'].strip()==segment]
-        if len(matches)!=1 or matches[0]['mimeType']!=FOLDER:raise SafetyError('DESTINATION_PARENT_MISSING_OR_AMBIGUOUS:'+path+'/'+segment)
-        sid=matches[0]['id'];path=(path+'/' if path else '')+segment;folder(sid)
+        next_path=(path+'/' if path else '')+segment
+        mapping=source.get('destination_folder_mappings',{}).get(next_path)
+        if mapping:
+            from .destination_mapping import verify_mapping
+            mapped_id=mapping['source_id'];folder(mapped_id)
+            verify_mapping(mapping,metadata[mapped_id],sid,children=listings[sid])
+            sid=mapped_id
+        else:
+            matches=[c for c in listings[sid] if c['name'].strip()==segment]
+            if len(matches)!=1 or matches[0]['mimeType']!=FOLDER:raise SafetyError('DESTINATION_PARENT_MISSING_OR_AMBIGUOUS:'+next_path)
+            sid=matches[0]['id'];folder(sid)
+        path=next_path
     paths={anchor:sid}
     # A failed preparation can verify destination anchors before saving a run
     # registry. Reuse only exact-ID observations corroborated by this capture;
@@ -312,9 +327,22 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
     for spec in candidates:
         if spec['logical_key'] in allocated and spec['logical_path'] not in paths:continue
         parent=layout['destination_paths'].get(spec['parent_path'])
-        if parent is None:continue
+        mapping=source.get('destination_folder_mappings',{}).get(spec['logical_path'])
+        if parent is None:
+            if mapping:raise SafetyError('DESTINATION_MAPPING_PARENT_UNRESOLVED:'+spec['logical_path'])
+            continue
         folder(parent,parent_context=parent==paths[anchor] and parent not in ids)
         children=listings[parent]
+        if mapping:
+            from .destination_mapping import verify_mapping
+            mapped_id=mapping['source_id']
+            folder(mapped_id)
+            verify_mapping(mapping,metadata[mapped_id],parent,children=children)
+            if spec['logical_path'] in paths and paths[spec['logical_path']]!=mapped_id:
+                raise SafetyError('DESTINATION_MAPPING_EXISTING_ID_CONFLICT:'+spec['logical_path'])
+            paths[spec['logical_path']]=mapped_id
+            layout=plan_destination(source,section_path=section,metadata_by_id=metadata,anchor_paths=paths,recovered_folders=recovered)
+            continue
         reused_id=layout['destination_paths'].get(spec['logical_path'])
         own_rename=by_id.get(reused_id,{}).get('RENAME')
         # A proved reused folder can already occupy this parent under its exact
@@ -635,6 +663,10 @@ def run_destination(config,section,*,apply=False,resume=False,rollback=None,publ
             summary={'section':section,'preview_only':not apply,'counts':dict(Counter(x['disposition'] for x in state['checks'])),
                 'missing_folders':[x['logical_path'] for x in state['layout']['missing_folders']],
                 'whole_folder_reuse_ids':state['layout']['reused_folder_ids'],'retained_source_folder_ids':state['layout']['source_container_ids'],
+                'retained_source_folder_reasons':state['layout']['source_container_reasons'],
+                'existing_destination_paths':{p:s for p,s in state['layout']['destination_paths'].items()
+                    if p!=logical_parent(section) and s not in state['layout']['reused_folder_ids']},
+                'mapped_destination_folders':state['layout'].get('mapped_destination_folders',{}),
                 'skipped_verified_history':len(state['live'].get('history_cached_source_ids',[])),
                 'preview_cached_reads_available':state['live'].get('preview_cached_read_count',0),
                 'required_rename_effects':sum('name' in x.get('pending_fields',[]) for x in pending),

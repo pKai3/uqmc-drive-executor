@@ -356,10 +356,21 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
     paths = {path: sid for path, sid in paths.items() if path not in unused}
     if len(set(paths.values())) != len(paths):
         raise SafetyError('FOLDER_ID_HAS_MULTIPLE_TARGET_PATHS')
+    mapped_context={}
     for path, sid in paths.items():
         state = metadata_by_id.get(sid)
         if not state or state.get('id') != sid or state.get('mime_type') != FOLDER or state.get('trashed') is True:
             raise SafetyError('ANCHOR_FOLDER_METADATA_REQUIRED:' + path)
+        mapping=source.get('destination_folder_mappings',{}).get(path)
+        if mapping and path!=anchor:
+            from .destination_mapping import verify_mapping
+            verify_mapping(mapping, state, paths.get(logical_parent(path)))
+            if sid not in groups:
+                # A mapping is destination identity evidence, not an extra rename.
+                # Preserve the observed name and its current parent as preconditions.
+                names[path]=state['name']
+                mapped_context[path]={**copy.deepcopy(mapping),'observed_name':state['name'],
+                                      'observed_parent_id':state['parents'][0]}
         # Logical collection labels trim legacy outer whitespace. Without an
         # explicit source-folder name claim this is an existing destination,
         # not an instruction to rename it. Preserve its exact observed title.
@@ -517,6 +528,7 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
     return {'records': records, 'item_routes': {sid:routes[sid] for sid in groups}, 'destination_paths': resolved,
             'recovered_destination_folders': recovered,
             'destination_folder_names': names, 'missing_folders': missing,
+            'mapped_destination_folders': mapped_context,
             'reused_folder_ids': sorted(reuse), 'folder_reuse_proofs': reuse,
             'source_container_ids': sorted(containers),
             'source_container_refs': sorted(r['reference'] for r in records if r['source_id'] in containers),

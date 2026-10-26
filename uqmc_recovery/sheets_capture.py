@@ -10,7 +10,7 @@ import copy
 from datetime import datetime, timezone
 
 from .direct_transport import GoogleDriveTransport, TransportError, FULL_DRIVE_SCOPE
-from .importer import HEADERS, workbook_fingerprint
+from .importer import HEADERS, OPTIONAL_HEADERS, workbook_fingerprint
 from .model import SafetyError, digest
 
 CELL_FIELDS = "userEnteredValue,effectiveValue,formattedValue"
@@ -78,14 +78,15 @@ def normalize_capture(response, *, workbook_id, revision, started_at_utc, captur
         if not isinstance(sheet, dict) or not isinstance(sheet.get("properties"), dict):
             raise SafetyError("WORKBOOK_SHEET_METADATA_INVALID")
         title = sheet["properties"].get("title")
-        if title in HEADERS:
+        if title in HEADERS | OPTIONAL_HEADERS:
             if title in indexed:
                 raise SafetyError("DUPLICATE_WORKBOOK_SHEET")
             indexed[title] = sheet
-    if set(indexed) != set(HEADERS):
+    if not set(HEADERS)<=set(indexed):
         raise SafetyError("WORKBOOK_CAPTURE_INCOMPLETE")
+    captured_headers=HEADERS | {k:v for k,v in OPTIONAL_HEADERS.items() if k in indexed}
     matrices, evidence, unavailable = {}, {}, []
-    for title, required in HEADERS.items():
+    for title, required in captured_headers.items():
         sheet = indexed[title]
         grid = sheet["properties"].get("gridProperties", {})
         row_count, column_count = grid.get("rowCount"), grid.get("columnCount")
@@ -131,7 +132,7 @@ def normalize_capture(response, *, workbook_id, revision, started_at_utc, captur
             "requested_range": "'" + title.replace("'", "''") + "'!A:" + _column(len(required)),
             "rowData": copy.deepcopy(rows)}
     result = {"workbook_id": workbook_id, "exported_at_utc": captured_at_utc,
-        "sheets": matrices, "complete": {title: True for title in HEADERS},
+        "sheets": matrices, "complete": {title: True for title in captured_headers},
         "cell_evidence": evidence, "source_revision": copy.deepcopy(revision),
         "capture_started_at_utc": started_at_utc,
         "unavailable_formula_cells": unavailable,
@@ -167,7 +168,7 @@ class GoogleSheetsCapture:
         started = _utcnow()
         before = self._revision()
         ranges = ["'" + title.replace("'", "''") + "'!A:" + _column(len(headers))
-                  for title, headers in HEADERS.items()]
+                  for title, headers in (HEADERS | OPTIONAL_HEADERS).items()]
         response = self.drive._read(lambda: self.service.spreadsheets().get(
             spreadsheetId=self.workbook_id, ranges=ranges, fields=FIELDS),
             request="spreadsheets.get", item_id=self.workbook_id)
