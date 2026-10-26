@@ -92,6 +92,7 @@ def compile_items(plan, journal, *, validate_authority=True):
         item["target"]["parents"] = sorted(item["target"]["parents"])
         item["operations"].append(op)
         item["allowed_collision_ids"].update(op.allowed_collision_ids)
+    operation_sources = {op.operation_id: op.file_id for item in groups.values() for op in item["operations"] if op.action == "MOVE"}
     latest = {r["operation_id"]: r for r in records if r["kind"] in LEGACY_STATES}
     for item in groups.values():
         if item["source_id"] in item["target"]["parents"]:
@@ -104,6 +105,16 @@ def compile_items(plan, journal, *, validate_authority=True):
             if event and event["kind"] in {"ATTEMPTED", "UNCERTAIN"}:
                 item["historical_uncertain_operation_ids"].append(op.operation_id)
         item["dependencies"] = [p for p in item["target"]["parents"] if p in groups and groups[p]["target"]["mime_type"] == FOLDER]
+        # Preserve explicit folder-move dependencies, including ancestors
+        # behind a newly created immediate parent. Non-folder global rename
+        # phases remain collapsed; one file still has one combined update.
+        for op in item["operations"]:
+            for dependency in op.depends_on:
+                parent = operation_sources.get(dependency)
+                if (parent in groups and parent != item["source_id"]
+                        and groups[parent]["target"]["mime_type"] == FOLDER
+                        and parent not in item["dependencies"]):
+                    item["dependencies"].append(parent)
     # A folder must not mutate concurrently with an original descendant that
     # leaves it. Target-parent edges alone miss those outgoing children. Honor
     # a required inversion (child leaves first, old parent moves into child)
