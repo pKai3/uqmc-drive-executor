@@ -210,6 +210,14 @@ def _carried_folder_observations(journal, observations):
     for event in records:
         if _desired_state(event): latest[event['payload'].get('source_id')] = event['seq']
     result = dict(observations)
+    # A verified human move changes descendant logical paths, not their IDs,
+    # direct parents or historical metadata observation timestamps.
+    for revision in verified.values():
+        if revision.get('performed_by') != 'user': continue
+        prefix = revision['before_path'] + '/'
+        for key, old in list(result.items()):
+            if old['path'].startswith(prefix):
+                result[key] = {**old, 'path': revision['target_path'] + old['path'][len(prefix)-1:]}
     for event in records:
         if event['kind'] != 'DESTINATION_REVISION_FROZEN': continue
         payload = event['payload']; evidence = journal.read_evidence(payload['manifest_ref'])

@@ -194,6 +194,33 @@ def revision_folder_updates(journal):
         if _desired_state(event) and event['payload'].get('source_id'):
             latest[event['payload']['source_id']] = event
     for event in records:
+        p = event['payload']
+        if event['kind'] == 'DESTINATION_VERIFIED' and p.get('manual_relocation_ref'):
+            # A human-performed relocation is observed, never an executor move.
+            proof = journal.read_evidence(p['manual_relocation_ref'])
+            observed = journal.read_evidence(p['observed_ref'])
+            before = journal.read_evidence(proof['prior_observation_ref'])
+            parent = journal.read_evidence(proof['parent_observed_ref'])
+            sid = p['file_id']; target_path = proof.get('target_path', '')
+            parent_path = proof.get('parent_path', '')
+            expected = {'id': sid, 'name': p['exact_name'],
+                        'parents': sorted(p['parent_ids']), 'mime_type': 'application/vnd.google-apps.folder'}
+            if (proof.get('schema_version') != 'uqmc.manual-folder-relocation.v1'
+                    or proof.get('actor') != 'user' or proof.get('source_id') != sid
+                    or not proof.get('instruction') or not proof.get('before_path')
+                    or _core(observed) != expected or observed.get('trashed') is not False
+                    or _core(before)['id'] != sid or _core(before)['mime_type'] != expected['mime_type']
+                    or before.get('name') != observed['name']
+                    or _core(parent)['mime_type'] != expected['mime_type'] or parent.get('trashed') is not False
+                    or expected['parents'] != [parent['id']]
+                    or target_path != parent_path + '/' + observed['name']
+                    or p['proposal_path'] != target_path):
+                raise ValueError('MANUAL_FOLDER_RELOCATION_EVIDENCE_MISMATCH')
+            if latest.get(sid, {}).get('seq', 0) <= event['seq']:
+                result[sid] = {'source_id': sid, 'before_path': proof['before_path'],
+                    'target_path': target_path, 'target_name': observed['name'],
+                    'verified': True, 'performed_by': 'user'}
+            continue
         if event['kind'] != 'DESTINATION_REVISION_FROZEN':
             continue
         payload = event['payload']; evidence = journal.read_evidence(payload['manifest_ref'])
