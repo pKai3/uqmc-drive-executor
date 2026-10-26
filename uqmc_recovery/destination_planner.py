@@ -534,8 +534,16 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
             reasons[sid] = 'DESCENDANT_FOLDER_REBOUND_TO_OTHER_ID'
     reuse = {sid: proofs[sid] for sid in selected}
     containers = folders - selected
-    if containers & set(resolved.values()):
-        raise SafetyError('MIXED_SOURCE_CANNOT_BE_MUTATED_DESTINATION')
+    for sid in containers & set(resolved.values()):
+        route = routes[sid]
+        # A known destination already at its exact approved name and parent
+        # needs no folder mutation. Its excluded/unassigned children stay put;
+        # only separately approved descendants may be processed.
+        if (resolved.get(route['path']) != sid
+                or states[sid]['name'] != route['exact_name']
+                or states[sid]['parents'] != [resolved.get(route['parent_path'])]):
+            raise SafetyError('MIXED_SOURCE_CANNOT_BE_MUTATED_DESTINATION:' + sid)
+        reasons[sid] = 'DESTINATION_ALREADY_SATISFIED_WITH_RETAINED_CHILDREN'
     for sid in folders - selected:
         reasons.setdefault(sid, 'EXISTING_DESTINATION_REUSED_INSTEAD')
     # Same logical path may consolidate several old folders, but different

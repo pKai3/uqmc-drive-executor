@@ -40,6 +40,37 @@ class ArchiveSiblingTests(unittest.TestCase):
         self.assertEqual(f.server.requests,[])
 
 
+class StationaryDestinationTests(unittest.TestCase):
+    def fixture(self):
+        f=command.DestinationCommandTests();f.setUp();self.addCleanup(f.temp.cleanup)
+        f.mixed()
+        f.server.drive.files['source-root'].update(name='Skills',parents=['club'])
+        return f
+
+    def test_existing_completed_destination_keeps_unassigned_passengers(self):
+        f=self.fixture();before=copy.deepcopy(f.server.drive.files['eoi'])
+        preview=f.run_command()
+        self.assertEqual(preview['blockers'],[])
+        self.assertEqual(preview['missing_folders'],[])
+        self.assertEqual(preview['retained_source_folder_reasons']['source-root'],
+                         'DESTINATION_ALREADY_SATISFIED_WITH_RETAINED_CHILDREN')
+        result=f.run_command(apply=True)
+        self.assertEqual(result['counts'],{'APPLIED':1},result)
+        self.assertEqual([x['fileId'] for x in f.server.requests],['leaf'])
+        self.assertEqual(f.server.drive.files['eoi'],before)
+        self.assertEqual(f.server.drive.files['source-root']['parents'],['club'])
+
+    def test_mixed_destination_still_cannot_be_renamed(self):
+        f=self.fixture();f.config['anchor_paths'][command.SECTION]='source-root'
+        rows=f.export['sheets']['Proposed Renames'];heads=rows[0]
+        for row in rows[1:]:
+            if row[heads.index('Source ID')]=='source-root':
+                row[heads.index('Proposed name + type suffix')]='Changed Skills'
+        with self.assertRaisesRegex(SafetyError,'MIXED_SOURCE_CANNOT_BE_MUTATED_DESTINATION'):
+            f.run_command()
+        self.assertEqual(f.server.requests,[])
+
+
 class CreatedAliasTests(unittest.TestCase):
     section='Parent/Collection'
 
