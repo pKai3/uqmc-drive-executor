@@ -44,7 +44,8 @@ def resolve_folder_path(data, value):
     node = None
     for segment in path_parts(value):
         matches = [n for n in data['nodes'] if n['p'] == parent and n['s'] == 'destination'
-                   and n['f'] and segment in {n['n'].strip(), (n.get('o') or '').strip()}]
+                   and n['f'] and not n.get('viewer_hidden')
+                   and segment in {n['n'].strip(), (n.get('o') or '').strip()}]
         if len(matches) != 1:
             raise ValueError('SECTION_PATH_NOT_UNIQUE:' + value)
         node = matches[0]
@@ -119,6 +120,52 @@ def node_paths(data):
     return paths
 
 
+def retained_proposal_containers(data, workbook):
+    """Keep explicit source-only wrappers as audit context, not destinations.
+
+    A retain row must identify the same original source path as its target.
+    Any accompanying rename row must retain the original source location.
+    Existing display aliases never become authority to move the source wrapper.
+    """
+    matrices = workbook.get('sheets', workbook.get('matrices', {}))
+    manifest = matrices.get('Move Manifest', [])
+    retained = {}
+    destination_ids = {n.get('id') for n in data['nodes']
+                       if n['f'] and n['s'] == 'destination'}
+    for row in manifest[1:]:
+        record = dict(zip(manifest[0], row))
+        if record.get('Scope', '').strip().casefold() != 'retain container only':
+            continue
+        sid, source = record.get('Source ID'), record.get('Source path')
+        if not sid or sid not in destination_ids or not source:
+            continue
+        if record.get('Exact target path') != source:
+            raise ValueError('RETAINED_CONTAINER_TARGET_CHANGED:' + sid)
+        if sid in retained and retained[sid] != source:
+            raise ValueError('AMBIGUOUS_RETAINED_CONTAINER:' + sid)
+        retained[sid] = source
+    rows = matrices['Proposed Renames']
+    for row in rows[1:]:
+        record = dict(zip(rows[0], row)); sid = record.get('Source ID')
+        if sid not in retained:
+            continue
+        current = record.get('Current name + type suffix')
+        proposed = record.get('Proposed name + type suffix')
+        parent = record.get('Proposed destination folder')
+        if (not current or not proposed or not parent
+                or parent.rstrip('/') + '/' + current != retained[sid]):
+            raise ValueError('RETAINED_CONTAINER_RENAME_CONFLICT:' + sid)
+    for n in data['nodes']:
+        sid = n.get('id')
+        if (n['f'] and n['s'] == 'destination' and sid in retained
+                and not n.get('destination_overlay')):
+            n['retained_source_container'] = {'source_path': retained[sid]}
+            n['viewer_hidden'] = True
+        elif n.pop('retained_source_container', None):
+            n.pop('viewer_hidden', None)
+    return retained
+
+
 def proposed_folder_updates(data, workbook, *, folder_revisions=()):
     """Map display-only folder revisions from current sheet targets and stable IDs.
 
@@ -126,6 +173,7 @@ def proposed_folder_updates(data, workbook, *, folder_revisions=()):
     file's explicit sheet target agrees with the same subtree transformation.
     This does not freeze a migration plan or confer execution approval.
     """
+    retained = retained_proposal_containers(data, workbook)
     nodes = data['nodes']; paths = node_paths(data); children = {}
     for n in nodes:
         children.setdefault(n['p'], []).append(n)
@@ -164,7 +212,7 @@ def proposed_folder_updates(data, workbook, *, folder_revisions=()):
     frozen = {r['source_id']: r for r in folder_revisions}
     result = {}
     for n in nodes:
-        if not n['f'] or n['s'] != 'destination': continue
+        if not n['f'] or n['s'] != 'destination' or n.get('viewer_hidden'): continue
         sid = n.get('destination_overlay', {}).get('destination_id') or n.get('id')
         if not sid: continue
         current = '/'.join(paths[n['i']])
@@ -199,7 +247,7 @@ def proposed_folder_updates(data, workbook, *, folder_revisions=()):
         result[sid] = dict(source_id=sid, before_path=before, target_path=path,
                            target_name=name, verified=verified)
     for sid, r in frozen.items():
-        if sid not in result: result[sid] = r
+        if sid not in result and sid not in retained: result[sid] = r
     ordered = sorted(result.values(), key=lambda r: len(path_parts(r['before_path'])))
     independent = []
     for r in ordered:
@@ -265,6 +313,7 @@ def refresh_proposal(data, workbook, *, folder_revisions=(), proposed_layout=Fal
     are not introduced. The existing file tree is retained for records without
     a proposed rename row; nothing is inferred from absent spreadsheet rows.
     """
+    retained = retained_proposal_containers(data, workbook)
     nodes = data['nodes']
     by_id = {n['id']: n for n in nodes if n.get('id')}
     rows = workbook.get('sheets', workbook.get('matrices', {}))['Proposed Renames']
@@ -276,7 +325,7 @@ def refresh_proposal(data, workbook, *, folder_revisions=(), proposed_layout=Fal
     def resolve(parts):
         parent = -1
         for part in parts:
-            candidates = [n for n in nodes if n['p'] == parent and n['s'] == 'destination' and n['f'] and part in {n['n'].strip(), (n.get('o') or '').strip()}]
+            candidates = [n for n in nodes if n['p'] == parent and n['s'] == 'destination' and n['f'] and not n.get('viewer_hidden') and part in {n['n'].strip(), (n.get('o') or '').strip()}]
             if len(candidates) > 1:
                 raise ValueError('AMBIGUOUS_PROPOSAL_FOLDER:' + '/'.join(parts))
             if candidates:
@@ -320,9 +369,37 @@ def refresh_proposal(data, workbook, *, folder_revisions=(), proposed_layout=Fal
             parent_path = revision['target_path'][:-len('/' + revision['target_name'])]
             parent = resolve(path_parts(parent_path))
             collision = [other for other in nodes if other is not n and other['p'] == parent
-                         and other['f'] and other['s'] == 'destination' and other['n'] == revision['target_name']]
+                         and other['f'] and other['s'] == 'destination' and not other.get('viewer_hidden')
+                         and other['n'] == revision['target_name']]
             if collision:
-                raise ValueError('REVISION_VIEWER_TARGET_COLLISION:' + sid)
+                # A corrected proposal may already show an anonymous target
+                # context. Reuse its display children under the stable-ID node;
+                # a real folder identity at that path remains a hard conflict.
+                if (len(collision) != 1 or any(collision[0].get(k)
+                        for k in ('id', 'context_id', 'destination_overlay'))):
+                    raise ValueError('REVISION_VIEWER_TARGET_COLLISION:' + sid)
+                placeholder = collision[0]
+                def anonymous(node):
+                    return not any(node.get(k) for k in ('id', 'context_id', 'destination_overlay'))
+                def adopt_context(context, target):
+                    for child in [c for c in nodes if c['p'] == context['i']]:
+                        peers = [c for c in nodes if c['p'] == target['i'] and c['f'] and child['f']
+                                 and not c.get('viewer_hidden') and not child.get('viewer_hidden')
+                                 and c['n'] == child['n']]
+                        if len(peers) > 1:
+                            raise ValueError('REVISION_VIEWER_CHILD_COLLISION:' + sid)
+                        if not peers:
+                            child['p'] = target['i']
+                        elif anonymous(child):
+                            adopt_context(child, peers[0])
+                        elif anonymous(peers[0]):
+                            adopt_context(peers[0], child)
+                            child['p'] = target['i']
+                        else:
+                            raise ValueError('REVISION_VIEWER_CHILD_COLLISION:' + sid)
+                    context['viewer_hidden'] = True
+                    context['proposal_context_replaced_by'] = sid
+                adopt_context(placeholder, n)
             if n['p'] != parent or n['n'] != revision['target_name']:
                 changed.append(sid)
             n['p'], n['n'] = parent, revision['target_name']
@@ -359,6 +436,8 @@ def refresh_proposal(data, workbook, *, folder_revisions=(), proposed_layout=Fal
         # Folder aliases are already rendered with their proposed name. Avoid
         # silently moving their whole subtree based on a file-level row refresh.
         if n['f']:
+            if sid in retained:
+                continue
             if n['n'] != target_name:
                 revision = revisions.get(sid)
                 if revision is None or revision['verified'] or revision['target_name'] != target_name:
@@ -615,8 +694,29 @@ def mark_retired_empty_folders(data, workbook=None):
                 planned_paths.add(parent + (row[ix['Proposed name + type suffix']].strip(),))
     children = {}
     for n in nodes:
-        n.pop('viewer_hidden', None); n.pop('retired_empty_parent', None)
         children.setdefault(n['p'], []).append(n['i'])
+    # Only discard hiding produced by the previous retirement pass. The input
+    # viewer can also contain explicitly retained source wrappers and obsolete
+    # proposal contexts; those are not evidence of a Drive trash operation.
+    def clear_retirement(index):
+        n = nodes[index]
+        if not n.get('retained_source_container'):
+            n.pop('viewer_hidden', None)
+        for child in children.get(index, []):
+            clear_retirement(child)
+    for n in nodes:
+        if n.pop('retired_empty_parent', None):
+            clear_retirement(n['i'])
+    if workbook is not None:
+        retained_proposal_containers(data, workbook)
+    for n in nodes:
+        if n['f'] or n.get('retired') or n.get('policy_excluded'):
+            continue
+        parent = n['p']
+        while parent >= 0:
+            if nodes[parent].get('viewer_hidden'):
+                raise ValueError('ACTIVE_PROPOSAL_UNDER_HIDDEN_FOLDER:' + n.get('id', ''))
+            parent = nodes[parent]['p']
     def identity(n):
         return n.get('destination_overlay', {}).get('destination_id') or n.get('id') or n.get('context_id')
     def safe_branch(index):

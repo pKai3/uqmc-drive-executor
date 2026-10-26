@@ -98,6 +98,21 @@ To execute that destination section and publish its verified status:
 command does not widen its scope to other items sharing a source folder. Existing
 completed sections and proposal/approval cells are preserved.
 
+## Existing destination folders
+
+When the current workbook includes `Destination Folder Names`, the planner uses
+its stable folder IDs to bind logical destination paths. It verifies each ID's
+live name, parent, MIME type and complete parent-listing membership before reuse.
+A different folder with the proposed name remains a collision. Literal slashes
+in a folder title do not invent additional hierarchy. This binding retains the
+folder's actual name; it does not execute separate scaffold naming proposals.
+
+The viewer preserves `Retain container only` source wrappers as hidden audit
+context. They cannot compete with a visible proposed destination of the same
+name. Anonymous presentation placeholders can be combined with an explicitly
+mapped stable-ID folder, while different real folder IDs remain conflicts.
+These display changes preserve execution history and do not perform Drive work.
+
 ## Whole-subtree coverage
 
 New batches include eligible `Keep name` entries from Rename Coverage when their
