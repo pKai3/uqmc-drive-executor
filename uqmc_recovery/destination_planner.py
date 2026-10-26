@@ -46,6 +46,10 @@ def file_parent_path(move, rename, state, *, canonical_path=lambda path: path):
     if not isinstance(path, str) or not path:
         raise SafetyError('EXACT_LOGICAL_PATH_REQUIRED')
     if move.get('whole_subtree_origin_reference'):
+        if ('coverage_exact_name' in move and
+                (state.get('name') != move['coverage_exact_name'] or
+                 state.get('mime_type') != move['coverage_mime_type'])):
+            raise SafetyError('KEEP_NAME_COVERAGE_METADATA_CONFLICT:' + sid)
         return canonical_path(_path(move['coverage_target_parent_path']))
     expected = canonical_path(_record_path(rename)) if rename else None
     def strip_title(title):
@@ -389,6 +393,7 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
     # identity/placement before admitting them into subtree coverage/reuse.
     recovered = {}
     recovered_paths = {}
+    unused_recovered = set()
     for sid, proof in (recovered_folders or {}).items():
         creation_section=proof.get('creation_section_path',section)
         if not (section==creation_section or section.startswith(creation_section+'/')):
@@ -396,6 +401,20 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
         expected_keys={'folder:'+digest({'section_path':creation_section,'logical_path':p}):p for p in required}
         path = expected_keys.get(proof.get('logical_key'))
         if path is None:
+            prior = proof.get('registered_logical_path')
+            if (prior and _inside(prior, section) and canonical_path(prior) not in required
+                    and sid not in set(groups) | blocked
+                    and proof['logical_key'] == 'folder:' + digest({
+                        'section_path': creation_section, 'logical_path': prior})):
+                state = metadata_by_id.get(sid, {})
+                if (state.get('id') != sid or state.get('mime_type') != FOLDER
+                        or state.get('trashed') is not False
+                        or state.get('name') != proof['name']
+                        or state.get('parents') != [proof['parent_id']]
+                        or state.get('appProperties', {}).get('uqmcFolderKey') != proof['stable_key']):
+                    raise SafetyError('RECOVERED_DESTINATION_METADATA_CONFLICT:' + sid)
+                unused_recovered.add(sid)
+                continue
             raise SafetyError('RECOVERED_DESTINATION_PATH_NO_LONGER_APPROVED:' + sid)
         state = metadata_by_id.get(sid)
         if (sid in groups or sid in blocked or not state or state.get('id') != sid
@@ -534,6 +553,7 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
                for p in sorted(required - resolved.keys(), key=lambda p: (p.count('/'), p))]
     return {'records': records, 'item_routes': {sid:routes[sid] for sid in groups}, 'destination_paths': resolved,
             'recovered_destination_folders': recovered,
+            'unused_recovered_destination_ids': sorted(unused_recovered),
             'destination_folder_names': names, 'missing_folders': missing,
             'mapped_destination_folders': mapped_context,
             'reused_folder_ids': sorted(reuse), 'folder_reuse_proofs': reuse,

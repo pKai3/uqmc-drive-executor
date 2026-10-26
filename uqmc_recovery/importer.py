@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .shortcut_policy import SHORTCUT_MIME, persist_shortcut_exclusions
-from .model import FOLDER, NATIVE, Operation, Plan, SafetyError, WITHDRAWN_ID, digest, snapshot, validate_extension_evidence
+from .model import FOLDER, NATIVE, MIME_EXTENSIONS, Operation, Plan, SafetyError, WITHDRAWN_ID, digest, snapshot, validate_extension_evidence
 
 # Live identity is supplied from ignored private configuration, never from a repo.
 WORKBOOK_ID = "fixture-workbook"
@@ -239,7 +239,12 @@ def _subtree_coverage_records(records, coverage, section_path=None, *, excluded_
         suffix = {**NATIVE, 'application/vnd.google-apps.shortcut': '.shortcut'}.get(row.get('Verified MIME type'))
         if suffix and name.endswith(suffix):
             labels.append(name[:-len(suffix)])
-        parents = {target[:-(len(label) + 1)] for label in labels if label and target.endswith('/' + label)}
+        mime = row.get('Verified MIME type')
+        uploaded_labels = {name[:-len(ext)] for ext in MIME_EXTENSIONS.get(mime, ())
+                           if name.casefold().endswith(ext.casefold())}
+        labels.extend(uploaded_labels)
+        matched_labels = {label for label in labels if label and target.endswith('/' + label)}
+        parents = {target[:-(len(label) + 1)] for label in matched_labels}
         if len(parents) != 1:
             raise SafetyError('KEEP_NAME_COVERAGE_PATH_CONFLICT:' + sid)
         parent_path = parents.pop()
@@ -254,6 +259,8 @@ def _subtree_coverage_records(records, coverage, section_path=None, *, excluded_
             'whole_subtree_origin_reference': parent['reference'],
             'whole_subtree_origin_source_id': parent['source_id'],
             'coverage_target_parent_path': parent_path,
+            **({'coverage_exact_name': next(iter(matched_labels)), 'coverage_mime_type': mime}
+               if name not in matched_labels and matched_labels <= uploaded_labels else {}),
             'row': {'Exact target path': target, 'Current item': name, 'Source ID': sid,
                     'Scope': 'Whole-subtree covered descendant', 'Origin coverage row': copy.deepcopy(row)},
             'row_sha256': digest({'derivation': 'WHOLE_SUBTREE_COVERAGE_V1',

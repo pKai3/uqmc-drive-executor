@@ -142,6 +142,30 @@ def load_created_folder_proofs(journal, section_id):
             'allocation_authority_ref': allocation['authority_ref'],
             'observed_ref': latest['payload']['observed_ref'],
             'allocation_event_ref': _event_ref(allocated), 'verification_event_ref': _event_ref(latest)}
+    # A successfully sealed earlier batch can retain destinations that a later
+    # proposal no longer needs. Bind those paths to journal evidence, not a
+    # mutable registry; callers may leave them untouched but never repurpose them.
+    for event in records:
+        payload = event['payload']
+        if (event['kind'] != 'SECTION_IMPORTED' or
+                not str(payload.get('run_id', '')).startswith(section_id + '-')):
+            continue
+        origin = journal.read_evidence(payload['manifest_ref'])
+        projection, plan = origin.get('projection', {}), origin.get('plan')
+        if plan is None:
+            continue
+        if (projection.get('section_id') != section_id
+                or digest(projection) != payload.get('projection_sha256')
+                or digest(plan) != payload.get('proposal_hash')
+                or origin.get('manifest', {}).get('section_approval_validated') is not True):
+            _fail('REGISTERED_PATH_PROOF_MISMATCH')
+        section_path = projection.get('section_path')
+        if not isinstance(section_path, str):
+            continue
+        for path, sid in projection.get('destination_paths', {}).items():
+            if sid in result and result[sid]['logical_key'] == 'folder:' + digest({
+                    'section_path': section_path, 'logical_path': path}):
+                result[sid]['registered_logical_path'] = path
     return result
 
 

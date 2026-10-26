@@ -114,6 +114,25 @@ class CreatedDestinationRecoveryTests(unittest.TestCase):
             f.run_command(apply=True)
         self.assertEqual(f.server.created,[child]);self.assertEqual(f.server.requests,[])
 
+    def test_registered_unused_destination_is_retained_without_blocking_new_work(self):
+        f=self.fixture();f.run_command(apply=True)
+        old=f.server.created[0];old_state=copy.deepcopy(f.server.drive.files[old])
+        for tab in ('Proposed Renames','Move Manifest','Proposed Moves'):
+            f.export['sheets'][tab]=f.export['sheets'][tab][:1]
+        f.server.drive.files['later']=fixture.raw('later','Later.pdf',['old-parent'])
+        append_row(f.export,'Proposed Renames',{'Rename ID':'RENAME-LATER','Source ID':'later',
+            'Current name + type suffix':'Later.pdf','Proposed name + type suffix':'Later.pdf',
+            'Proposed destination folder':fixture.SECTION+'/Different'})
+        before=copy.deepcopy(f.server.drive.files)
+        result=f.run_command()
+        self.assertEqual(result['blockers'],[])
+        self.assertEqual(f.server.drive.files,before)
+        self.assertEqual(result['missing_folders'],[fixture.SECTION+'/Different'])
+        result=f.run_command(apply=True)
+        self.assertEqual(result['counts'],{'APPLIED':1},result)
+        self.assertEqual(f.server.drive.files[old],old_state)
+        self.assertNotEqual(f.server.drive.files['later']['parents'],[old])
+
     def test_parent_scope_failed_preparation_can_preview_then_import_smaller_subtree(self):
         from uqmc_recovery.destination import run_destination, section_key
         f=self.fixture()
