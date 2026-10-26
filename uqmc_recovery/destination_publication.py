@@ -259,6 +259,78 @@ def revision_folder_updates(journal):
     return list(result.values())
 
 
+def reconcile_applied_folder_updates(journal, registry, updates):
+    """Recognize ordinary batch readbacks as well as explicit folder revisions.
+
+    A current sheet path is only a proposal. Confirm its folder ID, exact name
+    and mapped parent against an approved sealed plan and the latest successful
+    forward readback before using it as the folder's verified display location.
+    """
+    from .publication_projection import _core, _desired_state, FOLDER
+    from .projection import _ordered_plan_operations
+    records = journal.records()
+    latest, drafted, approved, observations = {}, {}, set(), {}
+    wanted = {r['source_id'] for r in updates if not r['verified']}
+    for event in records:
+        p = event['payload']
+        if event['kind'] == 'DRAFTED':
+            drafted[p['proposal_hash']] = p['plan_ref']
+        elif event['kind'] == 'APPROVED':
+            approved.add(p.get('proposal_hash'))
+        if p.get('source_id') in wanted and _desired_state(event):
+            latest[p['source_id']] = event
+        if event['kind'] == 'DESTINATION_VERIFIED' and p.get('file_id') in wanted:
+            observations[p['file_id']] = event
+    specs = section_specs(registry)
+    plans = {}
+    result = copy.deepcopy(updates)
+    for revision in result:
+        sid = revision['source_id']; event = latest.get(sid)
+        if revision['verified'] or event is None:
+            continue
+        p = event['payload']; ph = p.get('plan_sha256')
+        if (_desired_state(event) != 'VERIFIED_APPLIED' or p.get('direction') != 'FORWARD'
+                or not p.get('observed_ref') or ph not in approved or ph not in drafted):
+            continue
+        suffix = '/' + revision['target_name']
+        if not revision['target_path'].endswith(suffix):
+            raise ValueError('VIEWER_REVISION_TARGET_NAME_MISMATCH:' + sid)
+        parent_path = revision['target_path'][:-len(suffix)]
+        parents = set()
+        for spec in specs:
+            paths = spec.get('destination_paths', {})
+            if (ph in spec.get('plan_sha256s', [spec.get('plan_sha256')])
+                    and paths.get(sid) == revision['target_path']):
+                parents.update(fid for fid, path in paths.items() if path == parent_path)
+                if spec['proposal_path'] == parent_path:
+                    parents.add(spec['destination_id'])
+        if len(parents) > 1:
+            raise ValueError('VIEWER_REVISION_PARENT_PATH_AMBIGUOUS:' + sid)
+        if not parents:
+            continue
+        if ph not in plans:
+            plan = journal.read_evidence(drafted[ph])
+            if _sha(_bytes(plan)) != ph:
+                raise ValueError('VIEWER_REVISION_PLAN_HASH_MISMATCH')
+            plans[ph] = _ordered_plan_operations(plan)
+        operations = [op for op in plans[ph] if op['file_id'] == sid]
+        if not operations:
+            continue
+        target = _core(operations[0]['before'])
+        for op in operations:
+            target.update(op['target'])
+        expected = dict(id=sid, name=revision['target_name'],
+                        parents=sorted(parents), mime_type=FOLDER)
+        observed = journal.read_evidence(p['observed_ref'])
+        later = observations.get(sid)
+        if later and later['seq'] > event['seq']:
+            observed = journal.read_evidence(later['payload']['observed_ref'])
+        if (_core(target) == expected and _core(observed) == expected
+                and observed.get('trashed') is not True):
+            revision['verified'] = True
+    return result
+
+
 def retained_reporting_evidence(directory, data):
     """Retain current externally reconciled reporting with its original preimage.
 
@@ -310,6 +382,7 @@ def freeze_publication(config, registry, *, journal, fresh_workbook, drive):
     workbook = copy.deepcopy(fresh_workbook)
     workbook.setdefault('exported_at_utc', workbook.get('captured_at_utc', _now()))
     revisions = viewer.proposed_folder_updates(data, workbook, folder_revisions=revision_folder_updates(journal))
+    revisions = reconcile_applied_folder_updates(journal, registry, revisions)
     report = viewer.refresh_proposal(data, workbook, folder_revisions=revisions)
     report['registered_source_ids'] = registered
     specs = display_section_specs(registry, data, basis['source_ids'])
