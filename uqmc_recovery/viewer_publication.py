@@ -144,10 +144,23 @@ def retained_proposal_containers(data, workbook):
         if sid in retained and retained[sid] != source:
             raise ValueError('AMBIGUOUS_RETAINED_CONTAINER:' + sid)
         retained[sid] = source
+    # The sealed execution projection may retain a mixed source wrapper even
+    # when the sheet routes its contents into a different destination. Keep
+    # that ID as audit context, not a pending rename of the target folder.
+    execution = data.get('execution_sections', {})
+    if execution.get('basis') == 'verified_journal_readback':
+        sections = execution.get('sections', [])
+        active_destinations = {sec.get('destination_id') for sec in sections}
+        active_destinations.update(d['id'] for sec in sections
+            for d in sec.get('created_destinations', []) + sec.get('verified_destinations', []))
+        for sec in sections:
+            for sid in sec.get('retained_source_folder_ids', []):
+                if sid in destination_ids and sid not in active_destinations:
+                    retained.setdefault(sid, None)
     rows = matrices['Proposed Renames']
     for row in rows[1:]:
         record = dict(zip(rows[0], row)); sid = record.get('Source ID')
-        if sid not in retained:
+        if sid not in retained or retained[sid] is None:
             continue
         current = record.get('Current name + type suffix')
         proposed = record.get('Proposed name + type suffix')
@@ -260,7 +273,8 @@ def proposed_folder_updates(data, workbook, *, folder_revisions=()):
 
 def mark_proposed_revision_status(data, revisions):
     """Keep historical observations separate from satisfaction of fresh targets."""
-    pending = {r['source_id']: r for r in revisions if not r['verified']}
+    retained = {n.get('id') for n in data['nodes'] if n.get('retained_source_container')}
+    pending = {r['source_id']: r for r in revisions if not r['verified'] and r['source_id'] not in retained}
     pending_members = set(); counts = {}
     historical = {sid for sec in data['execution_sections']['sections'] for sid in sec.get('verified_file_ids', [])}
     for n in data['nodes']:
@@ -314,6 +328,7 @@ def refresh_proposal(data, workbook, *, folder_revisions=(), proposed_layout=Fal
     a proposed rename row; nothing is inferred from absent spreadsheet rows.
     """
     retained = retained_proposal_containers(data, workbook)
+    folder_revisions = [r for r in folder_revisions if r['source_id'] not in retained]
     nodes = data['nodes']
     by_id = {n['id']: n for n in nodes if n.get('id')}
     rows = workbook.get('sheets', workbook.get('matrices', {}))['Proposed Renames']
