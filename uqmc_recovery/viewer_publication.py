@@ -537,9 +537,15 @@ def integrate(data, bundle):
     for n in nodes:
         paths[n['i']] = (paths[n['p']] if n['p'] >= 0 else ()) + (n['n'].strip(),)
     path_nodes = {}
+    folder_identity_nodes = {}
     for n in nodes:
-        if n['s'] == 'destination' and n['f']:
+        if n['s'] == 'destination' and n['f'] and not n.get('viewer_hidden'):
             path_nodes.setdefault(paths[n['i']], []).append(n)
+            # Existing scaffold identities are context, not execution records.
+            # Resolve them just as precisely as moved or created folders.
+            for fid in {n.get('id'), n.get('context_id'),
+                        n.get('destination_overlay', {}).get('destination_id')} - {None, ''}:
+                folder_identity_nodes.setdefault(fid, []).append(n)
     retired_files = {sid for sid, item in items.items() if
         {'RETIRED', 'USER_CONFIRMED_DELETED', 'NOT_APPLIED'} <= set(item.get('reason_codes', []))}
     policy_files = {sid for sid,item in items.items() if
@@ -616,7 +622,14 @@ def integrate(data, bundle):
                 d = destinations[fid]
                 parents = d['parent_ids']
                 if len(parents) == 1 and parents[0] in destination_paths:
-                    destination_paths[fid] = destination_paths[parents[0]] + (d['name'].strip(),)
+                    bound = folder_identity_nodes.get(fid, [])
+                    if len(bound) > 1:
+                        raise ValueError('CREATED_DESTINATION_ID_NOT_UNIQUE:' + fid)
+                    # Children follow the verified parent's display alias. Its
+                    # actual Drive name can legitimately retain old numbering
+                    # or a literal slash; this does not authorize a rename.
+                    destination_paths[fid] = (paths[bound[0]['i']] if bound else
+                        destination_paths[parents[0]] + (d['name'].strip(),))
                     unresolved.remove(fid)
                     progress = True
             if not progress:
@@ -627,8 +640,7 @@ def integrate(data, bundle):
                 continue
             # A verified revision preserves destination ID while changing its
             # logical path. Prefer that existing stable identity over stale aliases.
-            matches = [n for n in nodes if n['s']=='destination' and n['f'] and
-                       (n.get('id')==fid or n.get('destination_overlay',{}).get('destination_id')==fid)]
+            matches = folder_identity_nodes.get(fid, [])
             if not matches:
                 matches = path_nodes.get(dp, [])
             if len(matches) != 1:
