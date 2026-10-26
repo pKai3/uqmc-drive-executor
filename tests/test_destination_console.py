@@ -1,4 +1,5 @@
 import io
+from datetime import datetime, timedelta, timezone
 import json
 import stat
 import tempfile
@@ -18,6 +19,41 @@ class DestinationConsoleTests(unittest.TestCase):
         self.r = ConsoleReporter(stream=self.out, clock=lambda: 30.0, **kwargs)
         self.addCleanup(self.r.close)
         return self.r
+
+    def test_human_lines_include_local_wall_clock_timezone_and_elapsed(self):
+        wall=datetime(2026,10,26,18,17,38,tzinfo=timezone(timedelta(hours=10),'AEST'))
+        r=self.reporter(wall_clock=lambda:wall)
+        r.progress({'stage':'folder_verified','path':'Club/Skills'})
+        self.assertEqual(self.out.getvalue(),'[00:00] [18:17:38 AEST +1000] Folder verified: Club/Skills\n')
+
+    def test_wall_clock_refreshes_each_line_without_changing_monotonic_elapsed(self):
+        ticks=iter([100.0,125.0,133.0])
+        wall=iter([datetime(2026,4,5,2,59,59,tzinfo=timezone(timedelta(hours=11),'AEDT')),
+                   datetime(2026,4,5,2,0,1,tzinfo=timezone(timedelta(hours=10),'AEST'))])
+        out=io.StringIO()
+        r=ConsoleReporter(stream=out,clock=lambda:next(ticks),wall_clock=lambda:next(wall))
+        r.line('before');r.line('after')
+        self.assertEqual(out.getvalue().splitlines(),[
+            '[00:25] [02:59:59 AEDT +1100] before',
+            '[00:33] [02:00:01 AEST +1000] after'])
+
+    def test_json_output_never_adds_human_wall_clock_prefix(self):
+        def unused():raise AssertionError('JSON output sampled local wall clock')
+        r=self.reporter(json_output=True,wall_clock=unused)
+        values=[{'stage':'folder_verified','path':'Club/Skills'}, {'error':'READ_TIMEOUT'}, {'counts':{'APPLIED':1}}]
+        r.progress(values[0]);r.error(values[1]);r.finish(values[2])
+        self.assertEqual([json.loads(line) for line in self.out.getvalue().splitlines()],values)
+
+    def test_private_transcript_retains_utc_and_existing_field_names(self):
+        wall=datetime(2026,10,26,18,17,38,tzinfo=timezone(timedelta(hours=10),'AEST'))
+        r=self.reporter(wall_clock=lambda:wall)
+        with tempfile.TemporaryDirectory() as directory:
+            r.open_log(directory);r.progress({'stage':'folder_verified','path':'Club/Skills'})
+            row=json.loads(r.log_path.read_text())
+            self.assertEqual(set(row),{'type','at_utc','elapsed_seconds','data'})
+            self.assertTrue(row['at_utc'].endswith('Z'))
+            self.assertEqual(row['elapsed_seconds'],0.0)
+            self.assertEqual(row['data'],{'stage':'folder_verified','path':'Club/Skills'})
 
     def test_readable_completion_names_counts_elapsed_and_publication(self):
         r = self.reporter()

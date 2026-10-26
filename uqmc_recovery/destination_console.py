@@ -26,10 +26,11 @@ def counts_text(counts):
 
 
 class ConsoleReporter:
-    def __init__(self, *, json_output=False, stream=None, clock=time.monotonic):
+    def __init__(self, *, json_output=False, stream=None, clock=time.monotonic, wall_clock=None):
         self.json_output = json_output
         self.stream = stream if stream is not None else sys.stdout
         self.clock, self.started = clock, clock()
+        self.wall_clock = wall_clock or (lambda: datetime.now().astimezone())
         self.log, self.log_path = None, None
         self.lock = threading.RLock()
         self.execution_started = False
@@ -55,7 +56,8 @@ class ConsoleReporter:
         return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
     def line(self, value):
-        print(f"[{self.elapsed()}] {value}", file=self.stream, flush=True)
+        now = self.wall_clock()
+        print(f"[{self.elapsed()}] [{now:%H:%M:%S %Z %z}] {value}", file=self.stream, flush=True)
 
     def write_log(self, kind, value):
         if self.log is None or self.log_error:
