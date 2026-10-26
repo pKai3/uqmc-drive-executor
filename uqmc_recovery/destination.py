@@ -378,6 +378,9 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
         expected_parent=layout['destination_paths'].get(layout['destination_parent_paths'].get(logical,logical_parent(logical)))
         if raw[folder_id]['name']!=layout['destination_folder_names'][logical] or raw[folder_id]['parents']!=[expected_parent]:
             raise SafetyError('EXISTING_DESTINATION_LOCATION_OR_NAME_DRIFT:'+logical)
+    # Preview and apply must reject the same invalid rename targets. This pass
+    # is pure: durable conversion/correction proofs are written only in freeze.
+    prepare_rename_evidence(None,layout,metadata,None,report)
     checks=[]
     records_by_id={}
     for r in records:records_by_id.setdefault(r['source_id'],{})[r['action']]=r
@@ -444,7 +447,9 @@ def prepare_rename_evidence(journal, layout, metadata, evidence_ref, report):
 
     Checks needing newly allocated destination IDs remain in the final import.
     Proofs retain exact observed names and MIME; no original evidence is changed.
+    With no journal, validate only; preview hashes are never registered as proofs.
     """
+    record_evidence=journal.evidence if journal is not None else digest
     native,corrections,errors={},{},[]
     for r in layout['records']:
         if r['action']!='RENAME' or r['source_id'] in layout['source_container_ids']:continue
@@ -452,12 +457,12 @@ def prepare_rename_evidence(journal, layout, metadata, evidence_ref, report):
         try:
             name=exact_rename(r,before);mime=before['mime_type']
             if name!=r['row']['Proposed name + type suffix']:
-                native[r['reference']]=journal.evidence({'schema_version':'uqmc.rename.native-display-conversion.v1','source_id':before['id'],'mime_type':mime,
+                native[r['reference']]=record_evidence({'schema_version':'uqmc.rename.native-display-conversion.v1','source_id':before['id'],'mime_type':mime,
                     'workbook_row_sha256':r['row_sha256'],'workbook_proposed_name':r['row']['Proposed name + type suffix'],
                     'exact_target_name':name,'display_suffix':NATIVE[mime],'provenance_ref':evidence_ref})
             suffix=uploaded_extension(before['name'])
             if mime not in NATIVE and mime!=FOLDER and suffix and uploaded_extension(name).casefold()!=suffix.casefold():
-                proof=journal.evidence({'kind':'VERIFIED_EXTENSION_CORRECTION','source_id':before['id'],'source_exact_name':before['name'],
+                proof=record_evidence({'kind':'VERIFIED_EXTENSION_CORRECTION','source_id':before['id'],'source_exact_name':before['name'],
                     'target_exact_name':name,'mime_type':mime,'provenance_ref':evidence_ref})
                 corrections[r['reference']]={'source_suffix':suffix,'target_suffix':uploaded_extension(name),'mime_type':mime,'evidence_ref':proof}
             validate_rename_name(SimpleNamespace(direction='FORWARD',target={'name':name},
