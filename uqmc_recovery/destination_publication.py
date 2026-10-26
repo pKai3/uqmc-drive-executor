@@ -210,7 +210,8 @@ def revision_folder_updates(journal):
                     or not proof.get('instruction') or not proof.get('before_path')
                     or _core(observed) != expected or observed.get('trashed') is not False
                     or _core(before)['id'] != sid or _core(before)['mime_type'] != expected['mime_type']
-                    or before.get('name') != observed['name']
+                    or (before.get('name') != observed['name'] and
+                        (proof.get('approved_name') != observed['name'] or not proof.get('name_change_instruction')))
                     or _core(parent)['mime_type'] != expected['mime_type'] or parent.get('trashed') is not False
                     or expected['parents'] != [parent['id']]
                     or target_path != parent_path + '/' + observed['name']
@@ -341,6 +342,8 @@ def freeze_publication(config, registry, *, journal, fresh_workbook, drive):
             report['current_proposal_layout'] = proposed_report
             report['proposal_revision_summary'] = data['proposal_revision_summary']
         viewer.mark_retired_empty_folders(data, workbook)
+        from .revision_cleanup import withdrawn_destination_ids
+        viewer.mark_withdrawn_destination_contexts(data, withdrawn_destination_ids(journal))
         if {n['id'] for n in data['nodes'] if n.get('id')} != identities:
             raise ValueError('PUBLIC_SOURCE_IDENTITIES_CHANGED')
         target = viewer.render(source.decode('utf-8'), data).encode('utf-8')

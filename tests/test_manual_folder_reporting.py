@@ -54,3 +54,28 @@ class ManualFolderReportingTests(unittest.TestCase):
         result=_carried_folder_observations(self.make(),{('section','child'):old,('section','other'):other})
         self.assertEqual(result[('section','child')],{**old,'path':'Root/New/2024/Child'})
         self.assertEqual(result[('section','other')],other)
+
+    def test_user_confirmed_name_change_is_bound_to_observed_name(self):
+        # The metadata payload remains exact: an unconfirmed different name is rejected.
+        with self.assertRaisesRegex(ValueError,'MANUAL_FOLDER_RELOCATION_EVIDENCE_MISMATCH'):
+            revision_folder_updates(self.make(lambda p,o:o.update(name='Different')))
+
+    def test_withdrawn_empty_context_keeps_audit_and_blocks_hidden_files(self):
+        data=tree();data['nodes']=data['nodes'][:3]
+        viewer.mark_withdrawn_destination_contexts(data,{'folder'})
+        self.assertTrue(data['nodes'][2]['viewer_hidden'])
+        self.assertEqual(data['nodes'][2]['id'],'folder')
+        with self.assertRaisesRegex(ValueError,'WITHDRAWN_CONTEXT_HAS_FILE_MEMBERS'):
+            viewer.mark_withdrawn_destination_contexts(tree(),{'folder'})
+
+    def test_user_withdrawal_filters_current_registry_without_trash_claim(self):
+        from uqmc_recovery.revision_cleanup import filter_registry,retired_parents
+        j=MemoryJournal();proof={'actor':'user','instruction':'I removed this folder',
+            'source_ids':['folder'],'effect':'WITHDRAW_DESTINATION_ONLY'}
+        j.append('DESTINATION_CONTEXT_WITHDRAWN',payload={'source_ids':['folder'],'authority_ref':j.evidence(proof)})
+        registry={'sections':[{'publication_spec':{'destination_id':'root','destination_ids':['root','folder'],
+             'destination_paths':{'root':'Root','folder':'Root/Folder'}},'destination_paths':{'Root':'root','Root/Folder':'folder'}}],
+             'runs':[{'historical_folder':'folder'}]}
+        result=filter_registry(j,registry)
+        self.assertEqual(result['sections'][0]['publication_spec']['destination_ids'],['root'])
+        self.assertEqual(result['runs'],registry['runs']);self.assertEqual(retired_parents(j),{})

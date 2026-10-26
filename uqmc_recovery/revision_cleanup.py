@@ -68,9 +68,24 @@ def reconcile_restored(journal,factory,source_ids):
 def retired_parent_ids(journal):return set(retired_parents(journal))
 
 
+def withdrawn_destination_ids(journal):
+    """Explicit user withdrawals are not claims that Drive contents were trashed."""
+    result=set()
+    for event in journal.records():
+        if event['kind'] != 'DESTINATION_CONTEXT_WITHDRAWN': continue
+        p=event['payload'];proof=journal.read_evidence(p['authority_ref'])
+        ids=proof.get('source_ids',[])
+        if (proof.get('actor')!='user' or not proof.get('instruction')
+                or not ids or len(ids)!=len(set(ids)) or p.get('source_ids')!=ids
+                or proof.get('effect')!='WITHDRAW_DESTINATION_ONLY'):
+            raise SafetyError('INVALID_DESTINATION_WITHDRAWAL')
+        result.update(ids)
+    return result
+
+
 def filter_registry(journal,registry):
     """Retire active lookups only; original runs and immutable events remain."""
-    value=copy.deepcopy(registry);retired=retired_parent_ids(journal)
+    value=copy.deepcopy(registry);retired=retired_parent_ids(journal)|withdrawn_destination_ids(journal)
     if not retired:return value
     for entry in value.get('sections',[]):
         entry['destination_paths']={p:s for p,s in entry.get('destination_paths',{}).items() if s not in retired}

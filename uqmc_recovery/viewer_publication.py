@@ -677,6 +677,29 @@ def integrate(data, bundle):
     data['notes'] = [re.sub(r'This remains a proposal; no source moves or renames have been executed\.', 'The tree combines the current proposal with the separately verified execution snapshot below; untracked records remain proposals.', x) for x in data['notes']]
 
 
+def mark_withdrawn_destination_contexts(data, source_ids):
+    """Hide only explicitly withdrawn folder contexts, retaining all audit nodes."""
+    withdrawn=set(source_ids);nodes=data['nodes'];children={}
+    for n in nodes:children.setdefault(n['p'],[]).append(n)
+    def branch(n):
+        result=[n]
+        for child in children.get(n['i'],[]):result.extend(branch(child))
+        return result
+    hidden=[]
+    for n in nodes:
+        sid=n.get('destination_overlay',{}).get('destination_id') or n.get('id') or n.get('context_id')
+        if sid not in withdrawn or n['s']!='destination':continue
+        members=branch(n)
+        if any(not x['f'] for x in members):
+            raise ValueError('WITHDRAWN_CONTEXT_HAS_FILE_MEMBERS:'+sid)
+        for member in members:
+            mid=member.get('destination_overlay',{}).get('destination_id') or member.get('id') or member.get('context_id')
+            if mid and mid not in withdrawn:raise ValueError('WITHDRAWN_CONTEXT_HAS_OTHER_IDENTITY:'+mid)
+        for member in members:member['viewer_hidden']=True;member['user_withdrawn_context']=True
+        hidden.append(sid)
+    data['user_withdrawn_destination_contexts']=sorted(set(hidden))
+
+
 def mark_retired_empty_folders(data, workbook=None):
     """Hide only proved retired branches with no active or protected descendants."""
     nodes = data['nodes']; sections = data.get('execution_sections', {})
