@@ -812,7 +812,7 @@ def _hybrid_profile(journal, projection, members, operations, boundary, metadata
             if effects or (path and state["name"].strip() != path.rsplit("/", 1)[-1].strip()):
                 raise SafetyError("HYBRID_ANCHOR_IDENTITY_MISMATCH")
             continue
-        parent_path = logical_parent(path)
+        parent_path = projection.get("destination_parent_paths", {}).get(path, logical_parent(path))
         expected_name = projection["destination_folder_names"][path]
         if sid not in reused and effects:
             raise SafetyError("HYBRID_UNPROVED_SOURCE_DESTINATION_REUSE")

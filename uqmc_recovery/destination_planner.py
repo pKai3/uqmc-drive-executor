@@ -224,13 +224,33 @@ def _folder_aliases(source, groups, states, section):
     return aliases
 
 
+def _folder_move_parent(move, rename, state):
+    """Use exact same-ID folder titles as opaque suffixes, not slash segments."""
+    path = _record_path(move)
+    titles = {state['name'], move['row'].get('Current item')}
+    if rename:
+        titles.update({rename['row'].get('Current name + type suffix'), exact_rename(rename, state)})
+    matches = {title: path[:-(len(title) + 1)] for title in titles
+               if isinstance(title, str) and '/' in title and path.endswith('/' + title)}
+    if len(set(matches.values())) > 1:
+        raise SafetyError('AMBIGUOUS_FOLDER_TITLE_PATH:' + state['id'])
+    if matches:
+        title, parent = next(iter(matches.items()))
+        return _path(parent), title
+    return logical_parent(path), None
+
+
 def _folder_route(actions, state, required, *, canonical_path=lambda path: path):
     move, rename = actions.get('MOVE'), actions.get('RENAME')
+    opaque_name = None
     if move:
         path = canonical_path(_record_path(move))
-        if rename and canonical_path(_record_path(rename)) != logical_parent(path):
+        parent, opaque_name = _folder_move_parent(move, rename, state)
+        parent = canonical_path(parent)
+        if rename and canonical_path(_record_path(rename)) != parent:
             raise SafetyError('FOLDER_MOVE_RENAME_PARENT_DISAGREEMENT:' + state['id'])
     else:
+        parent = canonical_path(_record_path(rename))
         historical = rename['row'].get('Current name + type suffix') or state['name']
         old = canonical_path(_record_path(rename) + '/' + historical)
         current = canonical_path(_record_path(rename) + '/' + state['name'])
@@ -239,7 +259,7 @@ def _folder_route(actions, state, required, *, canonical_path=lambda path: path)
         if len(referenced) > 1:
             raise SafetyError('AMBIGUOUS_RENAMED_FOLDER_LOGICAL_ALIAS:' + state['id'])
         path = next(iter(referenced)) if referenced else new
-    return path, exact_rename(rename, state) if rename else path.rsplit('/', 1)[-1]
+    return path, exact_rename(rename, state) if rename else (opaque_name or path.rsplit('/', 1)[-1]), parent
 
 
 def _reusable(sid, states, routes, blocked):
@@ -322,26 +342,34 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
         if states[sid]['mime_type'] != FOLDER:
             required.add(file_parent_path(actions.get('MOVE'), actions.get('RENAME'), states[sid], canonical_path=canonical_path))
         else:
-            for record in actions.values():
-                required.add(canonical_path(logical_parent(_record_path(record)) if record['action'] == 'MOVE' else _record_path(record)))
+            move, rename = actions.get('MOVE'), actions.get('RENAME')
+            parent = _folder_move_parent(move, rename, states[sid])[0] if move else _record_path(rename)
+            required.add(canonical_path(parent))
     routes, names = {}, {}
     for sid, actions in sorted(groups.items()):
         state = states[sid]
         rename, move = actions.get('RENAME'), actions.get('MOVE')
         if state['mime_type'] == FOLDER:
-            path, name = _folder_route(actions, state, required, canonical_path=canonical_path)
+            path, name, parent = _folder_route(actions, state, required, canonical_path=canonical_path)
             if not _inside(path, section):
                 raise SafetyError('FOLDER_TARGET_OUTSIDE_SECTION:' + sid)
             if path in names and names[path] != name:
                 raise SafetyError('CONSOLIDATED_DESTINATION_NAME_DISAGREEMENT:' + path)
             names[path] = name
-            routes[sid] = {'path': path, 'parent_path': logical_parent(path), 'exact_name': name}
+            routes[sid] = {'path': path, 'parent_path': parent, 'exact_name': name}
             required.add(path)
         else:
             parent = file_parent_path(move, rename, state, canonical_path=canonical_path)
             if not _inside(parent, section):
                 raise SafetyError('FILE_DESTINATION_OUTSIDE_SECTION:' + sid)
             routes[sid] = {'parent_path': parent, 'exact_name': exact_rename(rename, state) if rename else state['name']}
+    parent_paths = {}
+    for route in routes.values():
+        if 'path' not in route:continue
+        if route['path'] in parent_paths and parent_paths[route['path']] != route['parent_path']:
+            raise SafetyError('AMBIGUOUS_FOLDER_PARENT_PATH:' + route['path'])
+        parent_paths[route['path']] = route['parent_path']
+    parent_of = lambda path: parent_paths.get(path, logical_parent(path))
     required.discard(anchor)
     for path in list(required):
         cursor = path
@@ -349,7 +377,7 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
             if not _inside(cursor, section):
                 raise SafetyError('SECTION_PARENT_ANCHOR_UNRESOLVED:' + cursor)
             required.add(cursor)
-            cursor = logical_parent(cursor)
+            cursor = parent_of(cursor)
     explicit_folder_name_paths = set(names)
     names = {p: names.get(p, p.rsplit('/', 1)[-1]) for p in required}
     paths = {}
@@ -375,7 +403,7 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
         mapping=source.get('destination_folder_mappings',{}).get(path)
         if mapping and path!=anchor:
             from .destination_mapping import verify_mapping
-            verify_mapping(mapping, state, paths.get(logical_parent(path)))
+            verify_mapping(mapping, state, paths.get(parent_of(path)))
             if sid not in groups:
                 # A mapping is destination identity evidence, not an extra rename.
                 # Preserve the observed name and its current parent as preconditions.
@@ -438,7 +466,7 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
         recovered_paths[path] = sid
         recovered[sid] = copy.deepcopy(proof)
         states[sid] = copy.deepcopy(state)
-        routes[sid] = {'path': path, 'parent_path': logical_parent(path), 'exact_name': names[path]}
+        routes[sid] = {'path': path, 'parent_path': parent_of(path), 'exact_name': names[path]}
     def bind_existing_parent(path, sid):
         # Creation may have stopped before DESTINATION_VERIFIED was written for
         # an existing parent. Recover that parent from its recorded child ID and
@@ -453,7 +481,7 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
                 or state.get('trashed') is not False or state.get('name') != names[path]
                 or not isinstance(parents, list) or len(parents) != 1):
             return False
-        parent_path, parent_id = logical_parent(path), parents[0]
+        parent_path, parent_id = parent_of(path), parents[0]
         if not bind_existing_parent(parent_path, parent_id):
             return False
         subtree = metadata_by_id.get(parent_id, {}).get('subtree', {})
@@ -471,7 +499,7 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
         return True
 
     for path, sid in recovered_paths.items():
-        parent_path = logical_parent(path)
+        parent_path = parent_of(path)
         parent_id = recovered[sid]['parent_id']
         # A reused source parent may itself still await its approved move.
         # Its logical route must nevertheless be exact, and final reuse below
@@ -550,7 +578,7 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
     # logical paths or file IDs cannot claim one exact final name in a parent.
     occupants = {}
     for path in sorted(required):
-        key = (logical_parent(path), names[path])
+        key = (parent_of(path), names[path])
         if key in occupants and occupants[key] != path:
             raise SafetyError('DESTINATION_FOLDER_NAME_COLLISION:' + path)
         occupants[key] = path
@@ -571,15 +599,16 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
                 raise SafetyError('DESTINATION_EXACT_NAME_COLLISION:' + sid + ':' + str(other))
         occupants[key] = sid
     for path,sid in recovered_paths.items():
-        if resolved.get(logical_parent(path)) != recovered[sid]['parent_id']:
+        if resolved.get(parent_of(path)) != recovered[sid]['parent_id']:
             raise SafetyError('RECOVERED_DESTINATION_PARENT_REBOUND:' + sid)
     missing = [{'logical_key': 'folder:' + digest({'section_path': section, 'logical_path': p}),
-                'logical_path': p, 'folder_name': names[p], 'parent_path': logical_parent(p), 'kind': 'NEW_FOLDER_REQUIRED'}
+                'logical_path': p, 'folder_name': names[p], 'parent_path': parent_of(p), 'kind': 'NEW_FOLDER_REQUIRED'}
                for p in sorted(required - resolved.keys(), key=lambda p: (p.count('/'), p))]
     return {'records': records, 'item_routes': {sid:routes[sid] for sid in groups}, 'destination_paths': resolved,
             'recovered_destination_folders': recovered,
             'unused_recovered_destination_ids': sorted(unused_recovered),
             'destination_folder_names': names, 'missing_folders': missing,
+            'destination_parent_paths': {p: parent_of(p) for p in required},
             'mapped_destination_folders': mapped_context,
             'reused_folder_ids': sorted(reuse), 'folder_reuse_proofs': reuse,
             'source_container_ids': sorted(containers),
@@ -617,7 +646,7 @@ def build_hybrid_preparation(source, *, section_path, section_id, workbook_id, m
                 if ancestor==sid:raise SafetyError('TARGET_FOLDER_CYCLE')
                 if ancestor not in dependency_targets[sid]:dependency_targets[sid].append(ancestor)
             if not parent_path:break
-            parent_path=logical_parent(parent_path)
+            parent_path=layout['destination_parent_paths'].get(parent_path,logical_parent(parent_path))
     ordered, deps = _order_groups(groups, states, dependency_targets)
     operations, resolutions, last_ref = [], {}, {}
     for sid in ordered:
@@ -667,6 +696,10 @@ def build_hybrid_preparation(source, *, section_path, section_id, workbook_id, m
                   'members': [{'source_id': sid, 'direct_operation_refs': sorted(o['reference'] for o in operations if o['source_id'] == sid),
                                'ancestor_move_operation_refs': sorted(inherited[sid])} for sid in sorted(groups)],
                   'operations': operations}
+    opaque_parents = {p: parent for p, parent in layout['destination_parent_paths'].items()
+                      if parent != logical_parent(p)}
+    if opaque_parents:
+        projection['destination_parent_paths'] = opaque_parents
     if layout['recovered_destination_folders']:
         projection['recovered_destination_folders'] = layout['recovered_destination_folders']
         projection['recovered_descendant_ids'] = sorted(set(layout['recovered_destination_folders']) & {

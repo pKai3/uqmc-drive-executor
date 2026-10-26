@@ -322,7 +322,7 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
     # Discover existing exact destination containers before considering creation.
     # Do not adopt an unrelated same-name file or collapse duplicate folders.
     allocated={e['payload']['key'] for e in journal.records() if e['kind']=='REQUIRED_FOLDER_ALLOCATED' and e['payload'].get('section_id')==section_key(section)}
-    candidates=[{'logical_path':p,'logical_key':'folder:'+digest({'section_path':section,'logical_path':p}),'parent_path':logical_parent(p),'folder_name':n}
+    candidates=[{'logical_path':p,'logical_key':'folder:'+digest({'section_path':section,'logical_path':p}),'parent_path':layout['destination_parent_paths'].get(p,logical_parent(p)),'folder_name':n}
                 for p,n in sorted(layout['destination_folder_names'].items(),key=lambda kv:(kv[0].count('/'),kv[0]))]
     for spec in candidates:
         if spec['logical_key'] in allocated and spec['logical_path'] not in paths:continue
@@ -375,7 +375,7 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
             layout=plan_destination(source,section_path=section,metadata_by_id=metadata,anchor_paths=paths,recovered_folders=recovered)
     for logical,folder_id in layout['destination_paths'].items():
         if logical==anchor or folder_id in layout['reused_folder_ids']:continue
-        expected_parent=layout['destination_paths'].get(logical_parent(logical))
+        expected_parent=layout['destination_paths'].get(layout['destination_parent_paths'].get(logical,logical_parent(logical)))
         if raw[folder_id]['name']!=layout['destination_folder_names'][logical] or raw[folder_id]['parents']!=[expected_parent]:
             raise SafetyError('EXISTING_DESTINATION_LOCATION_OR_NAME_DRIFT:'+logical)
     checks=[]
@@ -513,7 +513,7 @@ def freeze(config, section, journal, state, factory, run_dir, report, *, revisio
             'history_cached_source_ids':live.get('history_cached_source_ids',[])})
         for logical,folder_id in paths.items():
             if logical==logical_parent(section):continue
-            value=metadata[folder_id];parent_path=logical_parent(logical)
+            value=metadata[folder_id];parent_path=layout['destination_parent_paths'].get(logical,logical_parent(logical))
             expected=layout['destination_folder_names'].get(logical,logical.rsplit('/',1)[-1])
             if value['name']==expected and value['parents']==[paths[parent_path]]:
                 journal.append('DESTINATION_VERIFIED',payload={'section_id':sid,'file_id':folder_id,'exact_name':value['name'],
