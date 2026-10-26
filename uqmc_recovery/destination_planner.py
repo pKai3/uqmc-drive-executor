@@ -156,9 +156,11 @@ def _canonical_folder_path(path, aliases):
 def _folder_aliases(source, groups, states, section):
     """Prove old/new labels equivalent using one exact same-ID coverage row.
 
-    Coverage supplies the canonical historical collection key, never additional
-    move authority. An unproved spelling remains distinct and fails the normal
-    route ambiguity checks. Proposal records and their hashes stay untouched.
+    Coverage may already use the approved title. Bind both exact titles to the
+    same source ID and keep the historical collection key, never adding move
+    authority. An explicit move already using the approved target stays there;
+    equal historical titles do not make distinct IDs equivalent. Unproved
+    spellings remain distinct and fail the normal route ambiguity checks. Proposal records and their hashes stay untouched.
     """
     evidence = {}
     for row in source.get('folder_rename_coverage', []):
@@ -191,9 +193,9 @@ def _folder_aliases(source, groups, states, section):
         row = rows[0]
         if (row.get('Verified MIME type') != FOLDER
                 or row.get('Rename proposal') != rename['reference']
-                or row.get('Current name + type suffix') != historical
+                or row.get('Current name + type suffix') not in {historical, proposed}
                 or row.get('Proposed name / retained name') != proposed
-                or row.get('Existing proposed target') != old
+                or row.get('Existing proposed target') not in {old, new}
                 or state['name'] not in {historical, proposed}):
             continue
         # A slash inside an exact title is not evidence of a nested folder.
@@ -201,6 +203,11 @@ def _folder_aliases(source, groups, states, section):
         if '/' in historical or '/' in proposed:
             continue
         if move and _record_path(move) not in {old, new}:
+            continue
+        if move and _record_path(move) == new and row.get('Existing proposed target') == new:
+            # The exact move and coverage already agree. Mapping this target
+            # back to a source title could conflate distinct year folders
+            # that happened to share a historical name such as Financials.
             continue
         if new in owners and owners[new] != sid:
             raise SafetyError('FOLDER_RENAME_ALIAS_IDENTITY_CONFLICT:' + sid)

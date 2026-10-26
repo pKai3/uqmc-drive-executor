@@ -86,6 +86,51 @@ class FolderRenameAliasTests(unittest.TestCase):
             if ref in source['records']:
                 self.assertEqual(resolution['row_sha256'], source['records'][ref]['row_sha256'])
 
+    def test_coverage_already_uses_proposed_title_and_path(self):
+        source=self.source()
+        source['folder_rename_coverage'][0].update({
+            'Current name + type suffix':'Intro Videos','Existing proposed target':NEW})
+        layout=self.plan(source)
+        self.assertEqual(layout['destination_paths'][OLD],'intro')
+        self.assertNotIn(NEW,layout['destination_paths'])
+        self.assertEqual(layout['missing_folders'],[])
+
+    def test_trailing_space_cleanup_with_trimmed_coverage_is_one_identity(self):
+        source=self.source();rename=source['records']['RENAME-INTRO']
+        rename['row']['Current name + type suffix']='Intro Videos '
+        self.states['intro']['name']='Intro Videos '
+        next(m for m in self.states['media']['subtree']['members'] if m['id']=='intro')['name']='Intro Videos '
+        source['folder_rename_coverage'][0].update({
+            'Current name + type suffix':'Intro Videos','Existing proposed target':NEW})
+        for record in source['records'].values():
+            if record.get('whole_subtree_origin_source_id')=='media' and record['source_id'] in {'ruby','leyton'}:
+                record['coverage_target_parent_path']=NEW+' '
+                record['row']['Exact target path']=NEW+' /'+self.states[record['source_id']]['name']
+        layout=self.plan(source)
+        self.assertEqual(layout['destination_paths'][NEW+' '],'intro')
+        self.assertNotIn(NEW,layout['destination_paths'])
+        self.assertFalse(any(s['folder_name']=='Intro Videos' for s in layout['missing_folders']))
+
+    def test_distinct_explicit_move_targets_do_not_share_historical_alias(self):
+        for sid,year in [('year-a','2024'),('year-b','2025')]:
+            append_row(self.export,'Proposed Moves',{'Proposal ID':'MOVE-'+sid})
+            append_row(self.export,'Move Manifest',{'Proposal ID':'MOVE-'+sid,
+                'Manifest item':'ITEM-'+sid,'Source ID':sid,'Current item':'Financials',
+                'Exact target path':PARENT+'/'+year,'Scope':'Single item'})
+            append_row(self.export,'Proposed Renames',{'Rename ID':'RENAME-'+sid,
+                'Source ID':sid,'Current name + type suffix':'Financials',
+                'Proposed name + type suffix':year,'Proposed destination folder':PARENT})
+            append_row(self.export,'Rename Coverage',{'Source ID':sid,
+                'Current name + type suffix':'Financials','Proposed name / retained name':year,
+                'Rename proposal':'RENAME-'+sid,'Verified MIME type':FOLDER,
+                'Existing proposed target':PARENT+'/'+year})
+            self.states[sid]=agent_snapshot({**metadata(sid,'Financials',FOLDER,['root']),
+                                            'parents_complete':True})
+        layout=self.plan()
+        self.assertEqual(layout['destination_paths'][PARENT+'/2024'],'year-a')
+        self.assertEqual(layout['destination_paths'][PARENT+'/2025'],'year-b')
+        self.assertNotIn(PARENT+'/Financials',layout['destination_paths'])
+
     def test_completed_rename_preserves_same_registered_alias(self):
         self.states['intro']['name'] = 'Intro Videos'
         next(m for m in self.states['media']['subtree']['members'] if m['id'] == 'intro')['name'] = 'Intro Videos'
