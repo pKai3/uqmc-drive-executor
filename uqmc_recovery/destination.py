@@ -406,7 +406,7 @@ def read_and_plan(config, section, journal, capture, factory, registry, report, 
     # Exact live collision checks use captured destination listings, never filenames as identity.
     moving={s:route for s,route in layout['item_routes'].items() if s not in layout['source_container_ids']}
     for check in checks:
-        if check['disposition']=='BLOCKED' or check['destination_unresolved']:continue
+        if check['disposition'] in {'BLOCKED','COMPLETE'} or check['destination_unresolved']:continue
         target=check['desired'];parent=target['parents'][0]
         for child in listings.get(parent,[]):
             if child['id']==check['source_id'] or child['name']!=target['name']:continue

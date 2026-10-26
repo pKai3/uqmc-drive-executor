@@ -400,8 +400,16 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
             raise SafetyError('RECOVERED_DESTINATION_APPROVAL_SCOPE_CONFLICT:'+sid)
         expected_keys={'folder:'+digest({'section_path':creation_section,'logical_path':p}):p for p in required}
         path = expected_keys.get(proof.get('logical_key'))
+        prior = proof.get('registered_logical_path')
+        # An approved source rename may canonicalize a collection label while
+        # its verified destination keeps the same ID. Recover the old key only
+        # through that proved alias; name, parent and marker checks still apply.
+        if (path is None and prior and canonical_path(prior) != prior
+                and canonical_path(prior) in required
+                and proof['logical_key'] == 'folder:' + digest({
+                    'section_path': creation_section, 'logical_path': prior})):
+            path = canonical_path(prior)
         if path is None:
-            prior = proof.get('registered_logical_path')
             if (prior and _inside(prior, section) and canonical_path(prior) not in required
                     and sid not in set(groups) | blocked
                     and proof['logical_key'] == 'folder:' + digest({
@@ -543,7 +551,16 @@ def plan_destination(source, *, section_path, metadata_by_id, anchor_paths, reco
             continue
         key = (route['parent_path'], route['exact_name'])
         if key in occupants:
-            raise SafetyError('DESTINATION_EXACT_NAME_COLLISION:' + sid + ':' + str(occupants[key]))
+            other = occupants[key]
+            parent = resolved.get(route['parent_path'])
+            # Moving an intact ancestor does not introduce a collision between
+            # existing unchanged siblings. Preserve both identities, without
+            # granting permission to rename or consolidate another file here.
+            unchanged = (other in states and other not in folders and parent
+                and all(states[item]['name'] == route['exact_name']
+                        and states[item]['parents'] == [parent] for item in (sid, other)))
+            if not unchanged:
+                raise SafetyError('DESTINATION_EXACT_NAME_COLLISION:' + sid + ':' + str(other))
         occupants[key] = sid
     for path,sid in recovered_paths.items():
         if resolved.get(logical_parent(path)) != recovered[sid]['parent_id']:
